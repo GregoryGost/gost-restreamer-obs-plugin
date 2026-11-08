@@ -1,0 +1,4 @@
+interface:
+  display_name: "C++ Style"
+  short_description: "Scoped C++ formatting and style policy"
+  default_prompt: "Use $cpp-style for project-first clang-format and naming reviews. Preserve public ABI, Qt meta-object identifiers, unrelated files and chosen analyzer severities."

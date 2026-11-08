@@ -1,0 +1,4 @@
+interface:
+  display_name: "C++ CMake"
+  short_description: "CMake targets, presets and build diagnostics"
+  default_prompt: "Use $cpp-cmake for target-aware CMake changes and compilation databases. Verify generator, compiler, presets, source context and authorization before configuring."

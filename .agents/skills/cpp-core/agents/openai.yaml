@@ -1,0 +1,4 @@
+interface:
+  display_name: "C++ Core"
+  short_description: "C++17+ ownership, ABI, diagnostics"
+  default_prompt: "Use $cpp-core for version-aware C++ engineering. Respect CODEX_PROJECT.md, actual C++ standard/toolchain, VS Code diagnostic integration and the smallest authorized change."

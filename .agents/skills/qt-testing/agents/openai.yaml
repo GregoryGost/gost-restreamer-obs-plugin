@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qt Testing"
+  short_description: "QTest, QSignalSpy and Qt GUI tests"
+  default_prompt: "Use $qt-testing for Qt Test signal, event-loop, model and GUI testing under the project-selected runner and platform environment."

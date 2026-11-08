@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qt Quick / QML"
+  short_description: "Qt 6 declarative UI and C++ integration"
+  default_prompt: "Use $qt-quick-qml for versioned Qt Quick/QML bindings, modules, C++ registration, qmllint and focused UI tests. Keep preview and profiling optional."

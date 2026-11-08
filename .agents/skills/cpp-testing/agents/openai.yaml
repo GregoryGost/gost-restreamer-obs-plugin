@@ -1,0 +1,4 @@
+interface:
+  display_name: "C++ Testing"
+  short_description: "C++ tests, CTest, sanitizers and coverage"
+  default_prompt: "Use $cpp-testing for independent behavior-driven C++ tests and project-approved CTest/sanitizer/coverage checks; report build context and unverified gates."

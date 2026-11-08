@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qt 6 Core"
+  short_description: "QObject lifetime, signals, threads and Qt tooling"
+  default_prompt: "Use $qt-core for versioned Qt 6 QObject lifetime, meta-object APIs, signals, thread affinity and evidence-based review using official Qt contracts."

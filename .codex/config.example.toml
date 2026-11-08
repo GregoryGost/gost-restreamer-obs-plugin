@@ -1,0 +1,16 @@
+# Пример проектной конфигурации Codex без секретов.
+# При существующем config.toml объединять параметры вручную, сохраняя локальные настройки.
+model = "gpt-6.1-sol"
+model_reasoning_effort = "xhigh"
+personality = "pragmatic"
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 4
+default_subagent_model = "gpt-6.1-sol"
+default_subagent_reasoning_effort = "high"
+
+# Роли обнаруживаются в .codex/agents/*.toml; отдельные [agents.<role>] не нужны.
+# При необходимости аутентификацию Context7 настраивать локально, не в этом файле.
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"

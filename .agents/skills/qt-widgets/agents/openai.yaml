@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qt Widgets"
+  short_description: "Widgets UI lifecycle and model/view contracts"
+  default_prompt: "Use $qt-widgets for Qt 6 Widgets, layouts, model/view, GUI thread safety and scoped UI validation; do not activate QML without separate selection."
