@@ -17,12 +17,12 @@
 ## Project Identity
 
 - Project key / workspace: `gost-restreamer-obs-plugin`.
-- Название продукта: `GOST Restreamer`; модуль плагина в архитектуре: `gost-obs-plugin`.
+- Название продукта: `GOST Restreamer`; модуль плагина: `gost-restreamer-obs-plugin`.
 - Тип: нативный плагин OBS Studio, управляющий клиент отдельного сервера.
 - Основной язык: C++20. Дополнительные форматы: CMake, JSON, INI, TOML; QML допускается для будущих явно запрошенных задач.
 - Платформа: Windows 10/11 x64; целевая базовая версия OBS — 33.0.1.
-- Источник требований: `gost-obs-plugin-architecture.md`, редакция 1.5 от 08.11.2026.
-- Стадия: подготовка репозитория. Исходники, CMake, тесты, CI, упаковка и совместимый комплект SDK пока не созданы. Архитектура описывает целевое состояние, а не выполненные проверки.
+- Источник требований: `gost-obs-plugin-architecture.md`, редакция 1.7.3 от 09.11.2026.
+- Стадия: каркас M0/T01 реализован и принят. Сборки, CTest и изолированные normal/portable OBS-проверки выполнены; результаты и ограничения записаны в `TASKS_ARCHIVE.md`. Остальная архитектура описывает целевое состояние последующих этапов.
 
 ## Natural Language Profile
 
@@ -34,6 +34,29 @@
 - Пользовательский интерфейс: русские подписи и локализация `en-US`, согласно архитектуре; продукт называется `GOST Restreamer`.
 - Импортированные правила, навыки и инструкции ролей сохраняют язык upstream. Политика русского языка относится к собственной прозе проекта; переводить весь импортированный набор не требуется.
 - `comment-language-audit` применять к затронутой прозе при соответствующих задачах; новые линтеры/тесты языка автоматически не добавлять.
+
+## Validation Workspace Boundary
+
+По указанию владельца все последующие проверки выполняются только внутри
+текущего workspace проекта.
+
+- Для проверок не использовать системные и пользовательские AppData/ProgramData:
+  ни чтение тестовых данных, ни запись, ни временное размещение плагина.
+- Конфигурация OBS и плагина, тестовые профили, плагины, кеши, временные файлы,
+  журналы и результаты проверок располагаются внутри workspace. `TEMP`/`TMP`
+  тестовых дочерних процессов направляются в собственный каталог проекта.
+- Настоящий OBS запускать только как portable-копию внутри workspace;
+  конфигурация находится в её собственном `config/`, плагин — в `plugins/`.
+- Не запускать `-Mode Normal` и прежние помощники размещения/очистки ProgramData.
+  Историческая приёмка T01 не разрешает повторять эти операции.
+- Если проверку нельзя выполнить с такой изоляцией, не запускать её и отмечать
+  соответствующий результат как непроверенный. Формат установочного каталога
+  проверять на staging внутри проекта; это не подтверждает фактическую загрузку
+  из системного пути.
+
+Это ограничение применяется и к последующим задачам, и к проверкам выпуска.
+Системные пути установки из архитектуры описывают поставку продукта и не
+являются разрешением использовать их при проверках в этом workspace.
 
 ## Active Stack Profiles
 
@@ -145,73 +168,75 @@ fixtures и существенной конфигурации, включая н
 ## C++ Core Profile
 
 - C++ enabled: yes; целевой стандарт C++20, расширения компилятора не использовать. Базовый C++17 в переносимых материалах не понижает стандарт проекта.
-- Источник стандарта сейчас: раздел 3 архитектуры. Фактические target flags будут подтверждаться `CMakeLists.txt`, presets, compile/link output и CI после создания каркаса.
-- C в собственных исходниках пока отсутствует; стандарт C не выбран. C API OBS не означает автоматического выбора стандарта C для C++ файлов.
-- Целевой компилятор: MSVC, Windows x64. Точные поддерживаемые toolset/CRT/stdlib, Debug/Release ABI и комплект SDK должны быть закреплены вместе с OBS 33.0.1 до реализации/сборки.
-- Найдено локально 08.11.2026: VS Build Tools 2022 17.3.32922.545, MSVC toolset 14.33.31629 (`cl.exe` 19.33.31630.0), Windows SDK headers 10.0.19041.0. Это инвентаризация, а не подтверждение совместимости с OBS/Qt.
-- Exceptions/RTTI: build policy ещё не закреплена. Исключения не пересекают C/plugin callback boundary; allocation/free, borrowed handles, export/calling convention и время жизни соблюдать по контракту OBS.
+- C++20 закреплён в CMake и подтверждён сгенерированными MSVC targets (`LanguageStandard=stdcpp20`) и успешными сборками RelWithDebInfo/Release.
+- Импортированный `plugin-support.c.in` собирается как C17; собственные исходники плагина используют C++20.
+- Компилятор: MSVC, Windows x64; выбранные toolset/SDK закреплены presets. RelWithDebInfo и Release используют `RuntimeLibrary=MultiThreadedDLL` (`/MD`), подтверждены сборкой. Отдельный preset Debug с debug CRT не заявляется.
+- Проверено локально 09.11.2026: VS Build Tools 2022 17.14.44, MSVC toolset 14.44.35207 (`cl.exe` 19.44.35229.0), Windows SDK 10.0.26100.0. Это инвентаризация; совместимость подтверждается отдельными configure/link/load проверками.
+- Exceptions: `/EHsc` (`ExceptionHandling=Sync`) в обеих выбранных конфигурациях; RTTI отдельно не переопределяется. Исключения не пересекают C/plugin callback boundary; allocation/free, borrowed handles, export/calling convention и время жизни соблюдать по контракту OBS.
 - Целевой diagnostic provider: VS Code `ms-vscode.cpptools` + контекст CMake Tools. Установлены cpptools 1.35.6, CMake Tools 1.24.42 и Qt extensions; активный provider и его контекст не подтверждены.
-- Прямой доступ агента к Problems/LSP и несохранённым буферам: unavailable. Сохранённые файлы и реальные compiler diagnostics являются доступной границей, когда появится сборка; чистоту IDE не заявлять.
+- Прямой доступ агента к Problems/LSP и несохранённым буферам: unavailable. Сохранённые файлы и реальные сообщения компилятора являются доступной границей диагностики; чистоту IDE не заявлять.
 - `clangd`, `clang-tidy`, Clazy на PATH не обнаружены; они не выбраны как обязательные gates. Не устанавливать и не переключать provider автоматически.
-- Терминальный debugger: не настроен. Целевой путь отладки — `cppvsdbg`/CMake Tools; подключение к работающему OBS требует отдельной разрешённой задачи.
+- Терминальный debugger: обнаружен CDB 10.0.26100.7705 в Windows SDK; при диагностике собственного CMake использовано неинвазивное чтение стека. Целевой путь отладки редактора — `cppvsdbg`/CMake Tools; подключение к работающему OBS требует отдельной разрешённой задачи.
 - Active pair: `cpp_core.md` + `cpp-core`.
 
 ## C++ Style Profile
 
-- `.clang-format`, `.editorconfig` и существующего стиля C++ пока нет. При создании каркаса учитывать конфигурацию выбранного OBS Plugin Template и явно закрепить проектный стиль; не навязывать другой глобальный стиль заранее.
-- Найден formatter LLVM 14.0.5 в `VC/Tools/Llvm/x64/bin/clang-format.exe` локальных Build Tools; formatter/version проекта пока не выбраны.
+- `.clang-format` импортирован из выбранного OBS Plugin Template с `Standard: c++20`; `.editorconfig` задаёт UTF-8, LF и отступы. Форматирование ограничено собственными затронутыми файлами.
+- Выбран существующий clang-format 19.1.5: `C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin/clang-format.exe`.
 - Область форматирования — только затронутые собственные файлы/строки; generated/vendor не форматировать. Имена ABI, callbacks, Qt signals/properties и сериализованные поля сохранять.
 - Active pair: `cpp_style.md` + `cpp-style`.
 
 ## C++ CMake Profile
 
-- CMake выбран архитектурой, build files пока отсутствуют. Минимальная версия проекта не закреплена.
-- На PATH: CMake/CTest 3.22.0 (`C:/Program Files/CMake/bin`). В Build Tools также найден комплект CMake и Ninja; они не являются выбранным build context.
-- Генератор ещё не закреплён. Архитектурный ориентир — MSVC/Ninja и CMake Presets; preset `windows-x64`, CI и `buildspec.json` из разделов 16–17 пока только запланированы.
-- OBS SDK/dependencies: официальный `obsproject/obs-plugintemplate`, адаптированный и закреплённый под OBS 33.0.1 и совместимый Qt. Наследовать зависимости OBS 31.1.1 из описанного в архитектуре шаблона без проверки нельзя.
-- При реализации потребуются frontend API, Qt и Network; включение `ENABLE_FRONTEND_API`/`ENABLE_QT`, C++ entrypoint и link targets проверять в фактически выбранной ревизии шаблона.
-- Compilation database отсутствует. Ninja/Makefiles могут создавать `compile_commands.json`; native Visual Studio generator не считать источником этой базы. До появления согласованного target/preset диагностический контекст unavailable.
+- Проект требует CMake 3.28 или новее; проверенная установленная версия CMake/CTest — 3.31.8 (`C:/Program Files/CMake/bin`).
+- Выбран генератор `Visual Studio 17 2022`, x64, v143 и SDK 10.0.26100.0. Ninja не используется: Windows bootstrap шаблона зависит от VS platform и дочернего configure с `-A`.
+- Configure preset `windows-x64`, build/test presets `windows-x64` (RelWithDebInfo) и `windows-x64-release` (Release), test preset `windows-x64-offline`; binary directory `build_x64/`. `windows-ci-x64` сохранён для адаптации импортированных CI-сценариев, их приёмка относится к выпуску.
+- База каркаса: полный официальный `obsproject/obs-plugintemplate` из `master`, ревизия `3e7d7ac3b5342cd7d9b88890b9c70b472d1520fc`, без PR #172. После импорта выполняется собственная адаптация под OBS 33.0.1 и совместимый Qt. Наследовать зависимости OBS 31.1.1 из шаблона без проверки нельзя.
+- Windows-размещение следует формату OBS 33: `gost-restreamer-obs-plugin/gost-restreamer-obs-plugin.dll` и соседний `data/`. Структуры staging, portable-проверки и будущего пакета должны быть согласованы. Последующие проверки загрузки и локализаций выполняются только в portable OBS внутри workspace. Полная упаковка и установщик относятся к выпуску с учётом `Validation Workspace Boundary`.
+- Используются frontend API, Qt и Network; `ENABLE_FRONTEND_API`/`ENABLE_QT` включены, C++ entrypoint и link targets проверены сборкой и фактической загрузкой в OBS 33.0.1.
+- Native Visual Studio generator не создаёт `compile_commands.json`. В `.vscode/settings.json` выбран CMake Tools как provider для cpptools; фактический контекст IDE и Problems напрямую не проверены.
 - Configure/build не запускать по вымышленным preset. Каталоги сборки, загрузки зависимостей и install/deploy эффекты должны соответствовать реальной задаче и будущим закреплённым командам.
 - Active pair: `cpp_cmake.md` + `cpp-cmake`.
 
 ## C++ Testing Profile
 
-- Планируемая граница: CTest и Qt Test; существующих test targets, runner и версий framework пока нет. Новый сторонний framework автоматически не добавлять.
-- Планируемые пути по архитектуре: `tests/unit/`, `tests/contract/`, `tests/integration/`; сейчас отсутствуют.
+- Граница: CTest и Qt Test 6.11.1. Targets: `gost-restreamer-lifecycle-test` и `gost-restreamer-backend-readonly-test`; тесты `gost-restreamer.lifecycle` и `gost-restreamer.backend-readonly`.
+- Созданы `tests/unit/`, `tests/integration/`, `tests/fixtures/`. Контрактные тесты DTO/SSE относятся к последующим этапам.
 - Чистые FSM/DTO/SSE/счётчики и порядок команд проверять без настоящего OBS через интерфейсы/fixtures. GUI/loadable DLL и live-приёмка — отдельные проверки Windows + OBS 33.0.1 + изолированный backend.
 - Реальный пользовательский OBS, эфир, сервер и настройки не использовать как неявную тестовую fixture.
-- Targeted и broad test commands: пока отсутствуют. Создать и закрепить вместе с реальными targets/presets; отсутствие тестов не выдавать за успешную проверку.
+- Файловая изоляция всех последующих проверок обязательна по `Validation Workspace Boundary`; AppData/ProgramData для них не используются.
+- Команды: `ctest --preset windows-x64`, `ctest --preset windows-x64-release`, `ctest --preset windows-x64-offline`. Успех объявлять только после выполнения на актуальном снимке.
 - Sanitizers, coverage и benchmarks: не выбраны, порог coverage отсутствует. Применять только поддерживаемую и явно настроенную конфигурацию, без переносимых универсальных процентов.
 - Active pair: `cpp_testing.md` + `cpp-testing`.
 
 ## Qt 6 Core Profile
 
-- Qt enabled: yes, целевая major 6. Точная minor/patch, путь SDK и runtime ABI не подтверждены; установить их по совместимому комплекту OBS 33 до реализации и проверки version-sensitive API.
-- Компоненты текущей архитектуры: Core, Widgets, Network; JSON через Qt Core. Test — для будущих тестов; Quick/Qml/QuickControls2/QuickTest не являются текущими runtime dependencies.
-- Qt SDK не обнаружен на PATH и в проверенных `C:/Qt`, `D:/Qt`, `E:/Qt`; это не доказательство отсутствия SDK во всех других каталогах.
+- Qt enabled: yes, SDK и установленный OBS runtime имеют версию 6.11.1. SDK извлечён из официального пакета OBS `2026-10-23` в `.deps/obs-deps-qt6-2026-10-23-x64`; SHA256 закреплён в `buildspec.json`. ABI подтверждается фактической сборкой и загрузкой DLL.
+- Компоненты: Core, Widgets, Network; JSON через Qt Core. Test используется только тестовыми targets; Quick/Qml/QuickControls2/QuickTest не являются текущими runtime dependencies.
+- Qt SDK используется из `.deps`, без установки в систему. Официальный пакет OBS не содержит Qt Test. Для тестов получен официальный Qt Base 6.11.1 MSVC 2022 x64, SHA256 `7f97edc3937fec7383eb865e010ed5128155bf9c80a563abca450860f3e9bef5`; bootstrap закреплён в `cmake/windows/qttest.cmake`. Runtime этого комплекта применяется только тестовыми процессами через CTest environment; с плагином не устанавливается.
 - Qt/CRT и загружаемые DLL должны быть совместимы с целевым OBS. Не упаковывать произвольный второй Qt runtime без проверки загрузки/ABI.
 - QObject ownership явный; parent-child ownership и RAII не дублируют владение. OBS handles освобождать по их API, callbacks и queued deliveries не переживают владельца.
 - Все network replies, таймеры и SSE работают асинхронно в известном Qt event loop. UI/OBS callbacks не блокируются сетевыми ожиданиями; запоздалые ответы старого поколения подключения не меняют новый StateStore.
-- `moc/uic/rcc` и autogen — только через будущие CMake targets, вручную generated files не создавать.
+- `moc/uic/rcc` и autogen — через CMake targets, вручную generated files не создавать.
 - Clazy: unavailable, checks и gate не выбраны.
 - Документация: Context7 при надёжном совпадении версии; иначе официальная version-matched документация Qt и ссылки активных навыков. Не заменять неизвестную версию на latest.
 - Active pair: `qt_core.md` + `qt-core`.
 
 ## Qt Widgets Profile
 
-- Widgets enabled: yes. Планируемые пути: `src/ui/`, `src/ui/pages/`; пока отсутствуют.
+- Widgets enabled: yes. Создан `src/ui/`; страницы каркаса пока реализованы внутри `ManagementWindow`, отдельных редакторов нет.
 - UI состоит из `RestreamDock` и одного повторно используемого `ManagementWindow`; страницы и редакторы находятся внутри расширенного окна. Dock не содержит вкладок и форм настроек.
 - Виджеты получают данные из общего `StateStore`, не выполняют HTTP сами. UI и GUI-facing models изменяются в GUI thread; workers используют безопасную queued передачу с проверенным временем жизни.
 - Закрытие расширенного окна не завершает эфир, не удаляет Dock и не уничтожает общее состояние. Shutdown OBS снимает callbacks, отменяет принадлежащие плагину запросы/таймеры и соблюдает допустимую фазу OBS lifecycle.
-- Формы `.ui`, autogen и model/view targets ещё не выбраны; generated outputs не редактировать.
+- Форм `.ui` и собственных model/view targets нет; сборка включает AUTOMOC. Generated outputs не редактировать.
 - Active pair: `qt_widgets.md` + `qt-widgets`.
 
 ## Qt Testing Profile
 
-- Qt Test/QTest, QSignalSpy, CTest: целевой выбор, модуль и runners ещё не установлены/не закреплены для проекта.
+- Qt Test/QTest 6.11.1, QSignalSpy и CTest закреплены в CMake; локальные и backend-тесты выполнены в обеих выбранных конфигурациях. Фактический интерфейс OBS проверяется отдельно от offscreen.
 - Application fixture выбирать по границе: QCoreApplication для Core, QApplication для Widgets, QGuiApplication/Quick Test только при реальной QML-задаче.
 - Проверять сигналы и аргументы, event-loop completion, ownership/teardown, model notifications и lifecycle окон согласно затронутым требованиям. Ожидания ограничены, без произвольных sleep как доказательства синхронизации.
-- GUI display/offscreen policy и команды пока не настроены; offscreen не заменяет Windows DPI, загрузку DLL и проверку поведения внутри OBS.
+- Lifecycle-тест использует `QApplication` и `QT_QPA_PLATFORM=offscreen`, бюджет 30 секунд; backend-тест имеет бюджет 15 секунд. Offscreen не заменяет Windows DPI, загрузку DLL и проверку поведения внутри OBS.
 - Active pair: `qt_testing.md` + `qt-testing`; обязательные базы: активные `cpp-testing` и `qt-core` вместе с их rules/skills.
 
 ## Qt Quick / QML Profile
@@ -225,7 +250,7 @@ fixtures и существенной конфигурации, включая н
 
 ## Build And Validation Commands
 
-Источник реальных команд — этот профиль и будущие CMake/preset/CI файлы.
+Источник реальных команд — этот профиль и проектные CMake/preset/CI файлы.
 Исполнение на Windows — PowerShell; для curl использовать `curl.exe`.
 Не использовать CMD/POSIX синтаксис без подтверждённой отдельной среды.
 
@@ -236,33 +261,77 @@ fixtures и существенной конфигурации, включая н
 | Версия Codex | `codex --version` |
 | Git status | `git status --short` |
 | Whitespace в отслеживаемом diff | `git diff --check` (не проверяет содержимое новых untracked files) |
-| Install dependencies | none; SDK и runtime dependencies не устанавливаются этой интеграцией |
-| Configure/build/packaging | none; CMake files и действующие presets отсутствуют |
-| Format/lint/static analysis | none; проектные конфигурации и контекст ещё не выбраны |
-| Unit/contract/GUI/integration/E2E | none; targets и изолированная среда ещё не созданы |
+| Project-local SDK bootstrap | `cmake --preset windows-x64`; bootstrap загружает и проверяет закреплённые архивы в `.deps`, собирает SDK в этой же области; глобальной установки нет |
+| Configure без тестовых targets | `cmake --preset windows-x64 -DBUILD_TESTING=OFF`; временная проверка DLL до получения Qt Test |
+| Build с символами / Release | `cmake --build --preset windows-x64`; `cmake --build --preset windows-x64-release` |
+| Установка в staging | `cmake --install build_x64 --config RelWithDebInfo`; preset направляет результат в `build/install/` |
+| Полная упаковка | пока не проверена, относится к выпуску |
+| Формат C++ | clang-format 19.1.5 `--dry-run --Werror` только для собственных затронутых `src` и `tests` |
+| Локальные UI/lifecycle | `ctest --preset windows-x64-offline` |
+| Локальные и backend GET | `ctest --preset windows-x64`; `ctest --preset windows-x64-release` |
+| PE/экспорты/раскладка | `tests/integration/Test-PluginArtifact.ps1 -PluginRoot <workspace-stage/plugin> -ExpectedBinary <workspace-DLL> -Dumpbin <dumpbin.exe>` |
+| Изолированный OBS portable | `tests/integration/Test-PortableObs.ps1 -ObsRoot <fresh-workspace-OBS33> -Locale ru-RU` (отдельная свежая среда для `en-US`) |
+| OBS normal / системное размещение | последующие запуски `-Mode Normal` и помощников ProgramData запрещены указанием владельца; использовать только portable и staging внутри workspace |
 | Sanitizers/coverage/benchmarks | none; не настроены |
 | QML tools/tests | none; нет модулей, targets и рабочего SDK |
 
-При добавлении реального каркаса обновить этот профиль в том же изменении:
+При изменении каркаса обновлять этот профиль в том же изменении:
 закрепить версии SDK/toolchain, пути и actual preset/target names, команды
 узких и обязательных общих проверок, generated paths и разрешённые эффекты.
 Не объявлять сборку/тесты пройденными до их фактического исполнения.
+
+Фактическая проверка 09.11.2026: штатный configure с C/C++ ABI-проверками,
+сборки DLL/Qt Test в RelWithDebInfo и Release и установка в staging прошли.
+CTest: offline 1/1, RelWithDebInfo 2/2 и Release 2/2; отсутствие URL даёт skip 77,
+заданный недопустимый URL — отказ. Проверены x64 PE, девять экспортов,
+локализации и совпадение staging/install со сборкой. Формат C++ и синтаксис
+PowerShell проверены. Точные результаты применимы к снимкам, записанным
+в архиве задачи; изменения исполняемого кода и проверок требуют оценки влияния.
+
+Старых зависших процессов перед запуском больше не было; прежнее ожидание
+MSBuild не воспроизвелось. Новое ожидание CMake локализовано в повторной
+загрузке пакетов OBS SDK: bootstrap теперь передаёт проверенные архивы
+в собственный кеш OBS. Исходная причина прежнего MSBuild не установлена.
+Историческая приёмка T01 до введения `Validation Workspace Boundary`:
+OBS 33.0.1, portable и normal, ru-RU и en-US, по два
+запуска — восемь завершений с кодом 0 без медиазапусков. Проверены локализации,
+шесть страниц, единственное окно, его повторная активация, сворачивание
+и восстановление, скрытие при закрытии и повторное открытие с сохранением
+выбранной страницы, реальный профиль OBS и остановленная трансляция,
+восстановление видимости и координат плавающего Dock. В normal каждая
+нативная проба CSIDL 26/28/35 подтвердила собственные Roaming/Local и настоящий
+ProgramData; загруженная DLL проверена по пути и SHA256. Временные глобальные
+файлы и созданный `plugins` удалены, исходный `obs-studio` сохранён.
+
+Нативным тестам нужен интерактивный рабочий стол; песочница скрывала активное окно.
+При запрете API пользователь один раз активирует основное окно каждой новой
+тестовой OBS в пределах 20 секунд. Принадлежность PID/path/start-time/HWND
+проверяется перед действиями. Сценарий normal сам не устанавливает плагин.
+Один ранний отказ проверки PID UIA не воспроизвёлся; причина по старому выводу
+не установлена, строгая защита сохранена, добавлена диагностика. Это не
+подтверждённый дефект продукта и не отменяет последующие успешные прогоны.
+Физическое закрепление перетаскиванием, восстановление размеров и отсутствие всех утечек
+этой приёмкой не доказываются. Пользовательские настройки OBS не заменяют
+изолированную среду.
 
 ## Documentation And Integrations
 
 - `context7_documentation.md` активен. Context7 доступен через существующее подключение родительской сессии; resolve/query проверены при внедрении. Ключи не копировать в документацию или versioned config.
 - Сначала проектные версии/контракты, затем Context7 для нужной версии и темы; при ненадёжном совпадении — первичные официальные источники. Context7 не определяет фактическую установленную версию.
-- Backend: `https://github.com/GregoryGost/gost-restreamer`, ветка `develop`. Архитектурный срез — дерево `0e7ea267e9a2cc0523022043793b4c074e76d8b8`, не автоматически текущий HEAD.
+- Backend: `https://github.com/GregoryGost/gost-restreamer`, ветка `develop`. Срез редакции 1.7.3 — commit `ccbca60acb5bf90322342ae0b59665a30f9e97f6`, поставка `v0.1.0-dev.5+ccbca60acb5b`. Это версия из архитектуры, не автоматически текущий HEAD или версия установленного сервера на `192.168.88.8`.
+- Тестовый backend владельца: `http://192.168.88.8:8080` (HTTP и штатный порт из `internal/config/defaults.go`). В рамках разрешённой проверки допускается автоматическое чтение трёх маршрутов `/api/v1/health/live`, `/api/v1/health/ready`, `/api/v1/system/capabilities`, без отдельной команды/подтверждения. GET фактически вернули HTTP 200. Presets задают URL только тестовым процессам; продуктовый клиент пока отсутствует. Запуски эфиров, изменения backend и серверное развёртывание этим не разрешены.
 - Перед реализацией DTO и контрактных тестов сверять исходники/API contracts и свежую `/api/v1/openapi.json` либо YAML той же фактической сборки backend. Старый `openapi.yaml` из архитектуры не является источником актуальных DTO.
+- В срезе dev.5 детальный GET возвращает лишь `publication_key_configured`, `stream_key_configured`, `endpoint_configured`. Целевой просмотр/копирование самих значений требует расширения backend и обновления OpenAPI. Отсутствие чтения — техническая зависимость T02/T05, не запрет доступа владельца и не блокировка каркаса T01. Backend в этом репозитории не изменяется.
+- Исторический медиопрогон backend T11 предшествует T15 и не использовал плагин; CI dev.5 не подтверждает целевой VM-прогон нового LIVE-аудио и беззвучного fallback. Приёмку плагина и новых аудиосценариев фиксировать отдельно.
 - Ссылки на официальные OBS/Qt/CMake источники и backend contracts приведены в разделе 22 архитектуры и references выбранных навыков. Новые версии не менять молча.
 - GitHub/network используются для разрешённого чтения исходников и документации; профиль сам по себе не разрешает live API-команды, изменение backend, Git push, публикацию, установку плагина или управление эфиром.
 - Obsidian, Jira, сторонние taskbook/wiki и server deployment не подключены.
 
 ## Dependency Policy
 
-- Текущий источник зависимостей — архитектура; CMake/buildspec/lockfile ещё отсутствуют.
+- Источники зависимостей — `buildspec.json`, `cmake/windows/qttest.cmake` и архитектура. Официальные архивы закреплены по версии и SHA256.
 - Запрошенный импорт `agent-projects-tools` разрешён этой задачей. Добавление остальных runtime/development dependencies требует явной авторизации владельца.
-- Будущий каркас использует официальный OBS Plugin Template с закреплёнными OBS 33/Qt зависимостями, а не произвольные latest SDK. Установка/upgrade локальных средств, расширений и смена глобальных defaults автоматически не разрешены.
+- Каркас использует официальный OBS Plugin Template с закреплёнными OBS 33/Qt зависимостями. Установка/upgrade локальных средств, расширений и смена глобальных defaults автоматически не разрешены.
 - Проектные build/runtime workflows не исполняют scripts непосредственно из `.agents/skills/`; нужные assets становятся отдельно управляемой проектной копией только в соответствующей задаче.
 
 ## Product Contracts
@@ -271,13 +340,16 @@ fixtures и существенной конфигурации, включая н
 Перед изменением компонента читать полный соответствующий раздел и зависимости.
 
 - Ровно два основных окна: Dock и одно расширенное окно. Единственная шестерёнка активирует существующий экземпляр; Widgets остаётся текущим UI.
-- OBS владеет единственным штатным streaming output, encoding, RTMP Server и Stream Key. Плагин не меняет streaming service, не создаёт второй output/encoder, не обрабатывает кадры и не реализует FFmpeg/серверную SQLite.
+- OBS владеет единственным штатным streaming output, encoding, RTMP Server и Stream Key. Плагин не меняет streaming service, не создаёт второй output/encoder, не обрабатывает кадры и не реализует FFmpeg/серверную SQLite. В карточке «Потоки» доступен серверный `publication_key` для ручной вставки в OBS; в карточке «Выходы» — `stream_key` и полный `endpoint` Destination, после появления соответствующего чтения backend.
+- Все три значения изначально маскированы; глаз показывает/скрывает, копирование берёт точное значение без предварительного раскрытия. Смена сущности и повторное открытие карточки возвращают маску. Доступ сохраняется для прежних записей после перезапуска OBS, источник истины — сервер. До поддержки чтения показывать недоступность, не фиктивное значение и не локальную постоянную копию. Карточки относятся к T05; в каркасе T01 их ещё нет.
 - Управление — REST/SSE через Qt Network и общий StateStore. HTTP `202` означает принятие; успех требует терминальной квитанции и отдельно наблюдаемого состояния. Сохранять `request_id` при повторе потерянного запроса.
 - Start из Dock ждёт успешную квитанцию и Session `RUNNING` до OBS Start. Pause/Resume относится к серверу; штатный OBS Stop/потеря SSE не завершают Session автоматически.
 - Snapshot → SSE, opaque cursor/epoch, bounded buffers/backoff, отмена и защита от устаревших ответов. Не заменять отсутствие наблюдения нулём или успехом.
 - Output restart и массовые операции — контролируемая последовательность отдельных `stop`/`start` с отдельными квитанциями и частичным результатом; серверных restart-all/reset endpoints не выдумывать.
 - Сброс статистики — только локальный baseline с идентичностью/эпохой; OBS render/encode/network drops, server queue/delivery и ACK показатели не смешивать.
-- Decimal `uint64`/наносекунды, `null`, write-only secrets, `expected_revision`/`409`, полная замена профиля и `encoding` v2 сохраняют серверный контракт. Готовое поколение fallback не равно готовой Session.
+- Decimal `uint64`/наносекунды, отсутствующее поле/`null`, `expected_revision`/`409`, полная замена профиля и `encoding` v2 сохраняют серверный контракт. Отсутствие секретного поля в текущем GET не заменяет значение флагом `*_configured`; PATCH других полей сохраняет ключ/адрес без их явной замены.
+- `profile.live_audio_mode` задаёт LIVE AAC независимо от видео `mode`, вне `encoding` v2. Новый профиль по умолчанию использует AAC `copy`; видео `copy` допускает только AAC `copy`. Отсутствующее поле старого профиля сохраняет наследуемую семантику, не превращается автоматически в новое значение по умолчанию; явный режим передаётся при каждой последующей полной замене. Изменения действуют на новое исполнение, не на закреплённый Output.
+- Fallback всегда содержит цифровую AAC-тишину. `audio_encoding`/`audio_encoder`/`audio_custom` относятся к заглушке и к LIVE только при AAC `transcode`; при `copy` фактический AAC OBS должен быть совместим, автоматического transcode нет. Старый `READY` до генератора `fallback-fmp4-silent-v2` требует rebuild до эфира; ошибка rebuild не делает его пригодным. Публичный DTO не содержит версии рецепта. Готовое поколение не равно готовой Session.
 - Доверенная локальная сеть владельца, REST/SSE без добавления авторизации. TLS проверяется штатно; ключи, секретные endpoint и request payload с секретами в клиентский журнал не попадают.
 - Изменения публичного контракта, UI или среды требуют обновления архитектуры и соответствующих проверок. Нативная сборка не заменяет реальную Windows/OBS/live-приёмку.
 

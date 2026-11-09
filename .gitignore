@@ -4,3 +4,12 @@
 # задачи
 TASKS.md
 TASKS_ARCHIVE.md
+
+# Локальные зависимости, сборка и изолированные проверки OBS.
+/.deps/
+/build/
+/build_x64/
+/release/
+/CMakeUserPresets.json
+/cmake/.CMakeBuildNumber
+.DS_Store
