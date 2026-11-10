@@ -1,23 +1,34 @@
 #include "fixtures/fake-frontend.hpp"
+#include "fixtures/api-json.hpp"
+#include "fixtures/http-server.hpp"
+#include "fixtures/workspace-temp.hpp"
 #include "core/plugin-lifecycle.hpp"
+#include "core/connection-controller.hpp"
+#include "core/settings-store.hpp"
 #include "core/state-store.hpp"
 #include "ui/management-window.hpp"
 #include "ui/restream-dock.hpp"
+#include "api/api-client.hpp"
+#include "api/event-client.hpp"
 
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QEvent>
+#include <QElapsedTimer>
 #include <QLineEdit>
 #include <QLabel>
 #include <QListWidget>
 #include <QMap>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QScrollBar>
 #include <QStackedWidget>
 #include <QTabWidget>
 #include <QTest>
 #include <QToolButton>
+#include <QTimer>
 
 #include <utility>
 #include <thread>
@@ -84,6 +95,10 @@ private slots:
 	void queuedFrontendEventIsDiscardedOnExit();
 	void hostDestructionDoesNotDoubleDelete();
 	void localesAreComplete();
+	void hiddenManagementKeepsOneSubscriptionAndMetadataVersion();
+	void largeStreamListAndRuntimeTrafficAllowGuiProgress();
+	void runtimeUpdatePreservesOpenStreamPopup();
+	void savedStreamIsUnconfirmedUntilListIsComplete();
 };
 
 void PluginLifecycleTest::stateStartsUnobserved()
@@ -506,6 +521,317 @@ void PluginLifecycleTest::localesAreComplete()
 		QVERIFY(!russian.value(key).toString().isEmpty());
 		QVERIFY(!english.value(key).toString().isEmpty());
 	}
+}
+
+void PluginLifecycleTest::hiddenManagementKeepsOneSubscriptionAndMetadataVersion()
+{
+	WorkspaceTemp temp(QStringLiteral("runtime-ui"));
+	QVERIFY(temp.isValid());
+	HttpServer server;
+	QVERIFY(server.listen());
+	QList<HttpServer::Request> subscriptions;
+	server.handler = [&](const auto &request) {
+		if (request.target.startsWith("/api/v1/health/ready"))
+			HttpServer::reply(request, R"({"status":"ready","reason":""})");
+		else if (request.target.startsWith("/api/v1/system/capabilities"))
+			HttpServer::reply(request, fixture::capabilities());
+		else if (request.target.startsWith("/api/v1/streams"))
+			HttpServer::reply(request, fixture::page({fixture::stream()}));
+		else if (request.target.startsWith("/api/v1/events/snapshot"))
+			HttpServer::reply(request, R"({"cursor":"anchor","sessions":[],"gpu":null})");
+		else if (request.target.startsWith("/api/v1/events?")) {
+			subscriptions.append(request);
+			HttpServer::stream(request, ": heartbeat\n\n");
+		}
+	};
+	FakeFrontend frontend;
+	const QString version = QStringLiteral("7.8.9-metadata");
+	gost::PluginLifecycle lifecycle(frontend, localeLookup(),
+					{version, temp.filePath(QStringLiteral("settings.json"))});
+	QVERIFY(lifecycle.load());
+	lifecycle.settingsStore()->setAutoConnect(false);
+	frontend.emitEvent(gost::FrontendEvent::FinishedLoading);
+	QVERIFY(lifecycle.connectionController());
+	lifecycle.connectionController()->connectToServer(server.origin().toString());
+	QTRY_COMPARE_WITH_TIMEOUT(subscriptions.size(), 1, 3000);
+	auto *versionLabel = frontend.content->findChild<QLabel *>(QStringLiteral("pluginVersion"));
+	QVERIFY(versionLabel);
+	QVERIFY(versionLabel->text().contains(version));
+	QCOMPARE(versionLabel->textFormat(), Qt::PlainText);
+	lifecycle.openManagementWindow();
+	QCOMPARE(managementWindows().size(), 1);
+	QPointer<gost::ManagementWindow> window = managementWindows().front();
+	QPointer<gost::StateStore> state = lifecycle.stateStore();
+	QPointer<gost::ConnectionController> controller = lifecycle.connectionController();
+	window->close();
+	dispatchQueuedEvents();
+	QVERIFY(!window->isVisible());
+	QVERIFY(state && controller);
+	subscriptions.front().socket->write(
+		fixture::frame(fixture::event(QStringLiteral("state"), QStringLiteral("while-hidden"))));
+	QTRY_COMPARE_WITH_TIMEOUT(state->runtime().cursor, QStringLiteral("while-hidden"), 2000);
+	lifecycle.openManagementWindow();
+	QCOMPARE(managementWindows().size(), 1);
+	QCOMPARE(managementWindows().front(), window.data());
+	QCOMPARE(lifecycle.connectionController(), controller.data());
+	QCOMPARE(subscriptions.size(), 1);
+	QVERIFY(window->isVisible());
+	frontend.emitEvent(gost::FrontendEvent::Exit);
+	QVERIFY(!state && !controller && !window);
+	dispatchQueuedEvents();
+	QCOMPARE(frontend.callsAfterExit, 0);
+	for (const auto &request : server.requests)
+		QCOMPARE(request.method, QByteArray("GET"));
+}
+
+void PluginLifecycleTest::largeStreamListAndRuntimeTrafficAllowGuiProgress()
+{
+	using namespace gost::api;
+	constexpr int streamCount = 10000;
+	constexpr int sessionCount = 64;
+	constexpr int outputCount = 8;
+	constexpr int eventCount = 256;
+	constexpr int batchSize = 32;
+	QVector<QByteArray> pages;
+	for (int page = 0; page < 100; ++page) {
+		QJsonArray items;
+		for (int index = page * 100; index < (page + 1) * 100; ++index) {
+			auto stream = fixture::stream(QStringLiteral("stream-%1").arg(index));
+			stream.insert(QStringLiteral("name"), QStringLiteral("Поток %1").arg(index));
+			items.append(stream);
+		}
+		pages.append(fixture::page(items, page == 99 ? QString{} : QStringLiteral("page-%1").arg(page + 1)));
+	}
+	Anchor anchor{QStringLiteral("load-anchor"), {}, {FieldState::Null, {}}};
+	for (int index = 0; index < sessionCount; ++index) {
+		RuntimeSession session;
+		session.sessionId = QStringLiteral("session-%1").arg(index);
+		session.observation = {
+			FieldState::Value,
+			{QStringLiteral("session-instance-%1").arg(index), 1, {}, QStringLiteral("RUNNING"), {}}};
+		for (int group = 0; group < 4; ++group) {
+			RuntimeGroup node;
+			node.instanceId = QStringLiteral("group-instance-%1-%2").arg(index).arg(group);
+			node.groupId = QStringLiteral("group-%1").arg(group);
+			node.profileId = QStringLiteral("profile-%1").arg(group);
+			node.state = QStringLiteral("READY");
+			node.revision = 1;
+			node.metrics = {FieldState::Value, {}};
+			session.groups.append(node);
+			for (const auto &role : {QStringLiteral("live"), QStringLiteral("fallback")}) {
+				RuntimeFFmpeg ffmpeg;
+				ffmpeg.instanceId = node.instanceId + QLatin1Char('-') + role;
+				ffmpeg.groupInstanceId = node.instanceId;
+				ffmpeg.role = role;
+				ffmpeg.state = QStringLiteral("RUNNING");
+				ffmpeg.metrics = {FieldState::Value, {}};
+				session.ffmpeg.append(ffmpeg);
+			}
+		}
+		for (int output = 0; output < outputCount; ++output) {
+			RuntimeOutput node;
+			node.outputId = QStringLiteral("output-%1").arg(output);
+			node.instanceId = QStringLiteral("output-instance-%1-%2").arg(index).arg(output);
+			node.state = QStringLiteral("PUBLISHING");
+			node.revision = 1;
+			node.metrics = {FieldState::Value, {}};
+			session.outputs.append(node);
+		}
+		anchor.sessions.append(session);
+	}
+	gost::StateStore state;
+	gost::ManagementWindow window(state, localeLookup());
+	window.show();
+	auto *selector = window.findChild<QComboBox *>(QStringLiteral("streamSelector"));
+	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
+	auto *stack = window.findChild<QStackedWidget *>(QStringLiteral("managementPages"));
+	QVERIFY(selector && navigation && stack);
+	HttpServer server;
+	QVERIFY(server.listen());
+	int pageIndex = 0;
+	server.handler = [&](const auto &request) {
+		if (request.target.startsWith("/api/v1/streams") && pageIndex < pages.size())
+			HttpServer::reply(request, pages[pageIndex++]);
+		else
+			HttpServer::stream(request, ": heartbeat\n\n");
+	};
+	QElapsedTimer clock;
+	clock.start();
+	qint64 last = 0;
+	qint64 maximumGap = 0;
+	int uiProgress = 0;
+	int progressDuringEvents = 0;
+	int received = 0;
+	bool guiConsistent = true;
+	QTimer ticker;
+	connect(&ticker, &QTimer::timeout, &window, [&] {
+		const auto now = clock.nsecsElapsed();
+		maximumGap = qMax(maximumGap, now - last);
+		last = now;
+		navigation->setCurrentRow((navigation->currentRow() + 1) % navigation->count());
+		guiConsistent = guiConsistent && stack->currentIndex() == navigation->currentRow();
+		++uiProgress;
+		if (received > 0 && received < eventCount)
+			++progressDuringEvents;
+	});
+	ticker.start(0);
+	APIClient api;
+	api.configure(server.origin(), {1, 1});
+	bool loaded = false;
+	bool listValid = false;
+	qint64 listElapsed = 0;
+	api.getAllStreams(&window, [&](auto, auto result) {
+		listValid = result && result.value->complete && result.value->items.size() == streamCount;
+		if (result)
+			state.setStreams(std::move(result.value->items), result.value->complete);
+		loaded = true;
+		listElapsed = clock.elapsed();
+	});
+	QTRY_VERIFY_WITH_TIMEOUT(loaded, 10000);
+	QVERIFY(listValid);
+	QCOMPARE(selector->count(), streamCount + 1);
+	state.setSelection(QStringLiteral("stream-9999"), true);
+	QCOMPARE(selector->currentData().toString(), QStringLiteral("stream-9999"));
+	const auto anchorStart = clock.nsecsElapsed();
+	QVERIFY(state.installAnchor(anchor));
+	const auto anchorElapsed = clock.nsecsElapsed() - anchorStart;
+	QCOMPARE(state.runtime().sessions.size(), sessionCount);
+	EventClient events;
+	bool failed = false;
+	bool applied = true;
+	events.subscribe(
+		server.origin(), anchor.cursor, {1, 1}, &window,
+		[&](auto, const auto &event) {
+			const bool accepted = state.applyEvent(event);
+			applied = applied && accepted;
+			++received;
+			return accepted;
+		},
+		[&](auto, auto, bool) { failed = true; });
+	QTRY_VERIFY_WITH_TIMEOUT(server.requests.size() == 101 || failed, 3000);
+	QVERIFY(!failed);
+	const auto trafficStart = clock.nsecsElapsed();
+	for (int batch = 0; batch < eventCount / batchSize; ++batch) {
+		QByteArray wire;
+		for (int number = batch * batchSize; number < (batch + 1) * batchSize; ++number) {
+			const int session = number % sessionCount;
+			const int output = (number / sessionCount) % outputCount;
+			auto event =
+				fixture::event(QStringLiteral("metrics"), QStringLiteral("load-event-%1").arg(number));
+			event.insert(QStringLiteral("owner"), QStringLiteral("output"));
+			event.insert(QStringLiteral("session_id"), QStringLiteral("session-%1").arg(session));
+			event.insert(QStringLiteral("output_id"), QStringLiteral("output-%1").arg(output));
+			event.insert(
+				QStringLiteral("observation"),
+				fixture::observation(QStringLiteral("output-instance-%1-%2").arg(session).arg(output),
+						     2, QString{}));
+			auto metrics = fixture::outputMetrics();
+			auto media = fixture::media();
+			media.insert(QStringLiteral("video_frames"), QString::number(number + 1));
+			metrics.insert(QStringLiteral("media"), media);
+			event.insert(QStringLiteral("output"), metrics);
+			wire += fixture::frame(event);
+		}
+		QVERIFY(server.requests.back().socket);
+		server.requests.back().socket->write(wire);
+		QTRY_VERIFY_WITH_TIMEOUT(received == (batch + 1) * batchSize || failed, 10000);
+		QVERIFY(!failed);
+	}
+	const auto trafficElapsed = clock.nsecsElapsed() - trafficStart;
+	maximumGap = qMax(maximumGap, clock.nsecsElapsed() - last);
+	ticker.stop();
+	events.shutdown();
+	QVERIFY(applied && guiConsistent);
+	QVERIFY(uiProgress > 0);
+	QVERIFY(progressDuringEvents > 0);
+	QCOMPARE(events.confirmedCursor(), QStringLiteral("load-event-255"));
+	QCOMPARE(state.runtime().sessions.size(), sessionCount);
+	for (int number = 0; number < eventCount; ++number) {
+		const auto &session = state.runtime().sessions[QStringLiteral("session-%1").arg(number % sessionCount)];
+		QCOMPARE(session.groups.size(), 4);
+		QCOMPARE(session.ffmpeg.size(), 8);
+		QCOMPARE(session.outputs.size(), outputCount);
+		const auto &output = session.outputs[(number / sessionCount) % outputCount];
+		QCOMPARE(output.state, QStringLiteral("PUBLISHING"));
+		QCOMPARE(output.metrics.value.media.videoFrames, quint64(number + 1));
+	}
+	QCOMPARE(selector->count(), streamCount + 1);
+	QCOMPARE(selector->currentData().toString(), QStringLiteral("stream-9999"));
+	qInfo("Нагрузка GUI: %d Stream/100 страниц, %d Session, 256 групп, 512 Output, 512 FFmpeg; %d SSE metrics в пачках %d; список %lld мс, установка anchor %.3f мс, SSE %.3f мс, максимальный разрыв event loop %.3f мс, продвижений GUI %d (при SSE %d); Qt %s.",
+	      streamCount, sessionCount, eventCount, batchSize, listElapsed, double(anchorElapsed) / 1000000.0,
+	      double(trafficElapsed) / 1000000.0, double(maximumGap) / 1000000.0, uiProgress, progressDuringEvents,
+	      qVersion());
+}
+
+void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
+{
+	WorkspaceTemp temp(QStringLiteral("stream-popup"));
+	QVERIFY(temp.isValid());
+	gost::StateStore state;
+	gost::SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	gost::api::APIClient api;
+	gost::api::EventClient events;
+	gost::ConnectionController controller(state, settings, api, events);
+	QVector<gost::api::Stream> streams;
+	for (int index = 0; index < 1000; ++index) {
+		gost::api::Stream stream;
+		stream.id = QStringLiteral("stream-%1").arg(index);
+		stream.name = QStringLiteral("Поток %1").arg(index);
+		streams.append(stream);
+	}
+	state.setStreams(streams, true);
+	state.setSelection(QStringLiteral("stream-10"), true);
+	state.setConnection(QStringLiteral("http://127.0.0.1:8080"), gost::ConnectionStatus::Connected);
+	QVERIFY(state.installAnchor({QStringLiteral("popup-anchor"), {}, {gost::api::FieldState::Null, {}}}));
+	gost::ManagementWindow window(state, localeLookup(), nullptr, &controller);
+	window.show();
+	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
+	auto *selector = window.findChild<QComboBox *>(QStringLiteral("streamSelector"));
+	QVERIFY(navigation && selector);
+	navigation->setCurrentRow(5);
+	QVERIFY(selector->isEnabled());
+	selector->showPopup();
+	auto *view = selector->view();
+	view->setCurrentIndex(view->model()->index(500, 0));
+	view->scrollTo(view->currentIndex(), QAbstractItemView::PositionAtCenter);
+	QTRY_VERIFY_WITH_TIMEOUT(view->isVisible(), 1000);
+	const int highlighted = view->currentIndex().row();
+	const int scroll = view->verticalScrollBar()->value();
+	QVERIFY(scroll > 0);
+	gost::api::RuntimeEvent update;
+	update.cursor = QStringLiteral("popup-event");
+	update.kind = QStringLiteral("state");
+	update.owner = QStringLiteral("session");
+	update.sessionId = QStringLiteral("session");
+	update.observation.instanceId = QStringLiteral("popup-session-instance");
+	update.observation.revision = 1;
+	update.observation.state = QStringLiteral("RUNNING");
+	QVERIFY(state.applyEvent(update));
+	QVERIFY(view->isVisible());
+	QCOMPARE(view->currentIndex().row(), highlighted);
+	QCOMPARE(view->verticalScrollBar()->value(), scroll);
+	QCOMPARE(selector->currentData().toString(), QStringLiteral("stream-10"));
+	selector->hidePopup();
+}
+
+void PluginLifecycleTest::savedStreamIsUnconfirmedUntilListIsComplete()
+{
+	gost::StateStore state;
+	const auto text = localeLookup();
+	gost::ManagementWindow window(state, text);
+	auto *selector = window.findChild<QComboBox *>(QStringLiteral("streamSelector"));
+	QVERIFY(selector);
+	state.setSelection(QStringLiteral("saved-stream"), true);
+	QCOMPARE(selector->currentText(), text("Stream.Unconfirmed").arg(QStringLiteral("saved-stream")));
+	state.setStreams({}, false);
+	QCOMPARE(selector->currentText(), text("Stream.Unconfirmed").arg(QStringLiteral("saved-stream")));
+	state.setStreams({}, true);
+	QCOMPARE(selector->currentText(), text("Stream.Unavailable").arg(QStringLiteral("saved-stream")));
+	gost::api::Stream stream;
+	stream.id = QStringLiteral("saved-stream");
+	stream.name = QStringLiteral("Подтверждённый поток");
+	state.setStreams({stream}, true);
+	QCOMPARE(selector->currentText(), stream.name);
 }
 
 QTEST_MAIN(PluginLifecycleTest)

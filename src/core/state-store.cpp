@@ -1,10 +1,45 @@
 #include "state-store.hpp"
+#include "api/json-decoder.hpp"
 
 #include <QThread>
+#include <QSet>
 
+#include <algorithm>
 #include <utility>
 
 namespace gost {
+namespace {
+constexpr qsizetype MaxRuntimeObservations = 10000;
+
+qsizetype observationCount(const api::RuntimeSession &session)
+{
+	return 1 + (session.observation ? 1 : 0) + session.groups.size() + session.outputs.size() +
+	       session.ffmpeg.size();
+}
+
+template<class T> api::JsonField<T> present(T value)
+{
+	return {api::FieldState::Value, std::move(value)};
+}
+
+bool validIdentity(const QString &value)
+{
+	return !value.isEmpty() && value.size() <= 4096 && !value.contains(QChar::Null);
+}
+
+template<class T> auto findInstance(QVector<T> &nodes, const QString &instance)
+{
+	return std::find_if(nodes.begin(), nodes.end(),
+			    [&instance](const auto &node) { return node.instanceId == instance; });
+}
+
+template<class T> void eraseInstances(QVector<T> &nodes, const QSet<QString> &instances)
+{
+	nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+				   [&instances](const auto &node) { return instances.contains(node.instanceId); }),
+		    nodes.end());
+}
+} // namespace
 
 StateStore::StateStore(QObject *parent) : QObject(parent) {}
 
@@ -27,6 +62,547 @@ void StateStore::setObsState(QString profileName, bool streamingActive)
 	profileName_ = std::move(profileName);
 	streamingActive_ = streamingActive;
 	emit obsStateChanged();
+}
+
+const QString &StateStore::serverOrigin() const noexcept
+{
+	return origin_;
+}
+ConnectionStatus StateStore::connectionStatus() const noexcept
+{
+	return connectionStatus_;
+}
+const QVector<api::Stream> &StateStore::streams() const noexcept
+{
+	return streams_;
+}
+bool StateStore::streamsComplete() const noexcept
+{
+	return streamsComplete_;
+}
+const QString &StateStore::selectedStreamId() const noexcept
+{
+	return selectedStreamId_;
+}
+bool StateStore::autoConnect() const noexcept
+{
+	return autoConnect_;
+}
+bool StateStore::reconnect() const noexcept
+{
+	return reconnect_;
+}
+const QString &StateStore::safeError() const noexcept
+{
+	return connectionError_.isEmpty() ? settingsError_ : connectionError_;
+}
+
+const QString &StateStore::safeErrorKey() const noexcept
+{
+	return connectionError_.isEmpty() ? settingsErrorKey_ : connectionErrorKey_;
+}
+bool StateStore::settingsUnsaved() const noexcept
+{
+	return settingsUnsaved_;
+}
+bool StateStore::profileResolved() const noexcept
+{
+	return profileResolved_;
+}
+const QString &StateStore::profileNotice() const noexcept
+{
+	return profileNotice_;
+}
+
+const QString &StateStore::profileNoticeKey() const noexcept
+{
+	return profileNoticeKey_;
+}
+const ConfigurationState &StateStore::configuration() const noexcept
+{
+	return configuration_;
+}
+const HistoryState &StateStore::history() const noexcept
+{
+	return history_;
+}
+const DetailState &StateStore::details() const noexcept
+{
+	return details_;
+}
+const RuntimeState &StateStore::runtime() const noexcept
+{
+	return runtime_;
+}
+const std::optional<api::Health> &StateStore::ready() const noexcept
+{
+	return ready_;
+}
+const std::optional<api::Capabilities> &StateStore::capabilities() const noexcept
+{
+	return capabilities_;
+}
+
+QString StateStore::selectedStreamName() const
+{
+	for (const auto &stream : streams_)
+		if (stream.id == selectedStreamId_)
+			return stream.name;
+	return {};
+}
+
+bool StateStore::selectionAvailable() const noexcept
+{
+	return profileResolved_ && !selectedStreamId_.isEmpty() &&
+	       std::any_of(streams_.cbegin(), streams_.cend(),
+			   [this](const auto &stream) { return stream.id == selectedStreamId_; });
+}
+
+void StateStore::setConnection(QString origin, ConnectionStatus status, QString safeError, QString errorKey)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	origin_ = std::move(origin);
+	connectionStatus_ = status;
+	connectionError_ = std::move(safeError);
+	connectionErrorKey_ = std::move(errorKey);
+	emit serverStateChanged();
+}
+
+void StateStore::setPreferences(bool autoConnect, bool reconnect, bool unsaved, QString settingsError, QString errorKey)
+{
+	autoConnect_ = autoConnect;
+	reconnect_ = reconnect;
+	settingsUnsaved_ = unsaved;
+	settingsError_ = std::move(settingsError);
+	settingsErrorKey_ = std::move(errorKey);
+	emit serverStateChanged();
+}
+
+void StateStore::setStreams(QVector<api::Stream> streams, bool complete)
+{
+	streams_ = std::move(streams);
+	streamsComplete_ = complete;
+	configuration_.streams.clear();
+	for (const auto &stream : streams_)
+		configuration_.streams.insert(stream.id, stream);
+	configuration_.streamsStatus = {RuntimeAvailability::Fresh, complete, {}};
+	emit streamsChanged();
+	emit serverStateChanged();
+}
+
+void StateStore::setSelection(QString streamId, bool profileResolved, QString notice, QString noticeKey)
+{
+	selectedStreamId_ = std::move(streamId);
+	profileResolved_ = profileResolved;
+	profileNotice_ = std::move(notice);
+	profileNoticeKey_ = std::move(noticeKey);
+	emit serverStateChanged();
+}
+
+void StateStore::setReady(api::Health ready)
+{
+	ready_ = std::move(ready);
+	emit serverStateChanged();
+}
+
+void StateStore::setCapabilities(api::Capabilities capabilities)
+{
+	capabilities_ = std::move(capabilities);
+	emit serverStateChanged();
+}
+
+void StateStore::setConfiguration(ConfigurationState configuration)
+{
+	configuration_ = std::move(configuration);
+	streams_.clear();
+	streams_.reserve(configuration_.streams.size());
+	for (const auto &stream : configuration_.streams)
+		streams_.append(stream);
+	streamsComplete_ = configuration_.streamsStatus.complete;
+	emit streamsChanged();
+	emit serverStateChanged();
+}
+
+void StateStore::setHistory(HistoryState history)
+{
+	history_ = std::move(history);
+	emit serverStateChanged();
+}
+
+void StateStore::setDetails(DetailState details)
+{
+	details_ = std::move(details);
+	emit serverStateChanged();
+}
+
+void StateStore::markRuntimeStale()
+{
+	if (runtime_.availability == RuntimeAvailability::Fresh)
+		runtime_.availability = RuntimeAvailability::Stale;
+	auto stale = [](ReadStatus &status) {
+		if (status.availability == RuntimeAvailability::Fresh)
+			status.availability = RuntimeAvailability::Stale;
+	};
+	stale(configuration_.streamsStatus);
+	stale(configuration_.destinationsStatus);
+	stale(configuration_.groupsStatus);
+	stale(configuration_.profilesStatus);
+	stale(configuration_.assetsStatus);
+	stale(configuration_.generationsStatus);
+	stale(configuration_.variantsStatus);
+	stale(history_.sessionsStatus);
+	stale(history_.outputsStatus);
+	stale(history_.receiptsStatus);
+	for (auto &status : details_.sessionMetricsStatus)
+		stale(status);
+	for (auto &status : details_.outputsStatus)
+		stale(status);
+	emit runtimeStateChanged();
+	emit serverStateChanged();
+}
+
+void StateStore::clearRuntime()
+{
+	runtime_ = {};
+	gpuInstanceId_.clear();
+	gpuRevision_.reset();
+	watermarks_.clear();
+	emit runtimeStateChanged();
+	emit serverStateChanged();
+}
+
+void StateStore::clearServerState()
+{
+	streams_.clear();
+	streamsComplete_ = false;
+	configuration_ = {};
+	history_ = {};
+	details_ = {};
+	ready_.reset();
+	capabilities_.reset();
+	emit streamsChanged();
+	clearRuntime();
+}
+
+bool StateStore::installAnchor(const api::Anchor &anchor)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (!validIdentity(anchor.cursor))
+		return false;
+	RuntimeState next;
+	QMap<QString, Watermarks> watermarks;
+	QSet<QString> instances;
+	auto addObservation = [&](const api::Observation &observation) {
+		if (!validIdentity(observation.instanceId) || instances.contains(observation.instanceId))
+			return false;
+		instances.insert(observation.instanceId);
+		watermarks[observation.instanceId].state = observation.revision;
+		return true;
+	};
+	for (const auto &session : anchor.sessions) {
+		if (!validIdentity(session.sessionId) || next.sessions.contains(session.sessionId))
+			return false;
+		if (session.observation && !addObservation(*session.observation))
+			return false;
+		QSet<QString> groups;
+		QSet<QString> outputIds;
+		for (const auto &group : session.groups) {
+			if (!validIdentity(group.groupId) || !validIdentity(group.profileId) || !addObservation(group))
+				return false;
+			groups.insert(group.instanceId);
+		}
+		for (const auto &output : session.outputs) {
+			if (!validIdentity(output.outputId) || outputIds.contains(output.outputId) ||
+			    !addObservation(output))
+				return false;
+			outputIds.insert(output.outputId);
+		}
+		for (const auto &ffmpeg : session.ffmpeg) {
+			if (!groups.contains(ffmpeg.groupInstanceId) || ffmpeg.role.size() > 4096 ||
+			    ffmpeg.role.contains(QChar::Null) || !addObservation(ffmpeg))
+				return false;
+		}
+		next.sessions.insert(session.sessionId, session);
+		if (instances.size() + next.sessions.size() > MaxRuntimeObservations)
+			return false;
+	}
+	next.cursor = anchor.cursor;
+	next.gpu = anchor.gpu;
+	next.availability = RuntimeAvailability::Fresh;
+	runtime_ = std::move(next);
+	gpuInstanceId_.clear();
+	gpuRevision_.reset();
+	watermarks_ = std::move(watermarks);
+	emit runtimeStateChanged();
+	emit serverStateChanged();
+	return true;
+}
+
+bool StateStore::applyEvent(const api::RuntimeEvent &event)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (runtime_.cursor.isEmpty() || !validIdentity(event.cursor) || !api::validateRuntimeEvent(event))
+		return false;
+	if (event.cursor == runtime_.cursor)
+		return true;
+	if (event.owner == QStringLiteral("system")) {
+		if (!validIdentity(event.observation.instanceId))
+			return false;
+		if (event.kind == QStringLiteral("removed")) {
+			if (gpuInstanceId_.isEmpty() || gpuInstanceId_ == event.observation.instanceId) {
+				runtime_.gpu = {};
+				gpuInstanceId_.clear();
+				gpuRevision_.reset();
+			}
+		} else if (gpuInstanceId_ != event.observation.instanceId || !gpuRevision_ ||
+			   event.observation.revision > *gpuRevision_) {
+			runtime_.gpu = event.gpu;
+			gpuInstanceId_ = event.observation.instanceId;
+			gpuRevision_ = event.observation.revision;
+		}
+		runtime_.cursor = event.cursor;
+		runtime_.availability = RuntimeAvailability::Fresh;
+		emit runtimeStateChanged();
+		emit serverStateChanged();
+		return true;
+	}
+	const bool stateEvent = event.kind == QStringLiteral("state");
+	const bool metricsEvent = event.kind == QStringLiteral("metrics");
+	const bool inputEvent = event.kind == QStringLiteral("input");
+	const bool attemptEvent = event.kind == QStringLiteral("attempt");
+	const bool removedEvent = event.kind == QStringLiteral("removed");
+	if ((!stateEvent && !metricsEvent && !inputEvent && !attemptEvent && !removedEvent) ||
+	    !validIdentity(event.sessionId) || !validIdentity(event.observation.instanceId))
+		return false;
+	const bool sessionOwner = event.owner == QStringLiteral("session");
+	const bool groupOwner = event.owner == QStringLiteral("group");
+	const bool outputOwner = event.owner == QStringLiteral("output");
+	const bool ffmpegOwner = event.owner == QStringLiteral("ffmpeg");
+	if ((!sessionOwner && !groupOwner && !outputOwner && !ffmpegOwner) ||
+	    (inputEvent && (!sessionOwner || !event.input)) || (attemptEvent && !ffmpegOwner) ||
+	    (groupOwner && (!validIdentity(event.groupId) || !validIdentity(event.profileId))) ||
+	    (outputOwner && !validIdentity(event.outputId)) ||
+	    (ffmpegOwner &&
+	     (!validIdentity(event.groupInstanceId) || event.role.size() > 4096 || event.role.contains(QChar::Null))) ||
+	    (metricsEvent &&
+	     ((sessionOwner && (!event.input || !event.input->metrics)) || (groupOwner && !event.group) ||
+	      (outputOwner && !event.output) || (ffmpegOwner && !event.ffmpeg))))
+		return false;
+	if (stateEvent && event.observation.state.isEmpty())
+		return false;
+	const auto &instance = event.observation.instanceId;
+	if (ffmpegOwner && event.groupInstanceId == instance)
+		return false;
+	for (const auto &existingSession : runtime_.sessions) {
+		if (existingSession.observation && existingSession.observation->instanceId == instance &&
+		    (!sessionOwner || existingSession.sessionId != event.sessionId))
+			return false;
+		for (const auto &group : existingSession.groups)
+			if (group.instanceId == instance &&
+			    (!groupOwner || existingSession.sessionId != event.sessionId ||
+			     (!group.groupId.isEmpty() && group.groupId != event.groupId) ||
+			     (!group.profileId.isEmpty() && group.profileId != event.profileId)))
+				return false;
+		for (const auto &output : existingSession.outputs)
+			if (output.instanceId == instance &&
+			    (!outputOwner || existingSession.sessionId != event.sessionId ||
+			     output.outputId != event.outputId))
+				return false;
+		for (const auto &ffmpeg : existingSession.ffmpeg)
+			if (ffmpeg.instanceId == instance &&
+			    (!ffmpegOwner || existingSession.sessionId != event.sessionId ||
+			     ffmpeg.groupInstanceId != event.groupInstanceId || ffmpeg.role != event.role))
+				return false;
+		if (ffmpegOwner) {
+			if (existingSession.observation &&
+			    existingSession.observation->instanceId == event.groupInstanceId)
+				return false;
+			for (const auto &existing : existingSession.outputs)
+				if (existing.instanceId == event.groupInstanceId)
+					return false;
+			for (const auto &existing : existingSession.ffmpeg)
+				if (existing.instanceId == event.groupInstanceId)
+					return false;
+			for (const auto &existing : existingSession.groups)
+				if (existing.instanceId == event.groupInstanceId &&
+				    existingSession.sessionId != event.sessionId)
+					return false;
+		}
+	}
+	// Изменения сессии и её ревизий устанавливаются только после полной проверки события.
+	auto session = runtime_.sessions.value(event.sessionId);
+	session.sessionId = event.sessionId;
+	if (groupOwner && !event.groupInstanceId.isEmpty() && session.observation &&
+	    event.groupInstanceId != session.observation->instanceId)
+		return false;
+	auto lanes = watermarks_.value(instance);
+	bool lanesChanged = false;
+	QSet<QString> removed;
+	auto removeSession = [&] {
+		if (session.observation)
+			removed.insert(session.observation->instanceId);
+		for (const auto &group : session.groups)
+			removed.insert(group.instanceId);
+		for (const auto &output : session.outputs)
+			removed.insert(output.instanceId);
+		for (const auto &ffmpeg : session.ffmpeg)
+			removed.insert(ffmpeg.instanceId);
+		session = {};
+		session.sessionId = event.sessionId;
+	};
+	auto removeGroup = [&](const QString &groupInstance) {
+		removed.insert(groupInstance);
+		for (const auto &ffmpeg : session.ffmpeg)
+			if (ffmpeg.groupInstanceId == groupInstance)
+				removed.insert(ffmpeg.instanceId);
+	};
+	bool eraseSession = false;
+	bool ignored = false;
+	api::Observation *observation = nullptr;
+	api::RuntimeGroup *group = nullptr;
+	api::RuntimeOutput *output = nullptr;
+	api::RuntimeFFmpeg *ffmpeg = nullptr;
+	if (sessionOwner) {
+		if (removedEvent) {
+			if (session.observation && session.observation->instanceId == instance) {
+				removeSession();
+				eraseSession = true;
+			} else if (!session.observation && runtime_.sessions.contains(event.sessionId)) {
+				return false;
+			}
+			ignored = true;
+		} else {
+			if (session.observation && session.observation->instanceId != instance)
+				removeSession();
+			if (!session.observation) {
+				api::Observation unknown;
+				unknown.instanceId = instance;
+				session.observation = present(std::move(unknown));
+			}
+			observation = &*session.observation;
+		}
+	} else if (groupOwner) {
+		auto found = findInstance(session.groups, instance);
+		if (removedEvent) {
+			if (found != session.groups.end())
+				removeGroup(instance);
+			ignored = true;
+		} else {
+			if (found == session.groups.end()) {
+				api::RuntimeGroup unknown;
+				unknown.instanceId = instance;
+				session.groups.push_back(std::move(unknown));
+			}
+			group = &*findInstance(session.groups, instance);
+			group->groupId = event.groupId;
+			group->profileId = event.profileId;
+			observation = group;
+		}
+	} else if (outputOwner) {
+		auto found = findInstance(session.outputs, instance);
+		if (removedEvent) {
+			if (found != session.outputs.end())
+				removed.insert(instance);
+			ignored = true;
+		} else {
+			if (found == session.outputs.end()) {
+				for (const auto &old : session.outputs)
+					if (old.outputId == event.outputId)
+						removed.insert(old.instanceId);
+				eraseInstances(session.outputs, removed);
+				api::RuntimeOutput unknown;
+				unknown.instanceId = instance;
+				unknown.outputId = event.outputId;
+				session.outputs.push_back(std::move(unknown));
+			}
+			output = &*findInstance(session.outputs, instance);
+			observation = output;
+		}
+	} else {
+		auto found = findInstance(session.ffmpeg, instance);
+		if (removedEvent) {
+			if (found != session.ffmpeg.end())
+				removed.insert(instance);
+			ignored = true;
+		} else {
+			auto parent = findInstance(session.groups, event.groupInstanceId);
+			if (parent == session.groups.end()) {
+				api::RuntimeGroup unknown;
+				unknown.instanceId = event.groupInstanceId;
+				session.groups.push_back(std::move(unknown));
+			}
+			if (found == session.ffmpeg.end()) {
+				api::RuntimeFFmpeg unknown;
+				unknown.instanceId = instance;
+				unknown.groupInstanceId = event.groupInstanceId;
+				unknown.role = event.role;
+				session.ffmpeg.push_back(std::move(unknown));
+			}
+			ffmpeg = &*findInstance(session.ffmpeg, instance);
+			observation = ffmpeg;
+		}
+	}
+	if (!ignored) {
+		lanesChanged = true;
+		if (attemptEvent) {
+			ffmpeg->metrics = {};
+			ffmpeg->state.clear();
+			ffmpeg->observedAt = {};
+			ffmpeg->failure = {};
+			lanes.metrics.reset();
+		} else if (inputEvent) {
+			if (event.observation.revision != 0)
+				return false;
+			session.input = event.input;
+			session.input->metrics = {};
+			lanes.metrics.reset();
+		} else if (stateEvent) {
+			if (!lanes.state || event.observation.revision > *lanes.state) {
+				*observation = event.observation;
+				lanes.state = event.observation.revision;
+				if (group) {
+					group->source = event.source;
+					group->sourceRevision = event.sourceRevision;
+				}
+			}
+		} else if (metricsEvent && (!lanes.metrics || event.observation.revision > *lanes.metrics)) {
+			lanes.metrics = event.observation.revision;
+			if (sessionOwner) {
+				if (!session.input)
+					session.input = event.input;
+				else
+					session.input->metrics = event.input->metrics;
+			} else if (group) {
+				group->metrics = event.group;
+			} else if (output) {
+				output->metrics = event.output;
+			} else {
+				ffmpeg->metrics = event.ffmpeg;
+			}
+		}
+	}
+	eraseInstances(session.groups, removed);
+	eraseInstances(session.outputs, removed);
+	eraseInstances(session.ffmpeg, removed);
+	qsizetype count = eraseSession ? 0 : observationCount(session);
+	for (const auto &existingSession : runtime_.sessions)
+		if (existingSession.sessionId != event.sessionId)
+			count += observationCount(existingSession);
+	if (count > MaxRuntimeObservations)
+		return false;
+	if (eraseSession)
+		runtime_.sessions.remove(event.sessionId);
+	else if (!ignored || runtime_.sessions.contains(event.sessionId))
+		runtime_.sessions.insert(event.sessionId, std::move(session));
+	for (const auto &id : removed)
+		watermarks_.remove(id);
+	if (lanesChanged)
+		watermarks_.insert(instance, std::move(lanes));
+	runtime_.cursor = event.cursor;
+	runtime_.availability = RuntimeAvailability::Fresh;
+	emit runtimeStateChanged();
+	emit serverStateChanged();
+	return true;
 }
 
 } // namespace gost

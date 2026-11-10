@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/GregoryGost/gost-restreamer",
+  "branch": "develop",
+  "commit": "103d839b11591fbb786fd027aefa143a2ff79036",
+  "contract": "docs/api-contracts.md",
+  "server_origin": "http://192.168.88.8:8080",
+  "schema_route": "/api/v1/openapi.json",
+  "retrieved_at_utc": "2026-11-09T22:47:03.9386299Z",
+  "schema_sha256": "9F6C45C1A8C1EEF0B3CD9BD1457AAE31EE0366AE096740F404640A5746EAA50C",
+  "api_version": "1.0.0",
+  "deployment_evidence": "Владелец сообщил об установке последней версии GitHub; HEAD develop и структура свежей схемы сверены. Хеш установленного бинарника отдельно не измерялся.",
+  "binary_hash_verified": false
+}

@@ -14,6 +14,8 @@ public:
 	void addEventCallback(EventCallback callback, void *cookie) override;
 	void removeEventCallback(EventCallback callback, void *cookie) override;
 	QString currentProfile() const override;
+	QString currentProfilePath() const override;
+	QStringList profiles() const override;
 	bool streamingActive() const override;
 
 private:

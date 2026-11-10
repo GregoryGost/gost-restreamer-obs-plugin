@@ -1,0 +1,21 @@
+#pragma once
+
+#include <QDir>
+#include <QTemporaryDir>
+
+class WorkspaceTemp final {
+public:
+	explicit WorkspaceTemp(const QString &name) : directory_(makeTemplate(name)) {}
+	bool isValid() const { return directory_.isValid(); }
+	QString path() const { return directory_.path(); }
+	QString filePath(const QString &name) const { return directory_.filePath(name); }
+
+private:
+	static QString makeTemplate(const QString &name)
+	{
+		const QString root = QStringLiteral(GOST_TEST_WORKSPACE_DIR);
+		QDir().mkpath(root);
+		return QDir(root).filePath(name + QStringLiteral("-XXXXXX"));
+	}
+	QTemporaryDir directory_;
+};

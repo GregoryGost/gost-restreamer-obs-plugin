@@ -1,5 +1,6 @@
 #include <obs-module.h>
 #include <plugin-support.h>
+#include <util/bmem.h>
 
 #include "core/plugin-lifecycle.hpp"
 #include "obs/obs-frontend.hpp"
@@ -25,9 +26,14 @@ bool obs_module_load(void)
 			return true;
 		}
 		frontend = std::make_unique<gost::OBSFrontend>();
-		lifecycle = std::make_unique<gost::PluginLifecycle>(*frontend, [](const char *key) {
-			return QString::fromUtf8(obs_module_text(key));
-		});
+		const std::unique_ptr<char, decltype(&bfree)> settingsPath(obs_module_config_path("settings.json"),
+									   &bfree);
+		gost::PluginOptions options;
+		options.version = QString::fromUtf8(PLUGIN_VERSION);
+		options.settingsFile = settingsPath ? QString::fromUtf8(settingsPath.get()) : QString{};
+		lifecycle = std::make_unique<gost::PluginLifecycle>(
+			*frontend, [](const char *key) { return QString::fromUtf8(obs_module_text(key)); },
+			std::move(options));
 		if (!lifecycle->load()) {
 			lifecycle.reset();
 			frontend.reset();

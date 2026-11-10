@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
+#include <QMetaType>
 
 class QWidget;
 
@@ -8,12 +10,22 @@ namespace gost {
 
 enum class FrontendEvent {
 	FinishedLoading,
+	ProfileChanging,
 	ProfileChanged,
+	ProfileRenamed,
+	ProfileListChanged,
 	StreamingStarting,
 	StreamingStarted,
 	StreamingStopping,
 	StreamingStopped,
 	Exit,
+};
+
+struct ProfileDescriptor {
+	QString name;
+	QString path;
+	QStringList inventory;
+	bool valid = false;
 };
 
 class Frontend {
@@ -28,7 +40,12 @@ public:
 	virtual void addEventCallback(EventCallback callback, void *cookie) = 0;
 	virtual void removeEventCallback(EventCallback callback, void *cookie) = 0;
 	virtual QString currentProfile() const = 0;
+	virtual QString currentProfilePath() const = 0;
+	virtual QStringList profiles() const = 0;
 	virtual bool streamingActive() const = 0;
 };
 
 } // namespace gost
+
+Q_DECLARE_METATYPE(gost::FrontendEvent)
+Q_DECLARE_METATYPE(gost::ProfileDescriptor)

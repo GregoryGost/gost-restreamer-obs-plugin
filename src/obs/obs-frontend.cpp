@@ -16,9 +16,14 @@ std::optional<FrontendEvent> translateEvent(obs_frontend_event event)
 	switch (event) {
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 		return FrontendEvent::FinishedLoading;
+	case OBS_FRONTEND_EVENT_PROFILE_CHANGING:
+		return FrontendEvent::ProfileChanging;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
-	case OBS_FRONTEND_EVENT_PROFILE_RENAMED:
 		return FrontendEvent::ProfileChanged;
+	case OBS_FRONTEND_EVENT_PROFILE_RENAMED:
+		return FrontendEvent::ProfileRenamed;
+	case OBS_FRONTEND_EVENT_PROFILE_LIST_CHANGED:
+		return FrontendEvent::ProfileListChanged;
 	case OBS_FRONTEND_EVENT_STREAMING_STARTING:
 		return FrontendEvent::StreamingStarting;
 	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
@@ -73,6 +78,24 @@ QString OBSFrontend::currentProfile() const
 {
 	const std::unique_ptr<char, decltype(&bfree)> profile(obs_frontend_get_current_profile(), &bfree);
 	return profile ? QString::fromUtf8(profile.get()) : QString{};
+}
+
+QString OBSFrontend::currentProfilePath() const
+{
+	const std::unique_ptr<char, decltype(&bfree)> path(obs_frontend_get_current_profile_path(), &bfree);
+	return path ? QString::fromUtf8(path.get()) : QString{};
+}
+
+QStringList OBSFrontend::profiles() const
+{
+	const std::unique_ptr<char *, decltype(&bfree)> names(obs_frontend_get_profiles(), &bfree);
+	QStringList result;
+	if (names) {
+		for (char **name = names.get(); *name; ++name) {
+			result.append(QString::fromUtf8(*name));
+		}
+	}
+	return result;
 }
 
 bool OBSFrontend::streamingActive() const

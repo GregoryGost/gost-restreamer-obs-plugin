@@ -78,6 +78,20 @@ public:
 		return profile;
 	}
 
+	QString currentProfilePath() const override
+	{
+		recordCall();
+		++profilePathReads;
+		return profilePath;
+	}
+
+	QStringList profiles() const override
+	{
+		recordCall();
+		++inventoryReads;
+		return profileInventory.isEmpty() ? QStringList{profile} : profileInventory;
+	}
+
 	bool streamingActive() const override
 	{
 		recordCall();
@@ -105,6 +119,8 @@ public:
 	QPointer<QDockWidget> dock;
 	QPointer<QWidget> content;
 	QString profile = QStringLiteral("Основной профиль");
+	QString profilePath = QStringLiteral("profiles/main");
+	QStringList profileInventory;
 	QString dockId;
 	QString dockTitle;
 	QString removedId;
@@ -121,6 +137,8 @@ public:
 	int callbackRemoves = 0;
 	int invalidCallbackOperations = 0;
 	mutable int profileReads = 0;
+	mutable int profilePathReads = 0;
+	mutable int inventoryReads = 0;
 	mutable int streamingReads = 0;
 	mutable int callsAfterExit = 0;
 	EventCallback activeCallback = nullptr;

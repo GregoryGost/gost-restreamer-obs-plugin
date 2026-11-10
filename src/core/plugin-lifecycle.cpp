@@ -1,5 +1,9 @@
 #include "plugin-lifecycle.hpp"
 
+#include "api/api-client.hpp"
+#include "api/event-client.hpp"
+#include "core/connection-controller.hpp"
+#include "core/settings-store.hpp"
 #include "core/state-store.hpp"
 #include "obs/frontend.hpp"
 #include "obs/obs-controller.hpp"
@@ -17,20 +21,39 @@ namespace gost {
 
 class PluginLifecycle::Runtime final : public QObject {
 public:
-	explicit Runtime(Frontend &frontend)
+	explicit Runtime(Frontend &frontend, const PluginOptions &options)
 	{
-		stateStore = new StateStore(this);
-		controller = new OBSController(frontend, *stateStore, this);
+		stateStore = std::make_unique<StateStore>();
+		settings = std::make_unique<SettingsStore>(options.settingsFile);
+		apiClient = std::make_unique<api::APIClient>();
+		eventClient = std::make_unique<api::EventClient>();
+		connection = std::make_unique<ConnectionController>(*stateStore, *settings, *apiClient, *eventClient);
+		controller = std::make_unique<OBSController>(frontend, *stateStore);
+		connect(controller.get(), &OBSController::profileObserved, connection.get(),
+			&ConnectionController::observeProfile);
 	}
-	~Runtime() override { delete managementWindow.data(); }
+	~Runtime() override
+	{
+		connection->shutdown();
+		delete managementWindow.data();
+	}
 
-	StateStore *stateStore = nullptr;
-	OBSController *controller = nullptr;
+	std::unique_ptr<StateStore> stateStore;
+	std::unique_ptr<SettingsStore> settings;
+	std::unique_ptr<api::APIClient> apiClient;
+	std::unique_ptr<api::EventClient> eventClient;
+	std::unique_ptr<ConnectionController> connection;
+	std::unique_ptr<OBSController> controller;
 	QPointer<RestreamDock> dock;
 	QPointer<ManagementWindow> managementWindow;
 };
 
-PluginLifecycle::PluginLifecycle(Frontend &frontend, TextLookup text) : frontend_(frontend), text_(std::move(text)) {}
+PluginLifecycle::PluginLifecycle(Frontend &frontend, TextLookup text, PluginOptions options)
+	: frontend_(frontend),
+	  text_(std::move(text)),
+	  options_(std::move(options))
+{
+}
 
 PluginLifecycle::~PluginLifecycle()
 {
@@ -47,8 +70,8 @@ bool PluginLifecycle::load()
 		return true;
 	}
 	try {
-		runtime_ = std::make_unique<Runtime>(frontend_);
-		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_);
+		runtime_ = std::make_unique<Runtime>(frontend_, options_);
+		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_, nullptr, options_.version);
 		runtime_->dock = dock.get();
 		connect(dock.get(), &RestreamDock::managementRequested, runtime_.get(),
 			[this] { openManagementWindow(); });
@@ -75,6 +98,9 @@ void PluginLifecycle::shutdown() noexcept
 	}
 	shuttingDown_ = true;
 	Q_ASSERT(!runtime_ || QThread::currentThread() == thread());
+	if (runtime_) {
+		runtime_->connection->shutdown();
+	}
 	if (callbackRegistered_) {
 		callbackRegistered_ = false;
 		try {
@@ -105,8 +131,8 @@ void PluginLifecycle::openManagementWindow()
 	}
 	try {
 		if (!runtime_->managementWindow) {
-			runtime_->managementWindow =
-				new ManagementWindow(*runtime_->stateStore, text_, frontend_.mainWindow());
+			runtime_->managementWindow = new ManagementWindow(
+				*runtime_->stateStore, text_, frontend_.mainWindow(), runtime_->connection.get());
 		}
 		auto *window = runtime_->managementWindow.data();
 		if (window->isMinimized()) {
@@ -122,7 +148,17 @@ void PluginLifecycle::openManagementWindow()
 
 StateStore *PluginLifecycle::stateStore() const noexcept
 {
-	return runtime_ ? runtime_->stateStore : nullptr;
+	return runtime_ ? runtime_->stateStore.get() : nullptr;
+}
+
+SettingsStore *PluginLifecycle::settingsStore() const noexcept
+{
+	return runtime_ ? runtime_->settings.get() : nullptr;
+}
+
+ConnectionController *PluginLifecycle::connectionController() const noexcept
+{
+	return runtime_ ? runtime_->connection.get() : nullptr;
 }
 
 void PluginLifecycle::frontendEvent(FrontendEvent event, void *cookie) noexcept
@@ -135,7 +171,7 @@ void PluginLifecycle::frontendEvent(FrontendEvent event, void *cookie) noexcept
 	}
 }
 
-void PluginLifecycle::handleEvent(FrontendEvent event)
+void PluginLifecycle::handleEvent(FrontendEvent event, bool reliableProfile)
 {
 	if (shuttingDown_ || !runtime_) {
 		return;
@@ -147,10 +183,18 @@ void PluginLifecycle::handleEvent(FrontendEvent event)
 	}
 	if (QThread::currentThread() != thread()) {
 		QMetaObject::invokeMethod(
-			runtime_.get(), [this, event] { frontendEvent(event, this); }, Qt::QueuedConnection);
+			runtime_.get(),
+			[this, event] {
+				try {
+					handleEvent(event, false);
+				} catch (...) {
+					qWarning("Не удалось обработать отложенное событие OBS.");
+				}
+			},
+			Qt::QueuedConnection);
 		return;
 	}
-	runtime_->controller->handleEvent(event);
+	runtime_->controller->handleEvent(event, reliableProfile);
 }
 
 } // namespace gost

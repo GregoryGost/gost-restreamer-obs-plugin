@@ -13,10 +13,12 @@ class OBSController final : public QObject {
 
 public:
 	OBSController(Frontend &frontend, StateStore &stateStore, QObject *parent = nullptr);
-	void handleEvent(FrontendEvent event);
+	void handleEvent(FrontendEvent event, bool reliableProfile = true);
+
+signals:
+	void profileObserved(gost::FrontendEvent event, const gost::ProfileDescriptor &profile);
 
 private:
-	void observe();
 	Frontend &frontend_;
 	StateStore &stateStore_;
 	bool ready_ = false;

@@ -1,5 +1,6 @@
 # AI
 .codex/config.toml
+/.agent-handoffs/
 
 # задачи
 TASKS.md

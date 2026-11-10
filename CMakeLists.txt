@@ -30,10 +30,25 @@ target_sources(
     src/core/state-store.hpp
     src/core/plugin-lifecycle.cpp
     src/core/plugin-lifecycle.hpp
+    src/core/settings-store.cpp
+    src/core/settings-store.hpp
+    src/core/connection-controller.cpp
+    src/core/connection-controller.hpp
+    src/api/models.hpp
+    src/api/json-decoder.cpp
+    src/api/json-decoder.hpp
+    src/api/api-client.cpp
+    src/api/api-client.hpp
+    src/api/event-client.cpp
+    src/api/event-client.hpp
+    src/api/sse-parser.cpp
+    src/api/sse-parser.hpp
+    src/api/network-origin.hpp
     src/obs/frontend.hpp
     src/obs/obs-controller.cpp
     src/obs/obs-controller.hpp
     src/ui/text-lookup.hpp
+    src/ui/connection-text.hpp
     src/ui/restream-dock.cpp
     src/ui/restream-dock.hpp
     src/ui/management-window.cpp
@@ -41,7 +56,7 @@ target_sources(
 )
 target_include_directories(gost-restreamer-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(gost-restreamer-core PUBLIC cxx_std_20)
-target_link_libraries(gost-restreamer-core PUBLIC Qt6::Core Qt6::Widgets)
+target_link_libraries(gost-restreamer-core PUBLIC Qt6::Core Qt6::Widgets Qt6::Network)
 set_target_properties(gost-restreamer-core PROPERTIES AUTOMOC ON CXX_EXTENSIONS OFF)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
