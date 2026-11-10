@@ -67,7 +67,9 @@
 - `cpp-style`
 - `cpp-cmake`
 - `cpp-testing`
+- `cpp-http-client`
 - `qt-core`
+- `qt-http-client`
 - `qt-widgets`
 - `qt-testing`
 - `qt-quick-qml`
@@ -82,8 +84,8 @@ Qt Quick runtime, модули или третье окно. Материалы 
 - Required routing rule: `.codex/rules/request_routing.md`.
 - Общие: `source_code_hygiene.md`, `git.md`.
 - Документация: `context7_documentation.md`.
-- C++: `cpp_core.md`, `cpp_style.md`, `cpp_cmake.md`, `cpp_testing.md`.
-- Qt 6: `qt_core.md`, `qt_widgets.md`, `qt_testing.md`, `qt_quick_qml.md`.
+- C++: `cpp_core.md`, `cpp_style.md`, `cpp_cmake.md`, `cpp_testing.md`, `cpp_http_client.md`.
+- Qt 6: `qt_core.md`, `qt_http_client.md`, `qt_widgets.md`, `qt_testing.md`, `qt_quick_qml.md`.
 
 Все дополнительные правила находятся в `.codex/rules/`; здесь использованы
 точные имена файлов согласно activation contract upstream. Условные
@@ -96,7 +98,9 @@ bootstrap-правила проверки зависимостей и коорд
 - `cpp-style`
 - `cpp-cmake`
 - `cpp-testing`
+- `cpp-http-client`
 - `qt-core`
+- `qt-http-client`
 - `qt-widgets`
 - `qt-testing`
 - `qt-quick-qml`
@@ -212,6 +216,15 @@ fixtures и существенной конфигурации, включая н
 - Sanitizers, coverage и benchmarks: не выбраны, порог coverage отсутствует. Применять только поддерживаемую и явно настроенную конфигурацию, без переносимых универсальных процентов.
 - Active pair: `cpp_testing.md` + `cpp-testing`.
 
+## C++ HTTP Client Profile
+
+- Транспорт исходящих REST/SSE-запросов — `Qt6::Network` 6.11.1 в `gost-restreamer-core`. Версию закрепляет `CMakeLists.txt`, источник SDK — `buildspec.json`.
+- `APIClient` выполняет GET, `EventClient` подписывается на `/api/v1/events`. Закреплённый контракт backend и доверенная локальная сеть описаны ниже и в разделах 7, 8, 12 и 14 архитектуры. Клиент использует явно выбранный HTTP(S) origin, штатную проверку TLS и ручную политику редиректов.
+- Для REST от отправки запроса действуют отдельные лимиты длительности (15 с) и простоя (10 с). Максимум 4 активных и 32 ожидающих запроса. Лимиты тела — 8 MiB для REST и 16 MiB для snapshot. Обход списка ограничен 100 страницами, 10 000 элементами и 64 MiB.
+- У `APIClient` нет общего механизма повторов. `ConnectionController` отдельно управляет восстановлением подключения, повторным snapshot и подпиской. Для команд сохранять контракт идемпотентности с тем же `request_id` при потере ответа.
+- Правила раскрытия данных заданы в `Product Contracts` и разделах 14–15 архитектуры. Диагностика клиента не включает ключи, секретные endpoint и тела запросов с секретами.
+- Active pair: `cpp_http_client.md` + `cpp-http-client`. Обязательная база — `cpp_core.md` + `cpp-core`.
+
 ## Qt 6 Core Profile
 
 - Qt enabled: yes, целевая версия SDK и OBS runtime — 6.11.1. SDK берётся из официального пакета OBS `2026-10-23` в `.deps/obs-deps-qt6-2026-10-23-x64`; SHA256 закреплён в `buildspec.json`. Совместимость ABI проверять сборкой и загрузкой DLL.
@@ -225,6 +238,15 @@ fixtures и существенной конфигурации, включая н
 - Clazy: checks и gate не выбраны.
 - Документация: Context7 при надёжном совпадении версии; иначе официальная version-matched документация Qt и ссылки активных навыков. Не заменять неизвестную версию на latest.
 - Active pair: `qt_core.md` + `qt-core`.
+
+## Qt HTTP Client Profile
+
+- `PluginLifecycle::Runtime` владеет `APIClient`, `EventClient` и `ConnectionController`. Каждый сетевой клиент владеет своим `QNetworkAccessManager` с NoProxy и работает в GUI Qt event loop. Replies читаются по частям, отменяются при смене контекста или завершении и освобождаются через `deleteLater()` либо уничтожение владельца. Таймеры и callbacks учитывают поколение запроса и время жизни получателя.
+- Используются `QNetworkAccessManager`, `QNetworkRequest` и `QNetworkReply`. Выбор протокола оставлен Qt. Обязательного HTTP/2 и отдельной проверки его согласования в проекте нет.
+- SSE использует отдельные таймеры заголовков (15 с) и простоя (45 с) без общего срока жизни подписки. Лимиты чтения, кадра и очереди — 256 KiB, 1 MiB и 4 MiB / 256 событий. За оборот event loop обрабатывается до 32 событий и 256 KiB либо один крупный допустимый кадр.
+- После установки snapshot подписка передаёт непрозрачный query `cursor`. В runtime-событии SSE `id` должен совпадать с `cursor` из JSON. Курсор подтверждается после применения события. При обрыве восстановление использует подтверждённый cursor, при `resync_required` или недостоверном продолжении нужен новый snapshot. Политика восстановления — `QTimer`, backoff 1–30 с с jitter и до трёх стартов за 10 с. См. разделы 8 и 12 архитектуры.
+- Изолированные проверки — `gost-restreamer.sse`, `gost-restreamer.network`, `gost-restreamer.connection`, `gost-restreamer.lifecycle` в preset `windows-x64-offline`. Они используют Qt Test и локальные fixtures. Приёмка в OBS проводится отдельно.
+- Active pair: `qt_http_client.md` + `qt-http-client`. Обязательные базы — `cpp_http_client.md` + `cpp-http-client` и `qt_core.md` + `qt-core`.
 
 ## Qt Widgets Profile
 
@@ -270,7 +292,7 @@ fixtures и существенной конфигурации, включая н
 | Build с символами / Release | `cmake --build --preset windows-x64`; `cmake --build --preset windows-x64-release` |
 | Установка в staging | `cmake --install build_x64 --config RelWithDebInfo`; preset направляет результат в `build/install/` |
 | Формат C++ | clang-format 19.1.5 `--dry-run --Werror` только для собственных затронутых `src` и `tests` |
-| Локальные UI/lifecycle | `ctest --preset windows-x64-offline` |
+| Локальные UI, lifecycle, HTTP/SSE | `ctest --preset windows-x64-offline` |
 | Локальные и backend GET | `ctest --preset windows-x64`; `ctest --preset windows-x64-release` |
 | PE/экспорты/раскладка | `tests/integration/Test-PluginArtifact.ps1 -PluginRoot <workspace-stage/plugin> -ExpectedBinary <workspace-DLL> -Dumpbin <dumpbin.exe>` |
 | Изолированный OBS portable | `tests/integration/Test-PortableObs.ps1 -ObsRoot <fresh-workspace-OBS33> -Locale ru-RU` (отдельная свежая среда для `en-US`) |
@@ -331,6 +353,6 @@ Offscreen-проверки, загрузка DLL, нативное поведе�
 ## Imported Materials
 
 - Upstream: `https://github.com/GregoryGost/agent-projects-tools`.
-- Revision: `ff4393f50c7d2e47cc03197e6e45ed087c89c954` (`master`).
+- Revision: `be85eb155a7b8fc4ae52259fa49a3c20c9e56929` (`v1.18.0`).
 - Переносимые rules/skills/roles подключены выборочно; `AGENTS.md` и общие правила адаптированы к целевому проекту.
 - Локальный `.codex/config.toml` остаётся вне Git; `.codex/config.example.toml` содержит воспроизводимый пример без секретов.

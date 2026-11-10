@@ -1,0 +1,4 @@
+interface:
+  display_name: "C++ HTTP Client"
+  short_description: "Outgoing C++ HTTP, HTTP/2, retries, TLS and SSE"
+  default_prompt: "Use $cpp-http-client for version-aware outgoing C++ HTTP contracts, actual selected transport, bounded safe retries, streaming/SSE framing and isolated validation. Do not add dependencies automatically."

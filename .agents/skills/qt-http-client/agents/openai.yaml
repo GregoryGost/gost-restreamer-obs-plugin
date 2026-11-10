@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qt HTTP Client"
+  short_description: "Qt Network, async HTTP/2, retries and SSE"
+  default_prompt: "Use $qt-http-client for Qt 6 Network/REST HTTP clients with QNetworkReply lifecycle, negotiated HTTP/2, QTimer retries and SSE parsing/reconnect over Qt Network. Respect selected SDK and no extra SSE library."
