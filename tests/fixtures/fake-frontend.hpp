@@ -99,6 +99,19 @@ public:
 		return streaming;
 	}
 
+	gost::ObsStatisticsSample readStatistics() override
+	{
+		recordCall();
+		++statisticsReads;
+		return statistics;
+	}
+
+	void releaseStatistics() noexcept override
+	{
+		recordCall();
+		++statisticsReleases;
+	}
+
 	void emitEvent(gost::FrontendEvent event)
 	{
 		const auto callback = activeCallback;
@@ -125,6 +138,7 @@ public:
 	QString dockTitle;
 	QString removedId;
 	QStringList cleanupOrder;
+	gost::ObsStatisticsSample statistics;
 	bool streaming = false;
 	bool acceptDock = true;
 	bool frontendUnavailable = false;
@@ -136,6 +150,8 @@ public:
 	int callbackAdds = 0;
 	int callbackRemoves = 0;
 	int invalidCallbackOperations = 0;
+	int statisticsReads = 0;
+	int statisticsReleases = 0;
 	mutable int profileReads = 0;
 	mutable int profilePathReads = 0;
 	mutable int inventoryReads = 0;

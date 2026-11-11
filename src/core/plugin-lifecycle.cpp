@@ -99,6 +99,7 @@ void PluginLifecycle::shutdown() noexcept
 	shuttingDown_ = true;
 	Q_ASSERT(!runtime_ || QThread::currentThread() == thread());
 	if (runtime_) {
+		runtime_->controller->shutdown();
 		runtime_->connection->shutdown();
 	}
 	if (callbackRegistered_) {

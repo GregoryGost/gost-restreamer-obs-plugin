@@ -28,6 +28,9 @@ target_sources(
   PRIVATE
     src/core/state-store.cpp
     src/core/state-store.hpp
+    src/core/dock-server-state.hpp
+    src/core/stats-baseline.cpp
+    src/core/stats-baseline.hpp
     src/core/plugin-lifecycle.cpp
     src/core/plugin-lifecycle.hpp
     src/core/settings-store.cpp
@@ -47,6 +50,9 @@ target_sources(
     src/obs/frontend.hpp
     src/obs/obs-controller.cpp
     src/obs/obs-controller.hpp
+    src/obs/obs-statistics.hpp
+    src/obs/obs-stats-collector.cpp
+    src/obs/obs-stats-collector.hpp
     src/ui/text-lookup.hpp
     src/ui/status-label.hpp
     src/ui/restream-dock.cpp

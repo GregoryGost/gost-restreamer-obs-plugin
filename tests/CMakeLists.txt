@@ -39,8 +39,9 @@ gost_add_offline_test(state unit/state-store-test.cpp)
 gost_add_offline_test(settings unit/settings-store-test.cpp)
 gost_add_offline_test(network integration/api-network-test.cpp)
 gost_add_offline_test(connection integration/connection-controller-test.cpp)
+gost_add_offline_test(stats-baseline unit/stats-baseline-test.cpp)
 
-foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection)
+foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection stats-baseline)
   target_compile_definitions(
     gost-restreamer-${name}-test
     PRIVATE
@@ -61,6 +62,6 @@ endif()
 set_tests_properties(
   gost-restreamer.lifecycle gost-restreamer.backend-readonly
   gost-restreamer.dto gost-restreamer.sse gost-restreamer.state gost-restreamer.settings
-  gost-restreamer.network gost-restreamer.connection
+  gost-restreamer.network gost-restreamer.connection gost-restreamer.stats-baseline
   PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GOST_QT_TEST_ROOT}/bin"
 )

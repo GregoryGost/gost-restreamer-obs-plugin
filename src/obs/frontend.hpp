@@ -1,5 +1,7 @@
 #pragma once
 
+#include "obs-statistics.hpp"
+
 #include <QString>
 #include <QStringList>
 #include <QMetaType>
@@ -43,6 +45,8 @@ public:
 	virtual QString currentProfilePath() const = 0;
 	virtual QStringList profiles() const = 0;
 	virtual bool streamingActive() const = 0;
+	virtual ObsStatisticsSample readStatistics() { return {}; }
+	virtual void releaseStatistics() noexcept {}
 };
 
 } // namespace gost

@@ -28,6 +28,12 @@ bool validIdentity(const QString &value)
 	return !value.isEmpty() && value.size() <= 4096 && !value.contains(QChar::Null);
 }
 
+void markStale(RuntimeAvailability &availability)
+{
+	if (availability == RuntimeAvailability::Fresh)
+		availability = RuntimeAvailability::Stale;
+}
+
 template<class T> auto findInstance(QVector<T> &nodes, const QString &instance)
 {
 	return std::find_if(nodes.begin(), nodes.end(),
@@ -67,6 +73,20 @@ void StateStore::setObsState(QString profileName, bool streamingActive)
 	profileName_ = std::move(profileName);
 	streamingActive_ = streamingActive;
 	emit obsStateChanged();
+}
+
+const ObsStatistics &StateStore::obsStatistics() const noexcept
+{
+	return obsStatistics_;
+}
+
+void StateStore::setObsStatistics(ObsStatistics statistics)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (obsStatistics_ == statistics)
+		return;
+	obsStatistics_ = std::move(statistics);
+	emit obsStatisticsChanged();
 }
 
 const QString &StateStore::serverOrigin() const noexcept
@@ -143,6 +163,19 @@ const RuntimeState &StateStore::runtime() const noexcept
 {
 	return runtime_;
 }
+const DockContext &StateStore::dockContext() const noexcept
+{
+	return dockContext_;
+}
+const DockServerState &StateStore::dockServer() const noexcept
+{
+	return dockServer_;
+}
+RuntimeEvidence StateStore::runtimeEvidence(const QString &instanceId) const
+{
+	const auto found = watermarks_.constFind(instanceId);
+	return pendingAnchor_ || found == watermarks_.cend() ? RuntimeEvidence{} : found->evidence;
+}
 const std::optional<api::Health> &StateStore::ready() const noexcept
 {
 	return ready_;
@@ -170,10 +203,19 @@ bool StateStore::selectionAvailable() const noexcept
 void StateStore::setConnection(QString origin, ConnectionStatus status, QString safeError, QString errorKey)
 {
 	Q_ASSERT(QThread::currentThread() == thread());
+	if (origin_ != origin) {
+		dockContext_ = {};
+		dockServer_ = {};
+	}
 	origin_ = std::move(origin);
 	connectionStatus_ = status;
 	connectionError_ = std::move(safeError);
 	connectionErrorKey_ = std::move(errorKey);
+	if (status == ConnectionStatus::Connected && pendingAnchor_) {
+		pendingAnchor_ = false;
+		runtime_.availability = RuntimeAvailability::Fresh;
+		emit runtimeStateChanged();
+	}
 	emit serverStateChanged();
 }
 
@@ -201,12 +243,24 @@ void StateStore::setStreams(QVector<api::Stream> streams, bool complete)
 	emit serverStateChanged();
 }
 
-void StateStore::setSelection(QString streamId, bool profileResolved, QString notice, QString noticeKey)
+void StateStore::setSelection(QString streamId, bool profileResolved, QString notice, QString noticeKey,
+			      QString profileUuid)
 {
+	DockContext next{origin_, std::move(profileUuid), streamId};
+	if (dockContext_ != next) {
+		dockContext_ = std::move(next);
+		dockServer_ = {};
+	}
 	selectedStreamId_ = std::move(streamId);
 	profileResolved_ = profileResolved;
 	profileNotice_ = std::move(notice);
 	profileNoticeKey_ = std::move(noticeKey);
+	emit serverStateChanged();
+}
+
+void StateStore::setDockServer(DockServerState metadata)
+{
+	dockServer_ = std::move(metadata);
 	emit serverStateChanged();
 }
 
@@ -248,12 +302,20 @@ void StateStore::setDetails(DetailState details)
 
 void StateStore::markRuntimeStale()
 {
-	if (runtime_.availability == RuntimeAvailability::Fresh)
-		runtime_.availability = RuntimeAvailability::Stale;
+	emit runtimeAboutToBecomeStale();
+	markStale(runtime_.availability);
+	if (!pendingAnchor_)
+		for (auto &lanes : watermarks_) {
+			markStale(lanes.evidence.state);
+			markStale(lanes.evidence.input);
+			markStale(lanes.evidence.metrics);
+		}
 	auto stale = [](ReadStatus &status) {
-		if (status.availability == RuntimeAvailability::Fresh)
-			status.availability = RuntimeAvailability::Stale;
+		markStale(status.availability);
 	};
+	stale(dockServer_.sessionStatus);
+	stale(dockServer_.outputsStatus);
+	markStale(dockServer_.fallback.availability);
 	stale(configuration_.streamsStatus);
 	stale(configuration_.destinationsStatus);
 	stale(configuration_.groupsStatus);
@@ -275,6 +337,7 @@ void StateStore::markRuntimeStale()
 void StateStore::clearRuntime()
 {
 	runtime_ = {};
+	pendingAnchor_ = false;
 	gpuInstanceId_.clear();
 	gpuRevision_.reset();
 	watermarks_.clear();
@@ -282,7 +345,7 @@ void StateStore::clearRuntime()
 	emit serverStateChanged();
 }
 
-void StateStore::clearServerState()
+void StateStore::clearServerState(bool preserveDock)
 {
 	streams_.clear();
 	streamsComplete_ = false;
@@ -291,11 +354,13 @@ void StateStore::clearServerState()
 	details_ = {};
 	ready_.reset();
 	capabilities_.reset();
+	if (!preserveDock)
+		dockServer_ = {};
 	emit streamsChanged();
 	clearRuntime();
 }
 
-bool StateStore::installAnchor(const api::Anchor &anchor)
+bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription)
 {
 	Q_ASSERT(QThread::currentThread() == thread());
 	if (!validIdentity(anchor.cursor))
@@ -307,31 +372,48 @@ bool StateStore::installAnchor(const api::Anchor &anchor)
 		if (!validIdentity(observation.instanceId) || instances.contains(observation.instanceId))
 			return false;
 		instances.insert(observation.instanceId);
-		watermarks[observation.instanceId].state = observation.revision;
+		auto &lanes = watermarks[observation.instanceId];
+		lanes.state = observation.revision;
+		if (!observation.state.isEmpty())
+			lanes.evidence.state = RuntimeAvailability::Fresh;
 		return true;
 	};
 	for (const auto &session : anchor.sessions) {
 		if (!validIdentity(session.sessionId) || next.sessions.contains(session.sessionId))
 			return false;
-		if (session.observation && !addObservation(*session.observation))
-			return false;
+		if (session.observation) {
+			if (!addObservation(*session.observation))
+				return false;
+			if (session.input) {
+				auto &evidence = watermarks[session.observation->instanceId].evidence;
+				evidence.input = RuntimeAvailability::Fresh;
+				if (session.input->metrics)
+					evidence.metrics = RuntimeAvailability::Fresh;
+			}
+		}
 		QSet<QString> groups;
 		QSet<QString> outputIds;
 		for (const auto &group : session.groups) {
 			if (!validIdentity(group.groupId) || !validIdentity(group.profileId) || !addObservation(group))
 				return false;
 			groups.insert(group.instanceId);
+			if (group.metrics)
+				watermarks[group.instanceId].evidence.metrics = RuntimeAvailability::Fresh;
 		}
 		for (const auto &output : session.outputs) {
 			if (!validIdentity(output.outputId) || outputIds.contains(output.outputId) ||
 			    !addObservation(output))
 				return false;
 			outputIds.insert(output.outputId);
+			if (output.metrics)
+				watermarks[output.instanceId].evidence.metrics = RuntimeAvailability::Fresh;
 		}
 		for (const auto &ffmpeg : session.ffmpeg) {
 			if (!groups.contains(ffmpeg.groupInstanceId) || ffmpeg.role.size() > 4096 ||
 			    ffmpeg.role.contains(QChar::Null) || !addObservation(ffmpeg))
 				return false;
+			if (ffmpeg.metrics)
+				watermarks[ffmpeg.instanceId].evidence.metrics = RuntimeAvailability::Fresh;
 		}
 		next.sessions.insert(session.sessionId, session);
 		if (instances.size() + next.sessions.size() > MaxRuntimeObservations)
@@ -339,8 +421,9 @@ bool StateStore::installAnchor(const api::Anchor &anchor)
 	}
 	next.cursor = anchor.cursor;
 	next.gpu = anchor.gpu;
-	next.availability = RuntimeAvailability::Fresh;
+	next.availability = awaitSubscription ? RuntimeAvailability::Unknown : RuntimeAvailability::Fresh;
 	runtime_ = std::move(next);
+	pendingAnchor_ = awaitSubscription;
 	gpuInstanceId_.clear();
 	gpuRevision_.reset();
 	watermarks_ = std::move(watermarks);
@@ -349,9 +432,11 @@ bool StateStore::installAnchor(const api::Anchor &anchor)
 	return true;
 }
 
-bool StateStore::applyEvent(const api::RuntimeEvent &event)
+bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyChanged)
 {
 	Q_ASSERT(QThread::currentThread() == thread());
+	if (dockTopologyChanged)
+		*dockTopologyChanged = false;
 	if (runtime_.cursor.isEmpty() || !validIdentity(event.cursor) || !api::validateRuntimeEvent(event))
 		return false;
 	if (event.cursor == runtime_.cursor)
@@ -469,6 +554,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 	};
 	bool eraseSession = false;
 	bool ignored = false;
+	bool topologyChanged = false;
 	api::Observation *observation = nullptr;
 	api::RuntimeGroup *group = nullptr;
 	api::RuntimeOutput *output = nullptr;
@@ -478,6 +564,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 			if (session.observation && session.observation->instanceId == instance) {
 				removeSession();
 				eraseSession = true;
+				topologyChanged = true;
 			} else if (!session.observation && runtime_.sessions.contains(event.sessionId)) {
 				return false;
 			}
@@ -489,20 +576,24 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 				api::Observation unknown;
 				unknown.instanceId = instance;
 				session.observation = present(std::move(unknown));
+				topologyChanged = true;
 			}
 			observation = &*session.observation;
 		}
 	} else if (groupOwner) {
 		auto found = findInstance(session.groups, instance);
 		if (removedEvent) {
-			if (found != session.groups.end())
+			if (found != session.groups.end()) {
 				removeGroup(instance);
+				topologyChanged = true;
+			}
 			ignored = true;
 		} else {
 			if (found == session.groups.end()) {
 				api::RuntimeGroup unknown;
 				unknown.instanceId = instance;
 				session.groups.push_back(std::move(unknown));
+				topologyChanged = true;
 			}
 			group = &*findInstance(session.groups, instance);
 			group->groupId = event.groupId;
@@ -512,8 +603,10 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 	} else if (outputOwner) {
 		auto found = findInstance(session.outputs, instance);
 		if (removedEvent) {
-			if (found != session.outputs.end())
+			if (found != session.outputs.end()) {
 				removed.insert(instance);
+				topologyChanged = true;
+			}
 			ignored = true;
 		} else {
 			if (found == session.outputs.end()) {
@@ -525,6 +618,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 				unknown.instanceId = instance;
 				unknown.outputId = event.outputId;
 				session.outputs.push_back(std::move(unknown));
+				topologyChanged = true;
 			}
 			output = &*findInstance(session.outputs, instance);
 			observation = output;
@@ -561,16 +655,23 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 			ffmpeg->observedAt = {};
 			ffmpeg->failure = {};
 			lanes.metrics.reset();
+			lanes.evidence.metrics = RuntimeAvailability::Unknown;
+			lanes.evidence.state = RuntimeAvailability::Unknown;
 		} else if (inputEvent) {
 			if (event.observation.revision != 0)
 				return false;
 			session.input = event.input;
 			session.input->metrics = {};
 			lanes.metrics.reset();
+			lanes.evidence.input = RuntimeAvailability::Fresh;
+			lanes.evidence.metrics = RuntimeAvailability::Unknown;
 		} else if (stateEvent) {
 			if (!lanes.state || event.observation.revision > *lanes.state) {
+				if (sessionOwner || (outputOwner && observation->state != event.observation.state))
+					topologyChanged = true;
 				*observation = event.observation;
 				lanes.state = event.observation.revision;
+				lanes.evidence.state = RuntimeAvailability::Fresh;
 				if (group) {
 					group->source = event.source;
 					group->sourceRevision = event.sourceRevision;
@@ -578,6 +679,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 			}
 		} else if (metricsEvent && (!lanes.metrics || event.observation.revision > *lanes.metrics)) {
 			lanes.metrics = event.observation.revision;
+			lanes.evidence.metrics = RuntimeAvailability::Fresh;
 			if (sessionOwner) {
 				if (!session.input)
 					session.input = event.input;
@@ -611,6 +713,13 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event)
 		watermarks_.insert(instance, std::move(lanes));
 	runtime_.cursor = event.cursor;
 	runtime_.availability = RuntimeAvailability::Fresh;
+	if (topologyChanged && dockServer_.session && dockServer_.session->id == event.sessionId) {
+		if (sessionOwner)
+			markStale(dockServer_.sessionStatus.availability);
+		markStale(dockServer_.outputsStatus.availability);
+	}
+	if (dockTopologyChanged)
+		*dockTopologyChanged = topologyChanged;
 	emit runtimeStateChanged();
 	emit serverStateChanged();
 	return true;

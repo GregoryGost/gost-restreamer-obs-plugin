@@ -1,6 +1,8 @@
 #pragma once
 
 #include "api/models.hpp"
+#include "core/dock-server-state.hpp"
+#include "obs/obs-statistics.hpp"
 
 #include <QObject>
 #include <QString>
@@ -10,13 +12,6 @@
 namespace gost {
 
 enum class ConnectionStatus { Disconnected, Connecting, Connected, Reconnecting, Error };
-enum class RuntimeAvailability { Unknown, Fresh, Stale };
-
-struct ReadStatus {
-	RuntimeAvailability availability = RuntimeAvailability::Unknown;
-	bool complete = false;
-	QString safeError;
-};
 
 struct ConfigurationState {
 	QMap<QString, api::Stream> streams;
@@ -66,6 +61,8 @@ public:
 	const std::optional<QString> &profileName() const noexcept;
 	std::optional<bool> streamingActive() const noexcept;
 	void setObsState(QString profileName, bool streamingActive);
+	const ObsStatistics &obsStatistics() const noexcept;
+	void setObsStatistics(ObsStatistics statistics);
 	const QString &serverOrigin() const noexcept;
 	ConnectionStatus connectionStatus() const noexcept;
 	const QVector<api::Stream> &streams() const noexcept;
@@ -86,33 +83,41 @@ public:
 	const HistoryState &history() const noexcept;
 	const DetailState &details() const noexcept;
 	const RuntimeState &runtime() const noexcept;
+	const DockContext &dockContext() const noexcept;
+	const DockServerState &dockServer() const noexcept;
+	RuntimeEvidence runtimeEvidence(const QString &instanceId) const;
 	const std::optional<api::Health> &ready() const noexcept;
 	const std::optional<api::Capabilities> &capabilities() const noexcept;
 	void setConnection(QString origin, ConnectionStatus status, QString safeError = {}, QString errorKey = {});
 	void setPreferences(bool autoConnect, bool reconnect, int sseRejectionRetries, bool unsaved,
 			    QString settingsError = {}, QString errorKey = {});
 	void setStreams(QVector<api::Stream> streams, bool complete);
-	void setSelection(QString streamId, bool profileResolved, QString notice = {}, QString noticeKey = {});
+	void setSelection(QString streamId, bool profileResolved, QString notice = {}, QString noticeKey = {},
+			  QString profileUuid = {});
+	void setDockServer(DockServerState metadata);
 	void setReady(api::Health ready);
 	void setCapabilities(api::Capabilities capabilities);
 	void setConfiguration(ConfigurationState configuration);
 	void setHistory(HistoryState history);
 	void setDetails(DetailState details);
-	bool installAnchor(const api::Anchor &anchor);
-	bool applyEvent(const api::RuntimeEvent &event);
+	bool installAnchor(const api::Anchor &anchor, bool awaitSubscription = false);
+	bool applyEvent(const api::RuntimeEvent &event, bool *dockTopologyChanged = nullptr);
 	void markRuntimeStale();
-	void clearServerState();
+	void clearServerState(bool preserveDock = false);
 	void clearRuntime();
 
 signals:
 	void obsStateChanged();
+	void obsStatisticsChanged();
 	void serverStateChanged();
 	void streamsChanged();
+	void runtimeAboutToBecomeStale();
 	void runtimeStateChanged();
 
 private:
 	std::optional<QString> profileName_;
 	std::optional<bool> streamingActive_;
+	ObsStatistics obsStatistics_;
 	QString origin_;
 	ConnectionStatus connectionStatus_ = ConnectionStatus::Disconnected;
 	QVector<api::Stream> streams_;
@@ -133,6 +138,9 @@ private:
 	HistoryState history_;
 	DetailState details_;
 	RuntimeState runtime_;
+	DockContext dockContext_;
+	DockServerState dockServer_;
+	bool pendingAnchor_ = false;
 	QString gpuInstanceId_;
 	std::optional<quint64> gpuRevision_;
 	std::optional<api::Health> ready_;
@@ -140,6 +148,7 @@ private:
 	struct Watermarks {
 		std::optional<quint64> state;
 		std::optional<quint64> metrics;
+		RuntimeEvidence evidence;
 	};
 	QMap<QString, Watermarks> watermarks_;
 };

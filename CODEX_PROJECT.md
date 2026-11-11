@@ -197,7 +197,7 @@ fixtures и существенной конфигурации, включая н
 
 - Проект требует CMake 3.28 или новее.
 - Выбран генератор `Visual Studio 17 2022`, x64, v143 и SDK 10.0.26100.0. Ninja не используется: Windows bootstrap шаблона зависит от VS platform и дочернего configure с `-A`.
-- Configure preset `windows-x64`, build/test presets `windows-x64` (RelWithDebInfo) и `windows-x64-release` (Release), test preset `windows-x64-offline`; binary directory `build_x64/`. CI preset — `windows-ci-x64`; его наличие не подтверждает приёмку CI.
+- Configure preset `windows-x64`, build/test presets `windows-x64` (RelWithDebInfo) и `windows-x64-release` (Release), test preset `windows-x64-offline`; binary directory `build_x64/`. CI preset — `windows-ci-x64`; его наличие не подтверждает приёмку CI. Выпуск версии в папку `build` (как пример `cmake --install build_x64 --config RelWithDebInfo`).
 - Основа CMake — официальный `obsproject/obs-plugintemplate`, ревизия `3e7d7ac3b5342cd7d9b88890b9c70b472d1520fc`. Зависимости выбираются по проектным `buildspec.json` и presets; версии из upstream-шаблона не наследуются автоматически.
 - Windows-размещение следует формату OBS 33: `gost-restreamer-obs-plugin/gost-restreamer-obs-plugin.dll` и соседний `data/`. Структуры staging, portable-проверки и пакета должны быть согласованы. Загрузку и локализации проверять только в portable OBS внутри workspace с учётом `Validation Workspace Boundary`.
 - Используются frontend API, Qt и Network; `ENABLE_FRONTEND_API`/`ENABLE_QT` включены.
@@ -207,7 +207,7 @@ fixtures и существенной конфигурации, включая н
 
 ## C++ Testing Profile
 
-- Граница: CTest и Qt Test 6.11.1. Targets `gost-restreamer-<name>-test`, где name: `lifecycle`, `backend-readonly`, `dto`, `sse`, `state`, `settings`, `network`, `connection`; имена CTest — `gost-restreamer.<name>`.
+- Граница: CTest и Qt Test 6.11.1. Targets `gost-restreamer-<name>-test`, где name: `lifecycle`, `backend-readonly`, `dto`, `sse`, `state`, `settings`, `network`, `connection`, `stats-baseline`; имена CTest — `gost-restreamer.<name>`.
 - Тесты в `tests/unit/`, `tests/contract/`, `tests/integration/`, `tests/fixtures/`.
 - Чистые FSM/DTO/SSE/счётчики и порядок команд проверять без настоящего OBS через интерфейсы/fixtures. GUI/loadable DLL и live-приёмка — отдельные проверки Windows + OBS 33.0.1 + изолированный backend.
 - Реальный пользовательский OBS, эфир, сервер и настройки не использовать как неявную тестовую fixture.

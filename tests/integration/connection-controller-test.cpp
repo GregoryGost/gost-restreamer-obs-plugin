@@ -9,6 +9,7 @@
 
 #include <QElapsedTimer>
 #include <QFile>
+#include <QSet>
 #include <QTest>
 #include <QTimer>
 #include <QUrlQuery>
@@ -70,6 +71,94 @@ bool readOnly(const HttpServer &server)
 		       !request.target.contains("/stop");
 	});
 }
+
+QJsonObject dockOutputMetrics(quint64 videoFrames)
+{
+	auto metrics = fixture::outputMetrics();
+	auto media = metrics.value(QStringLiteral("media")).toObject();
+	media.insert(QStringLiteral("video_frames"), QString::number(videoFrames));
+	metrics.insert(QStringLiteral("media"), media);
+	return metrics;
+}
+
+QJsonObject dockRuntimeSession(const QString &id, const QString &sessionInstance, const QString &outputInstance)
+{
+	auto session = fixture::object(R"({"input":null,"groups":[],"outputs":[],"ffmpeg":[]})");
+	session.insert(QStringLiteral("session_id"), id);
+	session.insert(QStringLiteral("observation"), fixture::observation(sessionInstance, 20));
+	auto output = fixture::observation(outputInstance, 50, QStringLiteral("PUBLISHING"));
+	output.insert(QStringLiteral("output_id"), QStringLiteral("output"));
+	output.insert(QStringLiteral("metrics"), dockOutputMetrics(200));
+	session.insert(QStringLiteral("outputs"), QJsonArray{output});
+	return session;
+}
+
+QByteArray dockAnchor()
+{
+	auto anchor = fixture::object(R"({"cursor":"dock-anchor","sessions":[],"gpu":null})");
+	anchor.insert(QStringLiteral("sessions"),
+		      QJsonArray{dockRuntimeSession(QStringLiteral("session"), QStringLiteral("epoch:1"),
+						    QStringLiteral("epoch:2")),
+				 dockRuntimeSession(QStringLiteral("other-session"), QStringLiteral("epoch:3"),
+						    QStringLiteral("epoch:4"))});
+	return fixture::bytes(anchor);
+}
+
+QByteArray dockMetricsFrame(const QString &cursor, const QString &sessionId, const QString &instanceId,
+			    quint64 revision, quint64 videoFrames)
+{
+	auto event = fixture::event(QStringLiteral("metrics"), cursor);
+	event.insert(QStringLiteral("owner"), QStringLiteral("output"));
+	event.insert(QStringLiteral("session_id"), sessionId);
+	event.insert(QStringLiteral("output_id"), QStringLiteral("output"));
+	event.insert(QStringLiteral("observation"), fixture::observation(instanceId, revision));
+	event.insert(QStringLiteral("output"), dockOutputMetrics(videoFrames));
+	return fixture::frame(event);
+}
+
+void respondWithDockMetadata(const HttpServer::Request &request, bool validExactSession)
+{
+	const QUrl url = QUrl::fromEncoded("http://local" + request.target);
+	const auto path = url.path();
+	if (path == QStringLiteral("/api/v1/streams")) {
+		HttpServer::reply(request,
+				  fixture::page({fixture::stream(), fixture::stream(QStringLiteral("other"))}));
+	} else if (path == QStringLiteral("/api/v1/events/snapshot")) {
+		HttpServer::reply(request, dockAnchor());
+	} else if (path == QStringLiteral("/api/v1/streams/stream/sessions")) {
+		const auto filter = QUrlQuery(url).queryItemValue(QStringLiteral("state"));
+		HttpServer::reply(request, filter == QStringLiteral("RUNNING") ? fixture::page({fixture::session()})
+									       : fixture::page({}));
+	} else if (path == QStringLiteral("/api/v1/sessions/session")) {
+		auto session = fixture::session();
+		if (!validExactSession) {
+			session.insert(QStringLiteral("stream_id"), QStringLiteral("other"));
+			session.insert(QStringLiteral("stream"), fixture::stream(QStringLiteral("other")));
+		}
+		HttpServer::reply(request, fixture::bytes(session));
+	} else if (path == QStringLiteral("/api/v1/sessions/session/outputs")) {
+		HttpServer::reply(request, fixture::page({fixture::output()}));
+	} else if (path == QStringLiteral("/api/v1/streams/stream/fallback-policy")) {
+		HttpServer::reply(request, R"({"revision":"1","fallback":{"asset_id":"asset","watchdog":{
+"video_timeout_ns":"1000000000","audio_timeout_ns":"1000000000","recovery_window_ns":"1000000000",
+"keyframe_timeout_ns":"1000000000"}}})");
+	} else if (path == QStringLiteral("/api/v1/fallback-assets/asset")) {
+		auto asset = fixture::asset();
+		asset.insert(QStringLiteral("current_generation_id"), QStringLiteral("current"));
+		asset.insert(QStringLiteral("pending_generation_id"), QStringLiteral("pending"));
+		HttpServer::reply(request, fixture::bytes(asset));
+	} else if (path == QStringLiteral("/api/v1/fallback-assets/asset/generations/current")) {
+		auto generation = fixture::record(QStringLiteral("current"));
+		generation.insert(QStringLiteral("asset_id"), QStringLiteral("asset"));
+		generation.insert(QStringLiteral("kind"), QStringLiteral("image"));
+		generation.insert(QStringLiteral("status"), QStringLiteral("ready"));
+		generation.insert(QStringLiteral("size_bytes"), QStringLiteral("1024"));
+		generation.insert(QStringLiteral("failure"), QJsonValue::Null);
+		HttpServer::reply(request, fixture::bytes(generation));
+	} else {
+		respond(request);
+	}
+}
 } // namespace
 
 class ConnectionControllerTest final : public QObject {
@@ -78,6 +167,9 @@ private slots:
 	void connectsWithoutImplicitStreamOrMedia();
 	void serverSwitchDiscardsOldResponses();
 	void profileSwitchRestoresOnlyItsBinding();
+	void dockMetadataRequiresExactSessionForSelectedStream_data();
+	void dockMetadataRequiresExactSessionForSelectedStream();
+	void resumedSubscriptionRefreshesOnlyAcceptedMetricLane();
 	void reconnectUsesConfirmedCursor();
 	void handshakeTimeoutRetriesWithoutPrematureConnection();
 	void terminalSubscriptionDoesNotRetry_data();
@@ -192,6 +284,156 @@ void ConnectionControllerTest::profileSwitchRestoresOnlyItsBinding()
 	controller.observeProfile(FrontendEvent::ProfileChanging, profile(QStringLiteral("B")));
 	controller.observeProfile(FrontendEvent::ProfileChanged, profile());
 	QCOMPARE(state.selectedStreamId(), QStringLiteral("stream"));
+	QVERIFY(readOnly(server));
+	controller.shutdown();
+}
+
+void ConnectionControllerTest::dockMetadataRequiresExactSessionForSelectedStream_data()
+{
+	QTest::addColumn<bool>("validExactSession");
+	QTest::newRow("matching-session") << true;
+	QTest::newRow("session-from-another-stream") << false;
+}
+
+void ConnectionControllerTest::dockMetadataRequiresExactSessionForSelectedStream()
+{
+	QFETCH(bool, validExactSession);
+	WorkspaceTemp temp(QStringLiteral("dock-context"));
+	QVERIFY(temp.isValid());
+	HttpServer server;
+	QVERIFY(server.listen());
+	HttpServer::Request pendingGeneration;
+	server.handler = [&](const auto &request) {
+		if (request.target == "/api/v1/fallback-assets/asset/generations/current")
+			pendingGeneration = request;
+		else if (!request.target.startsWith("/api/v1/events?"))
+			respondWithDockMetadata(request, validExactSession);
+	};
+	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	settings.setAutoConnect(false);
+	StateStore state;
+	APIClient api;
+	EventClient events;
+	ConnectionController controller(state, settings, api, events);
+	const auto origin = server.origin().toString();
+	controller.observeProfile(FrontendEvent::FinishedLoading, profile());
+	QVERIFY(settings.setSelectedStream(origin, settings.profileUuid(), QStringLiteral("stream")));
+	controller.connectToServer(origin);
+	QTRY_COMPARE_WITH_TIMEOUT(requestCount(server, "/api/v1/events?"), 1, 3000);
+	QVERIFY(state.selectionAvailable());
+	QCOMPARE(state.dockContext().streamId, QStringLiteral("stream"));
+	QCOMPARE(state.dockContext().profileUuid, settings.profileUuid());
+	QVERIFY(state.runtimeEvidence(QStringLiteral("epoch:2")).metrics != RuntimeAvailability::Fresh);
+	QVERIFY(!state.dockServer().session);
+	QVERIFY(subscription(server).socket);
+	HttpServer::stream(subscription(server));
+	QTRY_VERIFY_WITH_TIMEOUT(pendingGeneration.socket, 3000);
+	if (validExactSession) {
+		QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().outputsStatus.complete, 3000);
+		QVERIFY(state.dockServer().session);
+		QVERIFY(pendingGeneration.socket);
+		QVERIFY(state.dockServer().fallback.currentStatus.isEmpty());
+	}
+	respondWithDockMetadata(pendingGeneration, validExactSession);
+	QTRY_COMPARE_WITH_TIMEOUT(state.dockServer().fallback.currentStatus, QStringLiteral("ready"), 3000);
+	QCOMPARE(state.dockServer().fallback.assigned, std::optional{true});
+	QCOMPARE(state.dockServer().fallback.currentGenerationId, QStringLiteral("current"));
+	QCOMPARE(state.dockServer().fallback.pendingGenerationId, QStringLiteral("pending"));
+	QCOMPARE(state.runtimeEvidence(QStringLiteral("epoch:2")).metrics, RuntimeAvailability::Fresh);
+	QSet<QString> stateFilters;
+	for (const auto &request : server.requests) {
+		if (!request.target.startsWith("/api/v1/streams/stream/sessions?"))
+			continue;
+		const QUrlQuery query(QUrl::fromEncoded("http://local" + request.target));
+		stateFilters.insert(query.queryItemValue(QStringLiteral("state")));
+	}
+	const QSet<QString> activeStates{QStringLiteral("STARTING"), QStringLiteral("RUNNING"),
+					 QStringLiteral("STOPPING")};
+	QCOMPARE(stateFilters, activeStates);
+	QCOMPARE(requestCount(server, "/api/v1/streams/other/"), 0);
+	QCOMPARE(requestCount(server, "/api/v1/sessions/other-session"), 0);
+	QCOMPARE(requestCount(server, "/api/v1/fallback-assets/asset/generations/pending"), 0);
+	QVERIFY(std::any_of(server.requests.cbegin(), server.requests.cend(), [](const auto &request) {
+		return QUrl::fromEncoded("http://local" + request.target).path() ==
+		       QStringLiteral("/api/v1/sessions/session");
+	}));
+	QCOMPARE(requestCount(server, "/api/v1/sessions/session/outputs"), validExactSession ? 1 : 0);
+	if (validExactSession) {
+		QVERIFY(state.dockServer().session);
+		QCOMPARE(state.dockServer().session->id, QStringLiteral("session"));
+		QCOMPARE(state.dockServer().session->state, QStringLiteral("RUNNING"));
+		QVERIFY(state.dockServer().outputsStatus.complete);
+		QCOMPARE(state.dockServer().outputs.size(), 1);
+		QCOMPARE(state.dockServer().outputs.value(QStringLiteral("output")).name, QStringLiteral("Назначение"));
+	} else {
+		QVERIFY(!state.dockServer().session);
+		QVERIFY(state.dockServer().outputs.isEmpty());
+	}
+	QVERIFY(readOnly(server));
+	controller.shutdown();
+}
+
+void ConnectionControllerTest::resumedSubscriptionRefreshesOnlyAcceptedMetricLane()
+{
+	WorkspaceTemp temp(QStringLiteral("dock-resume"));
+	QVERIFY(temp.isValid());
+	HttpServer server;
+	QVERIFY(server.listen());
+	server.handler = [](const auto &request) {
+		respondWithDockMetadata(request, true);
+	};
+	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	settings.setAutoConnect(false);
+	StateStore state;
+	APIClient api;
+	EventClient events;
+	ConnectionController controller(state, settings, api, events);
+	const auto origin = server.origin().toString();
+	controller.observeProfile(FrontendEvent::FinishedLoading, profile());
+	QVERIFY(settings.setSelectedStream(origin, settings.profileUuid(), QStringLiteral("stream")));
+	controller.connectToServer(origin);
+	QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().session, 3000);
+	const QString sessionId = state.dockServer().session->id;
+	const QString instance = QStringLiteral("epoch:2");
+	const auto frames = [&] {
+		return state.runtime().sessions.value(sessionId).outputs.value(0).metrics.value.media.videoFrames;
+	};
+	const auto beforeBreak = subscription(server);
+	QVERIFY(beforeBreak.socket);
+	const QString currentCursor = QStringLiteral("selected-current");
+	beforeBreak.socket->write(dockMetricsFrame(currentCursor, sessionId, instance, 10, 320));
+	QTRY_COMPARE_WITH_TIMEOUT(state.runtime().cursor, currentCursor, 2000);
+	QCOMPARE(frames(), quint64{320});
+	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Fresh);
+	beforeBreak.socket->disconnectFromHost();
+	QTRY_COMPARE_WITH_TIMEOUT(state.connectionStatus(), ConnectionStatus::Reconnecting, 2000);
+	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Stale);
+	QTRY_COMPARE_WITH_TIMEOUT(requestCount(server, "/api/v1/events?"), 2, 4000);
+	QTRY_COMPARE_WITH_TIMEOUT(state.connectionStatus(), ConnectionStatus::Connected, 2000);
+	const auto afterBreak = subscription(server);
+	QVERIFY(afterBreak.socket);
+	QCOMPARE(subscriptionCursor(afterBreak), currentCursor);
+	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Stale);
+
+	const QString otherCursor = QStringLiteral("another-session-metric");
+	afterBreak.socket->write(
+		dockMetricsFrame(otherCursor, QStringLiteral("other-session"), QStringLiteral("epoch:4"), 100, 500));
+	QTRY_COMPARE_WITH_TIMEOUT(state.runtime().cursor, otherCursor, 2000);
+	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Stale);
+	QCOMPARE(state.runtimeEvidence(QStringLiteral("epoch:4")).metrics, RuntimeAvailability::Fresh);
+
+	const QString oldCursor = QStringLiteral("selected-old");
+	afterBreak.socket->write(dockMetricsFrame(oldCursor, sessionId, instance, 9, 15));
+	QTRY_COMPARE_WITH_TIMEOUT(state.runtime().cursor, oldCursor, 2000);
+	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Stale);
+	QCOMPARE(frames(), quint64{320});
+
+	const QString nextCursor = QStringLiteral("selected-next");
+	afterBreak.socket->write(dockMetricsFrame(nextCursor, sessionId, instance, 11, 365));
+	QTRY_COMPARE_WITH_TIMEOUT(state.runtime().cursor, nextCursor, 2000);
+	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Fresh);
+	QCOMPARE(state.runtimeEvidence(instance).state, RuntimeAvailability::Stale);
+	QCOMPARE(frames(), quint64{365});
 	QVERIFY(readOnly(server));
 	controller.shutdown();
 }

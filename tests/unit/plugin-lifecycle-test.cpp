@@ -10,6 +10,7 @@
 #include "ui/restream-dock.hpp"
 #include "api/api-client.hpp"
 #include "api/event-client.hpp"
+#include "obs/obs-stats-collector.hpp"
 
 #include <QAbstractItemView>
 #include <QApplication>
@@ -20,9 +21,11 @@
 #include <QElapsedTimer>
 #include <QLineEdit>
 #include <QLabel>
+#include <QListView>
 #include <QListWidget>
 #include <QMap>
 #include <QPalette>
+#include <QPushButton>
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSignalSpy>
@@ -83,12 +86,20 @@ private slots:
 	void registersBeforeFrontendReady();
 	void observesCurrentProfileAndStreaming_data();
 	void observesCurrentProfileAndStreaming();
+	void obsStatisticsUseMonotonicIntervalsAndIndependentFramePairs();
+	void obsStatisticsLoseTheRateAtOutputReplacementAndTransitions();
+	void obsStatisticsStopBeforeExitReturns();
 	void bothViewsFollowObservations_data();
 	void bothViewsFollowObservations();
 	void statusAppearanceFollowsStateAndPalette();
 	void managementWindowIsLazyAndReused_data();
 	void managementWindowIsLazyAndReused();
 	void dockStaysCompact();
+	void dockResetChangesOnlyDisplayedAccumulators();
+	void dockShowsNativeCounterLimitsIndependently_data();
+	void dockShowsNativeCounterLimitsIndependently();
+	void dockKeepsLastValuesOnlyInTheSameContext_data();
+	void dockKeepsLastValuesOnlyInTheSameContext();
 	void managementNavigationHasLocalizedPagesAndIcons_data();
 	void managementNavigationHasLocalizedPagesAndIcons();
 	void failedDockRegistrationReleasesResources();
@@ -195,6 +206,115 @@ void PluginLifecycleTest::observesCurrentProfileAndStreaming()
 	QCOMPARE(lifecycle.stateStore()->streamingActive().value(), initialStreaming);
 }
 
+void PluginLifecycleTest::obsStatisticsUseMonotonicIntervalsAndIndependentFramePairs()
+{
+	using namespace std::chrono_literals;
+	gost::OBSStatsCollector collector;
+	const gost::OBSStatsCollector::Clock::time_point start{};
+	gost::ObsStatisticsSample sample{.videoAvailable = true,
+					 .videoIdentity = 1,
+					 .outputIdentity = 2,
+					 .fps = 59.5,
+					 .renderTimeNs = 240000,
+					 .sentBytes = 700,
+					 .render = gost::FrameCounters{9, 300},
+					 .encode = gost::FrameCounters{3, 120},
+					 .network = gost::FrameCounters{1, 25}};
+	auto observed = collector.sample(sample, true, start);
+	QCOMPARE(observed.fps, std::optional{59.5});
+	QCOMPARE(observed.renderTimeNs, std::optional<quint64>{240000});
+	QVERIFY(!observed.bitrate);
+	QVERIFY(observed.bitrateWarming);
+
+	sample.sentBytes = 1700;
+	observed = collector.sample(sample, true, start + 250ms);
+	QCOMPARE(observed.bitrate, std::optional{32000.0});
+	QVERIFY(observed.render && observed.encode && observed.network);
+	QCOMPARE(observed.render->total, quint64{300});
+	QCOMPARE(observed.render->skipped, quint64{9});
+	QCOMPARE(observed.encode->total, quint64{120});
+	QCOMPARE(observed.encode->skipped, quint64{3});
+	QCOMPARE(observed.network->total, quint64{25});
+	QCOMPARE(observed.network->skipped, quint64{1});
+
+	observed = collector.sample(sample, true, start + 250ms);
+	QVERIFY(!observed.bitrate);
+	observed = collector.sample(sample, true, start + 750ms);
+	QCOMPARE(observed.bitrate, std::optional{0.0});
+}
+
+void PluginLifecycleTest::obsStatisticsLoseTheRateAtOutputReplacementAndTransitions()
+{
+	using namespace std::chrono_literals;
+	using gost::FrontendEvent;
+	using gost::ObsStreamingPhase;
+	gost::OBSStatsCollector collector;
+	const gost::OBSStatsCollector::Clock::time_point start{};
+	gost::ObsStatisticsSample sample{.videoAvailable = true,
+					 .videoIdentity = 1,
+					 .outputIdentity = 2,
+					 .fps = 60,
+					 .sentBytes = 1000,
+					 .network = gost::FrameCounters{0, 30}};
+	auto observed = collector.sample(sample, false, start, FrontendEvent::StreamingStarting);
+	QCOMPARE(observed.phase, ObsStreamingPhase::Starting);
+	QVERIFY(!observed.sentBytes && !observed.network && !observed.bitrate);
+	observed = collector.sample(sample, true, start + 100ms);
+	QCOMPARE(observed.phase, ObsStreamingPhase::Streaming);
+	QVERIFY(observed.bitrateWarming);
+	const auto firstOutput = observed.outputEpoch;
+	const auto video = observed.videoEpoch;
+
+	sample.sentBytes = 1500;
+	sample.outputIdentity = 3;
+	observed = collector.sample(sample, true, start + 200ms);
+	QVERIFY(observed.outputEpoch != firstOutput);
+	QCOMPARE(observed.videoEpoch, video);
+	QVERIFY(!observed.bitrate && observed.bitrateWarming);
+	const auto replacement = observed.outputEpoch;
+
+	sample.sentBytes = 100;
+	observed = collector.sample(sample, true, start + 300ms);
+	QVERIFY(observed.outputEpoch != replacement);
+	QVERIFY(!observed.bitrate && observed.bitrateWarming);
+	observed = collector.sample(sample, true, start + 400ms, FrontendEvent::StreamingStopping);
+	QCOMPARE(observed.phase, ObsStreamingPhase::Stopping);
+	observed = collector.sample(sample, false, start + 500ms);
+	QCOMPARE(observed.phase, ObsStreamingPhase::Stopped);
+	QVERIFY(!observed.sentBytes && !observed.network && !observed.bitrate);
+	QCOMPARE(observed.fps, std::optional{60.0});
+
+	sample.outputIdentity.reset();
+	observed = collector.sample(sample, true, start + 600ms, FrontendEvent::StreamingStarted);
+	QCOMPARE(observed.phase, ObsStreamingPhase::Streaming);
+	QVERIFY(!observed.sentBytes && !observed.network && !observed.bitrate);
+}
+
+void PluginLifecycleTest::obsStatisticsStopBeforeExitReturns()
+{
+	FakeFrontend frontend;
+	frontend.statistics.videoAvailable = true;
+	frontend.statistics.fps = 48.0;
+	gost::PluginLifecycle lifecycle(frontend, localeLookup());
+	QVERIFY(lifecycle.load());
+	QCOMPARE(frontend.statisticsReads, 0);
+	frontend.emitEvent(gost::FrontendEvent::FinishedLoading);
+	QTRY_COMPARE_WITH_TIMEOUT(lifecycle.stateStore()->obsStatistics().fps, std::optional{48.0}, 1500);
+	QVERIFY(frontend.statisticsReads > 0);
+	QCOMPARE(frontend.statisticsReleases, 0);
+	const int reads = frontend.statisticsReads;
+
+	frontend.emitEvent(gost::FrontendEvent::Exit);
+	QCOMPARE(frontend.statisticsReleases, 1);
+	QVERIFY(!lifecycle.stateStore());
+	frontend.lastCallback(gost::FrontendEvent::StreamingStarted, frontend.lastCookie);
+	lifecycle.shutdown();
+	dispatchQueuedEvents();
+	QCOMPARE(frontend.statisticsReads, reads);
+	QCOMPARE(frontend.statisticsReleases, 1);
+	QCOMPARE(frontend.callsAfterExit, 0);
+}
+
 void PluginLifecycleTest::managementWindowIsLazyAndReused_data()
 {
 	QTest::addColumn<QString>("locale");
@@ -235,7 +355,7 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 		QCOMPARE(label->text(), frontend.profile);
 		QCOMPARE(label->textFormat(), Qt::PlainText);
 	}
-	QCOMPARE(dockStreaming->text(), text("OBS.StreamingActive"));
+	QCOMPARE(dockStreaming->text(), text("Dock.ObsStreaming"));
 	QCOMPARE(windowStreaming->text(), text("OBS.StreamingActive"));
 	window->close();
 	frontend.profile = QStringLiteral("Переименованный профиль");
@@ -243,7 +363,7 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 	frontend.emitEvent(gost::FrontendEvent::ProfileChanged);
 	QCOMPARE(dockProfile->text(), frontend.profile);
 	QCOMPARE(windowProfile->text(), frontend.profile);
-	QCOMPARE(dockStreaming->text(), text("OBS.StreamingInactive"));
+	QCOMPARE(dockStreaming->text(), text("Dock.ObsStopped"));
 	QCOMPARE(windowStreaming->text(), text("OBS.StreamingInactive"));
 	QCOMPARE(server->text(), text("Observation.NoData"));
 	QCOMPARE(stream->text(), text("Observation.NoData"));
@@ -364,6 +484,269 @@ void PluginLifecycleTest::dockStaysCompact()
 	QVERIFY(dock->findChildren<QComboBox *>().isEmpty());
 	QVERIFY(dock->findChildren<QListWidget *>().isEmpty());
 	QVERIFY(dock->findChildren<QStackedWidget *>().isEmpty());
+}
+
+void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
+{
+	gost::StateStore state;
+	const auto text = localeLookup(QStringLiteral("en-US"));
+	gost::RestreamDock dock(state, text);
+	auto *reset = dock.findChild<QPushButton *>(QStringLiteral("statsResetButton"));
+	const auto *statistics = dock.findChild<QLabel *>(QStringLiteral("obsStatistics"));
+	QVERIFY(reset && statistics);
+	QVERIFY(!reset->isEnabled());
+	QVERIFY(statistics->text().contains(QStringLiteral("No data")));
+
+	gost::ObsStatistics sample{.phase = gost::ObsStreamingPhase::Streaming,
+				   .videoEpoch = 1,
+				   .outputEpoch = 1,
+				   .fps = 58.75,
+				   .bitrate = 6370000,
+				   .renderTimeNs = 340000,
+				   .sentBytes = 5000000,
+				   .render = gost::FrameCounters{12, 150},
+				   .encode = gost::FrameCounters{3, 40},
+				   .network = gost::FrameCounters{1, 25},
+				   .observed = true};
+	state.setObsStatistics(sample);
+	QTRY_VERIFY_WITH_TIMEOUT(reset->isEnabled(), 1000);
+	const auto before = statistics->text();
+	const QStringList rates{QStringLiteral("58.75"), QStringLiteral("6.37 Mbps"), QStringLiteral("0.34 ms")};
+	for (const auto &rate : rates)
+		QVERIFY(before.contains(rate));
+	reset->click();
+	QVERIFY(statistics->text() != before);
+	for (const auto &rate : rates)
+		QVERIFY(statistics->text().contains(rate));
+	QVERIFY(state.obsStatistics() == sample);
+
+	sample.render = gost::FrameCounters{14, 160};
+	sample.encode = gost::FrameCounters{4, 60};
+	sample.network = gost::FrameCounters{1, 29};
+	state.setObsStatistics(sample);
+	QTRY_VERIFY_WITH_TIMEOUT(statistics->text().contains(QStringLiteral("(20.0%)")), 1000);
+	QVERIFY(statistics->text().contains(QStringLiteral("(5.0%)")));
+	QVERIFY(statistics->text().contains(QStringLiteral("(0.0%)")));
+}
+
+void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently_data()
+{
+	QTest::addColumn<int>("limitedCounter");
+	QTest::newRow("render") << 0;
+	QTest::newRow("encode") << 1;
+	QTest::newRow("network") << 2;
+}
+
+void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently()
+{
+	QFETCH(int, limitedCounter);
+	gost::StateStore state;
+	const auto text = localeLookup(QStringLiteral("en-US"));
+	gost::RestreamDock dock(state, text);
+	const auto *statistics = dock.findChild<QLabel *>(QStringLiteral("obsStatistics"));
+	QVERIFY(statistics);
+	const gost::ObsStatisticsSample sample{.videoAvailable = true,
+					       .videoIdentity = 1,
+					       .outputIdentity = 2,
+					       .fps = 48.25,
+					       .render = gost::FrameCounters{5, 100},
+					       .encode = gost::FrameCounters{6, 100},
+					       .network = gost::FrameCounters{7, 100},
+					       .renderLimited = limitedCounter == 0,
+					       .encodeLimited = limitedCounter == 1,
+					       .networkLimited = limitedCounter == 2};
+	gost::OBSStatsCollector collector;
+	const auto observed = collector.sample(sample, true, {});
+	QCOMPARE(observed.renderLimited, sample.renderLimited);
+	QCOMPARE(observed.encodeLimited, sample.encodeLimited);
+	QCOMPARE(observed.networkLimited, sample.networkLimited);
+	state.setObsStatistics(observed);
+	QTRY_VERIFY_WITH_TIMEOUT(statistics->text().contains(QStringLiteral("48.25")), 1000);
+	const auto lines = statistics->text().split(QLatin1Char('\n'));
+	QStringList counterValues;
+	for (int i = 0; i < 3; ++i) {
+		counterValues.append(i == limitedCounter ? text("Dock.ChangeUnavailable")
+							 : text("Dock.PairPeriod")
+								   .arg(QString::number(i + 5), QStringLiteral("100"),
+									QStringLiteral("%1.0%").arg(i + 5),
+									text("Dock.PeriodRun")));
+	}
+	const auto counterLines =
+		text("Dock.LocalCounters")
+			.arg(counterValues.at(0), counterValues.at(1), counterValues.at(2), text("Observation.NoData"))
+			.split(QLatin1Char('\n'));
+	for (const auto &line : counterLines)
+		QCOMPARE(lines.count(line), 1);
+}
+
+void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::addColumn<QString>("currentRate");
+	QTest::addColumn<QString>("lastRate");
+	QTest::addColumn<QString>("resumedRate");
+	QTest::addColumn<QString>("replacementRate");
+	QTest::addColumn<QString>("currentSession");
+	QTest::addColumn<QString>("noCurrentData");
+	QTest::addColumn<QString>("lastValues");
+	QTest::newRow("russian")
+		<< QStringLiteral("ru-RU") << QStringLiteral("8,37") << QStringLiteral("9,37")
+		<< QStringLiteral("10,37") << QStringLiteral("12,37") << QStringLiteral("Рестрим запущен")
+		<< QStringLiteral("Данные отсутствуют") << QStringLiteral("Последние полученные значения");
+	QTest::newRow("english")
+		<< QStringLiteral("en-US") << QStringLiteral("8.37") << QStringLiteral("9.37")
+		<< QStringLiteral("10.37") << QStringLiteral("12.37") << QStringLiteral("Restream running")
+		<< QStringLiteral("No current data") << QStringLiteral("Last received values");
+}
+
+void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
+{
+	QFETCH(QString, locale);
+	QFETCH(QString, currentRate);
+	QFETCH(QString, lastRate);
+	QFETCH(QString, resumedRate);
+	QFETCH(QString, replacementRate);
+	QFETCH(QString, currentSession);
+	QFETCH(QString, noCurrentData);
+	QFETCH(QString, lastValues);
+	using namespace gost;
+	using namespace gost::api;
+	StateStore state;
+	const auto origin = QStringLiteral("http://127.0.0.1:8080");
+	const auto streamId = QStringLiteral("stream");
+	const auto sessionId = QStringLiteral("session");
+	const auto profileId = QStringLiteral("profile-a");
+	Stream stream;
+	stream.id = streamId;
+	stream.name = QStringLiteral("Selected");
+	state.setStreams({stream}, true);
+	state.setConnection(origin, ConnectionStatus::Connected);
+	state.setSelection(streamId, true, {}, {}, profileId);
+	state.setObsState(QStringLiteral("OBS profile"), false);
+	const auto text = localeLookup(locale);
+	RestreamDock dock(state, text);
+	auto *outputs = dock.findChild<QListView *>(QStringLiteral("outputList"));
+	auto *reset = dock.findChild<QPushButton *>(QStringLiteral("statsResetButton"));
+	const auto *server = dock.findChild<QLabel *>(QStringLiteral("serverObservation"));
+	const auto *sessionLabel = dock.findChild<QLabel *>(QStringLiteral("sessionObservation"));
+	const auto *ingest = dock.findChild<QLabel *>(QStringLiteral("ingestStatistics"));
+	const auto *notice = dock.findChild<QLabel *>(QStringLiteral("serverDataNotice"));
+	const auto *localStatistics = dock.findChild<QLabel *>(QStringLiteral("obsStatistics"));
+	QVERIFY(outputs && reset && server && sessionLabel && ingest && notice && localStatistics);
+
+	RuntimeSession session;
+	session.sessionId = sessionId;
+	session.observation = {FieldState::Value, Observation{.instanceId = QStringLiteral("epoch:1"),
+							      .state = QStringLiteral("RUNNING")}};
+	Input input;
+	input.connected = true;
+	input.metrics.state = FieldState::Value;
+	input.metrics.value.sourceEpoch = 1;
+	auto &inputBitrate = input.metrics.value.media.rates.payloadBitrate;
+	inputBitrate.status = QStringLiteral("available");
+	inputBitrate.value = {FieldState::Value, 8370000.0};
+	session.input = {FieldState::Value, input};
+	DockServerState metadata;
+	metadata.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.session = DockSession{sessionId, QStringLiteral("RUNNING"), false};
+	metadata.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
+	for (int i = 0; i < 20; ++i) {
+		RuntimeOutput output;
+		output.instanceId = QStringLiteral("epoch:%1").arg(i + 2);
+		output.outputId = QStringLiteral("out-%1").arg(i);
+		output.state = QStringLiteral("PUBLISHING");
+		if (i == 0) {
+			output.metrics.state = FieldState::Value;
+			output.metrics.value.counters.insert(QStringLiteral("reconnects"), 7);
+			output.metrics.value.queueDrops.insert(QStringLiteral("video"), 11);
+			output.metrics.value.deliveryDrops.insert(QStringLiteral("video"), 13);
+		}
+		metadata.outputs.insert(output.outputId, {QStringLiteral("Channel %1").arg(i), true, true});
+		session.outputs.append(output);
+	}
+	QVERIFY(state.installAnchor({QStringLiteral("anchor"), {session}, {FieldState::Null, {}}}));
+	state.setDockServer(metadata);
+	dock.resize(360, 560);
+	dock.show();
+	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(currentRate), 1000);
+	QVERIFY(sessionLabel->text().contains(currentSession));
+	QVERIFY(!notice->text().contains(lastValues));
+	QCOMPARE(outputs->model()->rowCount(), 20);
+	const auto firstRow = outputs->model()->index(0, 0);
+	const auto rowBeforeReset = firstRow.data().toString();
+	QVERIFY(rowBeforeReset.contains(QStringLiteral("Channel 0")));
+	QVERIFY(rowBeforeReset.contains(QStringLiteral("11")));
+	QVERIFY(rowBeforeReset.contains(QStringLiteral("13")));
+	QVERIFY(reset->isEnabled());
+	reset->click();
+	const auto rowAfterReset = firstRow.data().toString();
+	QVERIFY(rowAfterReset.contains(text("Dock.PeriodReset")));
+	QVERIFY(!rowAfterReset.contains(QStringLiteral("11")));
+	QVERIFY(!rowAfterReset.contains(QStringLiteral("13")));
+	const auto raw = state.runtime().sessions.value(sessionId).outputs.front().metrics.value;
+	QCOMPARE(raw.counters.value(QStringLiteral("reconnects")), quint64{7});
+	QCOMPARE(raw.queueDrops.value(QStringLiteral("video")), quint64{11});
+	QCOMPARE(raw.deliveryDrops.value(QStringLiteral("video")), quint64{13});
+	QTRY_VERIFY_WITH_TIMEOUT(outputs->verticalScrollBar()->maximum() > 0, 1000);
+	QVERIFY(dock.width() >= 300 && dock.width() <= 400);
+	outputs->scrollToBottom();
+	QTRY_VERIFY_WITH_TIMEOUT(outputs->verticalScrollBar()->value() > 0, 1000);
+	QVERIFY(!server->visibleRegion().isEmpty());
+	QVERIFY(!sessionLabel->visibleRegion().isEmpty());
+
+	RuntimeEvent metric;
+	metric.cursor = QStringLiteral("latest-before-disconnect");
+	metric.kind = QStringLiteral("metrics");
+	metric.owner = QStringLiteral("session");
+	metric.sessionId = sessionId;
+	metric.observation.instanceId = session.observation->instanceId;
+	metric.observation.revision = 1;
+	inputBitrate.value = {FieldState::Value, 9370000.0};
+	metric.input = {FieldState::Value, input};
+	QVERIFY(state.applyEvent(metric));
+	state.markRuntimeStale();
+	state.setConnection(origin, ConnectionStatus::Reconnecting);
+	QTRY_VERIFY_WITH_TIMEOUT(notice->text().contains(noCurrentData), 1000);
+	QVERIFY(notice->text().contains(lastValues));
+	const auto lastBitrate = text("Dock.LastValue").arg(text("Dock.Megabits").arg(lastRate));
+	QVERIFY(ingest->text().contains(lastBitrate));
+	QVERIFY(!ingest->text().contains(currentRate));
+	state.setConnection(origin, ConnectionStatus::Connected);
+	QTRY_VERIFY_WITH_TIMEOUT(notice->text().contains(lastValues), 1000);
+	QVERIFY(ingest->text().contains(lastBitrate));
+
+	metric.cursor = QStringLiteral("exact-metric-after-reconnect");
+	metric.observation.revision = 2;
+	inputBitrate.value = {FieldState::Value, 10370000.0};
+	metric.input = {FieldState::Value, input};
+	QVERIFY(state.applyEvent(metric));
+	QCOMPARE(state.dockServer().sessionStatus.availability, RuntimeAvailability::Stale);
+	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(resumedRate), 1000);
+	const auto resumedBitrate = text("Dock.Megabits").arg(resumedRate);
+	const auto lastResumedBitrate = text("Dock.LastValue").arg(resumedBitrate);
+	QVERIFY(!ingest->text().contains(lastResumedBitrate));
+	QVERIFY(!sessionLabel->text().contains(currentSession));
+
+	state.markRuntimeStale();
+	state.setConnection(origin, ConnectionStatus::Reconnecting);
+	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(lastResumedBitrate), 1000);
+	session.observation->instanceId = QStringLiteral("replacement:1");
+	session.outputs.front().instanceId = QStringLiteral("replacement:2");
+	inputBitrate.value = {FieldState::Value, 12370000.0};
+	session.input = {FieldState::Value, input};
+	QVERIFY(state.installAnchor({QStringLiteral("replacement-anchor"), {session}, {FieldState::Null, {}}}, true));
+	state.setObsStatistics({.fps = 43.0, .observed = true});
+	QTRY_VERIFY_WITH_TIMEOUT(localStatistics->text().contains(QStringLiteral("43")), 1000);
+	QVERIFY(ingest->text().contains(lastResumedBitrate));
+	QVERIFY(!ingest->text().contains(replacementRate));
+	state.setConnection(origin, ConnectionStatus::Connected);
+	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(replacementRate), 1000);
+	QVERIFY(!ingest->text().contains(resumedRate));
+
+	state.setSelection(streamId, true, {}, {}, QStringLiteral("profile-b"));
+	QTRY_VERIFY_WITH_TIMEOUT(!ingest->text().contains(replacementRate), 1000);
+	QVERIFY(!notice->text().contains(lastValues));
+	QVERIFY(!sessionLabel->text().contains(currentSession));
 }
 
 void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons_data()

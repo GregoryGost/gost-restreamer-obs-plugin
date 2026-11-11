@@ -8,16 +8,48 @@
 #include <QElapsedTimer>
 #include <QPointer>
 #include <QRandomGenerator>
+#include <QSet>
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <deque>
 #include <limits>
 #include <utility>
 
 namespace gost {
+namespace {
+
+constexpr int SessionPageSize = 2;
+const std::array ActiveSessionStates{QStringLiteral("STARTING"), QStringLiteral("RUNNING"), QStringLiteral("STOPPING")};
+
+bool terminalSession(const QString &state)
+{
+	return state == QStringLiteral("STOPPED") || state == QStringLiteral("FAILED") ||
+	       state == QStringLiteral("INTERRUPTED");
+}
+
+bool activeSession(const QString &state)
+{
+	return std::find(ActiveSessionStates.cbegin(), ActiveSessionStates.cend(), state) != ActiveSessionStates.cend();
+}
+
+bool validDockId(const QString &id)
+{
+	return !id.isEmpty() && id.size() <= 4096 && !id.contains(QChar::Null);
+}
+
+void markReadUnconfirmed(ReadStatus &status)
+{
+	if (status.availability == RuntimeAvailability::Fresh)
+		status.availability = RuntimeAvailability::Stale;
+	status.complete = false;
+}
+
+} // namespace
 
 class ConnectionController::Impl {
 public:
@@ -59,6 +91,24 @@ public:
 	bool active = false;
 	bool profileResolved = false;
 	bool autoStarted = false;
+	struct DockRead {
+		DockContext selection;
+		quint64 anchorVersion = 0;
+		DockServerState next;
+		QSet<QString> candidates;
+		std::size_t remainingPages = ActiveSessionStates.size();
+		bool complete = true;
+		bool sessionDone = false;
+		bool fallbackDone = false;
+		bool sessionPublished = false;
+		bool fallbackPublished = false;
+		bool dirty = false;
+	};
+	using DockBatch = std::shared_ptr<DockRead>;
+	DockBatch dockRead;
+	quint64 anchorVersion = 0;
+	DockContext dockSessionHintContext;
+	QString dockSessionHint;
 
 	bool current(api::RequestContext received) const { return !stopped && active && received == context; }
 
@@ -81,20 +131,269 @@ public:
 		++context.selection;
 		retry.stop();
 		clearSseRejection();
+		dockRead.reset();
 		api.cancelAll();
 		events.close();
 		if (!connection && active)
 			state.setConnection(state.serverOrigin(), ConnectionStatus::Connecting);
 	}
 
-	void configure() { api.configure(QUrl(state.serverOrigin()), context); }
+	void configure()
+	{
+		dockRead.reset();
+		api.configure(QUrl(state.serverOrigin()), context);
+	}
 
 	void resolveSelection(QString notice = {}, QString noticeKey = {})
 	{
-		state.setSelection(profileResolved
-					   ? settings.selectedStream(state.serverOrigin(), settings.profileUuid())
-					   : QString{},
-				   profileResolved, std::move(notice), std::move(noticeKey));
+		const auto profileUuid = profileResolved ? settings.profileUuid() : QString{};
+		const auto streamId = profileResolved ? settings.selectedStream(state.serverOrigin(), profileUuid)
+						      : QString{};
+		const DockContext selection{state.serverOrigin(), profileUuid, streamId};
+		if (dockSessionHintContext != selection) {
+			dockSessionHintContext = selection;
+			dockSessionHint.clear();
+		}
+		state.setSelection(streamId, profileResolved, std::move(notice), std::move(noticeKey), profileUuid);
+	}
+
+	bool currentDockRead(const DockBatch &batch, api::RequestContext received) const
+	{
+		return current(received) && dockRead == batch && batch->anchorVersion == anchorVersion &&
+		       state.connectionStatus() == ConnectionStatus::Connected &&
+		       state.dockContext() == batch->selection;
+	}
+
+	void finishDockRead(const DockBatch &batch, api::RequestContext received)
+	{
+		if (!currentDockRead(batch, received))
+			return;
+		if (batch->sessionDone && !batch->sessionPublished && !batch->dirty) {
+			auto published = state.dockServer();
+			published.session = batch->next.session;
+			published.sessionStatus = batch->next.sessionStatus;
+			published.outputs = batch->next.outputs;
+			published.outputsStatus = batch->next.outputsStatus;
+			batch->sessionPublished = true;
+			const QPointer<ConnectionController> guard = &owner;
+			state.setDockServer(std::move(published));
+			if (!guard || !currentDockRead(batch, received))
+				return;
+		}
+		if (batch->fallbackDone && !batch->fallbackPublished) {
+			auto published = state.dockServer();
+			published.fallback = batch->next.fallback;
+			batch->fallbackPublished = true;
+			const QPointer<ConnectionController> guard = &owner;
+			state.setDockServer(std::move(published));
+			if (!guard || !currentDockRead(batch, received))
+				return;
+		}
+		if (batch->sessionDone && batch->fallbackDone) {
+			dockRead.reset();
+			if (batch->dirty)
+				refreshDock();
+		}
+	}
+
+	void finishDockSession(const DockBatch &batch, api::RequestContext received)
+	{
+		batch->sessionDone = true;
+		finishDockRead(batch, received);
+	}
+
+	void finishDockFallback(const DockBatch &batch, api::RequestContext received)
+	{
+		batch->fallbackDone = true;
+		finishDockRead(batch, received);
+	}
+
+	void readDockOutputs(const DockBatch &batch, const QString &sessionId)
+	{
+		api.getAllOutputs(
+			sessionId, &owner,
+			[this, batch, sessionId](auto received, api::Result<api::Collection<api::Output>> result) {
+				if (!currentDockRead(batch, received))
+					return;
+				if (!batch->dirty && result) {
+					QMap<QString, DockOutput> outputs;
+					bool valid = true;
+					for (const auto &output : result.value->items) {
+						if (!validDockId(output.id) || outputs.contains(output.id) ||
+						    output.sessionId != sessionId ||
+						    output.destination.streamId != batch->selection.streamId) {
+							valid = false;
+							break;
+						}
+						outputs.insert(output.id, {output.destination.name, output.attached,
+									   output.desiredRunning});
+					}
+					if (valid) {
+						batch->next.outputs = std::move(outputs);
+						batch->next.outputsStatus = {RuntimeAvailability::Fresh,
+									     result.value->complete,
+									     {}};
+					}
+				}
+				finishDockSession(batch, received);
+			});
+	}
+
+	void readExactDockSession(const DockBatch &batch, api::RequestContext received)
+	{
+		const bool terminalOnly = batch->candidates.isEmpty();
+		if (batch->dirty || !batch->complete || batch->candidates.size() > 1 ||
+		    (terminalOnly && dockSessionHint.isEmpty())) {
+			finishDockSession(batch, received);
+			return;
+		}
+		const auto sessionId = terminalOnly ? dockSessionHint : *batch->candidates.cbegin();
+		api.getSession(sessionId, &owner,
+			       [this, batch, sessionId, terminalOnly](auto ctx, api::Result<api::Session> result) {
+				       if (!currentDockRead(batch, ctx))
+					       return;
+				       if (!result || result.value->id != sessionId ||
+					   result.value->streamId != batch->selection.streamId ||
+					   result.value->stream.id != batch->selection.streamId ||
+					   (!terminalSession(result.value->state) &&
+					    (terminalOnly || !activeSession(result.value->state)))) {
+					       finishDockSession(batch, ctx);
+					       return;
+				       }
+				       dockSessionHint = sessionId;
+				       if (batch->dirty) {
+					       finishDockSession(batch, ctx);
+					       return;
+				       }
+				       if (!batch->next.session || batch->next.session->id != sessionId) {
+					       batch->next.outputs.clear();
+					       batch->next.outputsStatus = {};
+				       }
+				       batch->next.session =
+					       DockSession{sessionId, result.value->state, result.value->desiredPaused};
+				       batch->next.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+				       readDockOutputs(batch, sessionId);
+			       });
+	}
+
+	void readDockSessionPage(const DockBatch &batch, const QString &status)
+	{
+		api::ListQuery query;
+		query.limit = SessionPageSize;
+		query.state = status;
+		api.getStreamSessions(
+			batch->selection.streamId, &owner,
+			[this, batch, status](auto ctx, api::Result<api::Page<api::Session>> result) {
+				if (!currentDockRead(batch, ctx))
+					return;
+				if (!result || !result.value->nextCursor.isEmpty() ||
+				    result.value->items.size() > SessionPageSize) {
+					batch->complete = false;
+				} else {
+					QSet<QString> ids;
+					for (const auto &session : result.value->items) {
+						if (!validDockId(session.id) || ids.contains(session.id) ||
+						    session.streamId != batch->selection.streamId ||
+						    session.stream.id != batch->selection.streamId ||
+						    session.state != status) {
+							batch->complete = false;
+							break;
+						}
+						ids.insert(session.id);
+					}
+					batch->candidates.unite(ids);
+				}
+				if (--batch->remainingPages == 0)
+					readExactDockSession(batch, ctx);
+			},
+			std::move(query));
+	}
+
+	void readDockGeneration(const DockBatch &batch, const QString &assetId, const QString &generationId)
+	{
+		api.getGeneration(assetId, generationId, &owner,
+				  [this, batch, assetId, generationId](auto ctx, api::Result<api::Generation> result) {
+					  if (!currentDockRead(batch, ctx))
+						  return;
+					  if (result && result.value->id == generationId &&
+					      result.value->assetId == assetId)
+						  batch->next.fallback.currentStatus = result.value->status;
+					  finishDockFallback(batch, ctx);
+				  });
+	}
+
+	void readDockAsset(const DockBatch &batch, const QString &assetId)
+	{
+		api.getAsset(assetId, &owner, [this, batch, assetId](auto ctx, api::Result<api::Asset> result) {
+			if (!currentDockRead(batch, ctx))
+				return;
+			auto &fallback = batch->next.fallback;
+			if (result && result.value->id == assetId) {
+				fallback.assetKnown = true;
+				fallback.pendingGenerationId = result.value->pendingGenerationId;
+				fallback.currentGenerationId = result.value->currentGenerationId;
+				if (validDockId(fallback.currentGenerationId)) {
+					readDockGeneration(batch, assetId, fallback.currentGenerationId);
+					return;
+				}
+			}
+			finishDockFallback(batch, ctx);
+		});
+	}
+
+	void readDockFallback(const DockBatch &batch)
+	{
+		api.getFallbackPolicy(batch->selection.streamId, &owner,
+				      [this, batch](auto ctx, api::Result<api::PolicyResult> result) {
+					      if (!currentDockRead(batch, ctx))
+						      return;
+					      if (result && result.value->fallback.isNull()) {
+						      batch->next.fallback = {};
+						      batch->next.fallback.availability = RuntimeAvailability::Fresh;
+						      batch->next.fallback.assigned = false;
+					      } else if (result && result.value->fallback &&
+							 validDockId(result.value->fallback->assetId)) {
+						      batch->next.fallback = {};
+						      batch->next.fallback.availability = RuntimeAvailability::Fresh;
+						      batch->next.fallback.assigned = true;
+						      readDockAsset(batch, result.value->fallback->assetId);
+						      return;
+					      }
+					      finishDockFallback(batch, ctx);
+				      });
+	}
+
+	void refreshDock()
+	{
+		if (!active || stopped || state.connectionStatus() != ConnectionStatus::Connected ||
+		    !state.dockContext().valid())
+			return;
+		if (dockRead) {
+			dockRead->dirty = true;
+			return;
+		}
+		auto batch = std::make_shared<DockRead>();
+		batch->selection = state.dockContext();
+		batch->anchorVersion = anchorVersion;
+		batch->next = state.dockServer();
+		markReadUnconfirmed(batch->next.sessionStatus);
+		markReadUnconfirmed(batch->next.outputsStatus);
+		if (batch->next.fallback.availability == RuntimeAvailability::Fresh)
+			batch->next.fallback.availability = RuntimeAvailability::Stale;
+		dockRead = batch;
+		for (const auto &status : ActiveSessionStates)
+			readDockSessionPage(batch, status);
+		readDockFallback(batch);
+	}
+
+	bool relevantDockEvent(const api::RuntimeEvent &event) const
+	{
+		const auto &session = state.dockServer().session;
+		if (session && session->id == event.sessionId)
+			return true;
+		return event.owner == QStringLiteral("session") &&
+		       (!session || terminalSession(session->state) ||
+			state.dockServer().sessionStatus.availability != RuntimeAvailability::Fresh);
 	}
 
 	void stopWithReason(ConnectionStatus status, QString message, QString key)
@@ -103,6 +402,8 @@ public:
 		const QPointer<ConnectionController> guard = &owner;
 		active = false;
 		retry.stop();
+		dockRead.reset();
+		api.cancelAll();
 		state.markRuntimeStale();
 		if (guard && !stopped && !active && context == expected)
 			state.setConnection(state.serverOrigin(), status, std::move(message), std::move(key));
@@ -149,6 +450,8 @@ public:
 		const auto expected = context;
 		const QPointer<ConnectionController> guard = &owner;
 		retry.start(delay);
+		dockRead.reset();
+		api.cancelAll();
 		state.markRuntimeStale();
 		if (guard && current(expected))
 			state.setConnection(state.serverOrigin(), ConnectionStatus::Reconnecting,
@@ -231,12 +534,14 @@ public:
 		api.getSnapshot(&owner, [this](auto ctx, api::Result<api::Anchor> result) {
 			if (!current(ctx))
 				return;
-			if (!result || !state.installAnchor(*result.value)) {
+			const QPointer<ConnectionController> guard = &owner;
+			if (!result || !state.installAnchor(*result.value, true)) {
 				schedule(Phase::Snapshot);
 				return;
 			}
-			if (!current(ctx))
+			if (!guard || !current(ctx))
 				return;
+			++anchorVersion;
 			subscribe();
 		});
 	}
@@ -289,11 +594,15 @@ public:
 			[this](auto ctx, const api::RuntimeEvent &event) {
 				if (!current(ctx))
 					return false;
-				if (!state.applyEvent(event))
+				const QPointer<ConnectionController> guard = &owner;
+				bool topologyChanged = false;
+				if (!state.applyEvent(event, &topologyChanged))
 					return false;
-				if (!current(ctx))
+				if (!guard || !current(ctx))
 					return false;
 				failures = 0;
+				if (topologyChanged && relevantDockEvent(event))
+					refreshDock();
 				return true;
 			},
 			[this](auto ctx, api::Error error, bool requiresSnapshot) {
@@ -305,7 +614,10 @@ public:
 				if (!current(ctx))
 					return;
 				clearSseRejection();
+				const QPointer<ConnectionController> guard = &owner;
 				state.setConnection(state.serverOrigin(), ConnectionStatus::Connected);
+				if (guard && current(ctx))
+					refreshDock();
 			});
 	}
 
@@ -324,7 +636,10 @@ public:
 		active = false;
 		invalidate(true);
 		settings.setServerOrigin(*canonical);
-		state.clearServerState();
+		const bool sameOrigin = state.serverOrigin() == *canonical;
+		if (sameOrigin)
+			state.markRuntimeStale();
+		state.clearServerState(sameOrigin);
 		state.setConnection(*canonical, ConnectionStatus::Connecting);
 		resolveSelection();
 		failures = 0;

@@ -57,6 +57,27 @@ public:
 		}
 	}
 
+	void setStreamingPhase(const TextLookup &text, ObsStreamingPhase phase)
+	{
+		switch (phase) {
+		case ObsStreamingPhase::Unknown:
+			setStatus(text("Observation.NoData"), Tone::Neutral);
+			break;
+		case ObsStreamingPhase::Stopped:
+			setStatus(text("Dock.ObsStopped"), Tone::Neutral);
+			break;
+		case ObsStreamingPhase::Starting:
+			setStatus(text("Dock.ObsStarting"), Tone::Pending);
+			break;
+		case ObsStreamingPhase::Streaming:
+			setStatus(text("Dock.ObsStreaming"), Tone::Active);
+			break;
+		case ObsStreamingPhase::Stopping:
+			setStatus(text("Dock.ObsStopping"), Tone::Pending);
+			break;
+		}
+	}
+
 protected:
 	bool eventFilter(QObject *watched, QEvent *event) override
 	{
