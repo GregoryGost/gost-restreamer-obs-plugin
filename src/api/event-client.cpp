@@ -21,6 +21,7 @@ public:
 	QPointer<QObject> receiver;
 	EventHandler eventHandler;
 	ErrorHandler errorHandler;
+	OpenHandler openHandler;
 	QMetaObject::Connection receiverConnection;
 	RequestContext context;
 	quint64 serial = 0;
@@ -58,6 +59,7 @@ public:
 		receiver = nullptr;
 		eventHandler = {};
 		errorHandler = {};
+		openHandler = {};
 		validated = false;
 		finished = false;
 		scheduled = false;
@@ -85,17 +87,22 @@ public:
 					   .trimmed()
 					   .toLower();
 		if (status != 200) {
-			fail(makeError(ErrorKind::Http, status), status == 400 || status == 409);
+			fail(makeError(ErrorKind::Http, status), false);
 			return false;
 		}
 		if (media != QStringLiteral("text/event-stream")) {
-			fail(makeError(ErrorKind::Contract, status), true);
+			fail(makeError(ErrorKind::Contract, status), false);
 			return false;
 		}
 		validated = true;
 		handshake.stop();
 		idle.start(std::max(1, limits.sseIdleMs));
-		return true;
+		const auto expected = serial;
+		const QPointer<EventClient> guard = owner;
+		auto callback = std::move(openHandler);
+		if (receiver && callback)
+			callback(context);
+		return guard && expected == serial && receiver;
 	}
 	void schedule()
 	{
@@ -155,8 +162,12 @@ public:
 			const auto expected = serial;
 			const QPointer<EventClient> guard = owner;
 			if (!headers()) {
-				if (guard && expected == serial && finished)
-					fail(makeError(ErrorKind::Transport), false);
+				if (guard && expected == serial && finished) {
+					const auto kind = reply->error() == QNetworkReply::SslHandshakeFailedError
+								  ? ErrorKind::Tls
+								  : ErrorKind::Transport;
+					fail(makeError(kind), false);
+				}
 				return;
 			}
 		}
@@ -211,7 +222,7 @@ public:
 		}
 	}
 	void subscribe(QUrl origin, QString cursor, RequestContext ctx, QObject *target, EventHandler events,
-		       ErrorHandler errors)
+		       ErrorHandler errors, OpenHandler opened)
 	{
 		if (stopped)
 			return;
@@ -220,6 +231,7 @@ public:
 		receiver = target;
 		eventHandler = std::move(events);
 		errorHandler = std::move(errors);
+		openHandler = std::move(opened);
 		confirmed = cursor;
 		if (!receiver)
 			return;
@@ -267,9 +279,10 @@ EventClient::~EventClient()
 	shutdown();
 }
 void EventClient::subscribe(QUrl origin, QString cursor, RequestContext context, QObject *receiver, EventHandler events,
-			    ErrorHandler errors)
+			    ErrorHandler errors, OpenHandler opened)
 {
-	impl_->subscribe(std::move(origin), std::move(cursor), context, receiver, std::move(events), std::move(errors));
+	impl_->subscribe(std::move(origin), std::move(cursor), context, receiver, std::move(events), std::move(errors),
+			 std::move(opened));
 }
 void EventClient::close()
 {

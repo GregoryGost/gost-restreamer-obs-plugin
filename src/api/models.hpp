@@ -32,7 +32,7 @@ struct ProfileText {
 	QByteArray bytes;
 	bool operator==(const ProfileText &) const = default;
 };
-enum class ErrorKind { Transport, Timeout, Cancelled, Decode, Limit, Http, Contract };
+enum class ErrorKind { Transport, Timeout, Cancelled, Decode, Limit, Http, Contract, Tls };
 struct Problem {
 	QString type;
 	QString title;

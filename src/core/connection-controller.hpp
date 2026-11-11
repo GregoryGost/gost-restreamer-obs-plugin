@@ -27,6 +27,7 @@ public:
 	void selectStream(QString streamId);
 	void setAutoConnect(bool enabled);
 	void setReconnect(bool enabled);
+	void setSseRejectionRetries(int retries);
 	void shutdown();
 
 private:

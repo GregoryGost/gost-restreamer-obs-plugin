@@ -124,8 +124,7 @@ void SSEParser::reset()
 }
 bool SSEParser::finish()
 {
-	if (!line_.isValidUtf8() || !bom_.isEmpty())
-		return fail(ErrorKind::Decode);
+	bom_.clear();
 	line_.clear();
 	data_.clear();
 	event_.clear();

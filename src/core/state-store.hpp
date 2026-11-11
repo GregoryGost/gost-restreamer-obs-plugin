@@ -76,6 +76,7 @@ public:
 	bool profileResolved() const noexcept;
 	bool autoConnect() const noexcept;
 	bool reconnect() const noexcept;
+	int sseRejectionRetries() const noexcept;
 	const QString &safeError() const noexcept;
 	const QString &safeErrorKey() const noexcept;
 	bool settingsUnsaved() const noexcept;
@@ -88,8 +89,8 @@ public:
 	const std::optional<api::Health> &ready() const noexcept;
 	const std::optional<api::Capabilities> &capabilities() const noexcept;
 	void setConnection(QString origin, ConnectionStatus status, QString safeError = {}, QString errorKey = {});
-	void setPreferences(bool autoConnect, bool reconnect, bool unsaved, QString settingsError = {},
-			    QString errorKey = {});
+	void setPreferences(bool autoConnect, bool reconnect, int sseRejectionRetries, bool unsaved,
+			    QString settingsError = {}, QString errorKey = {});
 	void setStreams(QVector<api::Stream> streams, bool complete);
 	void setSelection(QString streamId, bool profileResolved, QString notice = {}, QString noticeKey = {});
 	void setReady(api::Health ready);
@@ -120,6 +121,7 @@ private:
 	bool profileResolved_ = false;
 	bool autoConnect_ = true;
 	bool reconnect_ = true;
+	int sseRejectionRetries_;
 	bool settingsUnsaved_ = false;
 	QString connectionError_;
 	QString connectionErrorKey_;

@@ -95,10 +95,19 @@ bool SettingsStore::load()
 	if (parseError.error != QJsonParseError::NoError || !document.isObject())
 		return reject();
 	const auto root = document.object();
-	if (!exactKeys(root, {QStringLiteral("schema_version"), QStringLiteral("server_origin"),
-			      QStringLiteral("auto_connect"), QStringLiteral("reconnect"), QStringLiteral("profiles"),
-			      QStringLiteral("bindings")}) ||
-	    root.value(QStringLiteral("schema_version")).toInt(-1) != 1 ||
+	const int schemaVersion = root.value(QStringLiteral("schema_version")).toInt(-1);
+	if (schemaVersion != 1 && schemaVersion != 2)
+		return reject();
+	QStringList keys{QStringLiteral("schema_version"), QStringLiteral("server_origin"),
+			 QStringLiteral("auto_connect"),   QStringLiteral("reconnect"),
+			 QStringLiteral("profiles"),       QStringLiteral("bindings")};
+	int retries = DefaultSseRejectionRetries;
+	if (schemaVersion == 2) {
+		const auto key = QStringLiteral("sse_rejection_retries");
+		keys.append(key);
+		retries = root.value(key).toInt(UnlimitedSseRejectionRetries - 1);
+	}
+	if (!exactKeys(root, keys) || retries < UnlimitedSseRejectionRetries ||
 	    !root.value(QStringLiteral("server_origin")).isString() ||
 	    !root.value(QStringLiteral("auto_connect")).isBool() || !root.value(QStringLiteral("reconnect")).isBool() ||
 	    !root.value(QStringLiteral("profiles")).isArray() || !root.value(QStringLiteral("bindings")).isArray())
@@ -152,6 +161,7 @@ bool SettingsStore::load()
 	origin_ = origin;
 	autoConnect_ = root.value(QStringLiteral("auto_connect")).toBool();
 	reconnect_ = root.value(QStringLiteral("reconnect")).toBool();
+	sseRejectionRetries_ = retries;
 	profiles_ = std::move(profiles);
 	bindings_ = std::move(bindings);
 	currentUuid_.clear();
@@ -184,10 +194,11 @@ bool SettingsStore::save()
 			bindings.append(QJsonObject{{QStringLiteral("origin"), server.key()},
 						    {QStringLiteral("profile_uuid"), binding.key()},
 						    {QStringLiteral("stream_id"), binding.value()}});
-	const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1},
+	const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 2},
 						     {QStringLiteral("server_origin"), origin_},
 						     {QStringLiteral("auto_connect"), autoConnect_},
 						     {QStringLiteral("reconnect"), reconnect_},
+						     {QStringLiteral("sse_rejection_retries"), sseRejectionRetries_},
 						     {QStringLiteral("profiles"), profiles},
 						     {QStringLiteral("bindings"), bindings}})
 				   .toJson(QJsonDocument::Compact);
@@ -223,6 +234,10 @@ bool SettingsStore::autoConnect() const noexcept
 bool SettingsStore::reconnect() const noexcept
 {
 	return reconnect_;
+}
+int SettingsStore::sseRejectionRetries() const noexcept
+{
+	return sseRejectionRetries_;
 }
 bool SettingsStore::unsaved() const noexcept
 {
@@ -280,6 +295,14 @@ void SettingsStore::setReconnect(bool enabled)
 {
 	if (reconnect_ != enabled) {
 		reconnect_ = enabled;
+		persist();
+	}
+}
+
+void SettingsStore::setSseRejectionRetries(int retries)
+{
+	if (retries >= UnlimitedSseRejectionRetries && retries != sseRejectionRetries_) {
+		sseRejectionRetries_ = retries;
 		persist();
 	}
 }

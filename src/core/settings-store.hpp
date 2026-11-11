@@ -27,6 +27,9 @@ class SettingsStore final : public QObject {
 	Q_OBJECT
 
 public:
+	static constexpr int UnlimitedSseRejectionRetries = -1;
+	static constexpr int DefaultSseRejectionRetries = 3;
+
 	explicit SettingsStore(QString filePath, QObject *parent = nullptr);
 	static std::optional<QString> canonicalOrigin(const QString &text);
 	bool load();
@@ -34,6 +37,7 @@ public:
 	const QString &serverOrigin() const noexcept;
 	bool autoConnect() const noexcept;
 	bool reconnect() const noexcept;
+	int sseRejectionRetries() const noexcept;
 	bool unsaved() const noexcept;
 	const QString &error() const noexcept;
 	const QString &errorKey() const noexcept;
@@ -43,6 +47,7 @@ public:
 	bool setServerOrigin(const QString &origin);
 	void setAutoConnect(bool enabled);
 	void setReconnect(bool enabled);
+	void setSseRejectionRetries(int retries);
 	bool setSelectedStream(const QString &origin, const QString &profileUuid, const QString &streamId);
 	ProfileResolution observeProfile(FrontendEvent event, const ProfileDescriptor &descriptor);
 
@@ -56,6 +61,7 @@ private:
 	QString origin_;
 	bool autoConnect_ = true;
 	bool reconnect_ = true;
+	int sseRejectionRetries_ = DefaultSseRejectionRetries;
 	bool unsaved_ = false;
 	bool writeAllowed_ = true;
 	QString error_;

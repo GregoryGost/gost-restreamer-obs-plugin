@@ -102,9 +102,9 @@ $dockMenuExpandState = $null
 $gearName = if ($russian) { 'Открыть управление и настройки' } else { 'Open management and settings' }
 $title = if ($russian) { 'GOST Restreamer — Управление и настройки' } else { 'GOST Restreamer — Management and settings' }
 $pages = if ($russian) {
-    @('Потоки', 'Выходы', 'Группы и профили', 'Заглушки', 'Диагностика', 'Настройки')
+    @('Потоки', 'Выходы', 'Группы и профили', 'Заглушки', 'Диагностика', 'Настройки', 'Расширенные')
 } else {
-    @('Streams', 'Outputs', 'Groups and profiles', 'Fallback', 'Diagnostics', 'Settings')
+    @('Streams', 'Outputs', 'Groups and profiles', 'Fallback', 'Diagnostics', 'Settings', 'Advanced')
 }
 $processCondition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ObsProcessId)
@@ -475,8 +475,8 @@ $navigationCondition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
 $navigation = @($management.FindAll([System.Windows.Automation.TreeScope]::Descendants, $navigationCondition))
 $names = @($navigation | ForEach-Object { $_.Current.Name })
-if ($names.Count -ne 6 -or ($names -join '|') -cne ($pages -join '|')) {
-    throw 'Не подтверждены шесть локализованных разделов расширенного окна.'
+if ($names.Count -ne $pages.Count -or ($names -join '|') -cne ($pages -join '|')) {
+    throw 'Не подтверждены локализованные разделы расширенного окна.'
 }
 $foregroundBeforeGear = Prepare-OwnedMainForeground
 Invoke-Gear
@@ -514,7 +514,7 @@ Assert-OwnedElement $reopened
 if ($reopened.Current.Name -cne $title) { throw 'Повторно открытое окно имеет неверный локализованный заголовок.' }
 $reopenedNavigation = @($reopened.FindAll([System.Windows.Automation.TreeScope]::Descendants, $navigationCondition))
 $reopenedNames = @($reopenedNavigation | ForEach-Object { $_.Current.Name })
-if ($reopenedNames.Count -ne 6 -or ($reopenedNames -join '|') -cne ($pages -join '|')) {
+if ($reopenedNames.Count -ne $pages.Count -or ($reopenedNames -join '|') -cne ($pages -join '|')) {
     throw 'Повторно открытое окно потеряло локализованные разделы.'
 }
 $reopenedSection = $reopenedNavigation[$reopenedNavigation.Count - 1]

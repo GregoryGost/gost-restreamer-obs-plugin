@@ -318,8 +318,7 @@ public:
 				walk->cursors.insert(walk->query.cursor);
 				QTimer::singleShot(0, owner, [this, walk] { walkNext(walk); });
 			},
-			std::min(limits.restBodyBytes,
-				 std::max<qsizetype>(1, limits.pageWalkBytes - walk->result.bytes)));
+			limits.restBodyBytes);
 	}
 	template<class T> void all(QString path, QObject *receiver, Callback<Collection<T>> callback, ListQuery query)
 	{

@@ -41,6 +41,8 @@ private slots:
 	void everyListPreservesOpaqueCursorAndFilters();
 	void incompleteWalkCannotReportSuccess_data();
 	void incompleteWalkCannotReportSuccess();
+	void listBodyLimitsPreserveOnlyWholePages_data();
+	void listBodyLimitsPreserveOnlyWholePages();
 	void httpProblemsAndDecodeFailures_data();
 	void httpProblemsAndDecodeFailures();
 	void cancellationAndOldContextAreObservable();
@@ -207,8 +209,7 @@ void ApiNetworkTest::incompleteWalkCannotReportSuccess_data()
 	QTest::newRow("repeated-cursor") << 0;
 	QTest::newRow("page-limit") << 1;
 	QTest::newRow("item-limit") << 2;
-	QTest::newRow("byte-limit") << 3;
-	QTest::newRow("http-page-two") << 4;
+	QTest::newRow("http-page-two") << 3;
 }
 void ApiNetworkTest::incompleteWalkCannotReportSuccess()
 {
@@ -216,7 +217,7 @@ void ApiNetworkTest::incompleteWalkCannotReportSuccess()
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [&](const HttpServer::Request &request) {
-		if (failure == 4 && server.requests.size() > 1)
+		if (failure == 3 && server.requests.size() > 1)
 			HttpServer::reply(request, R"({"title":"Unavailable","status":503})", 503,
 					  "application/problem+json");
 		else
@@ -227,8 +228,6 @@ void ApiNetworkTest::incompleteWalkCannotReportSuccess()
 		limits.maxPages = 1;
 	if (failure == 2)
 		limits.maxItems = 1;
-	if (failure == 3)
-		limits.pageWalkBytes = 8;
 	APIClient api(limits);
 	api.configure(server.origin(), {1, 1});
 	std::optional<Result<Collection<Stream>>> result;
@@ -237,6 +236,53 @@ void ApiNetworkTest::incompleteWalkCannotReportSuccess()
 	QVERIFY(!result->value || !result->value->complete);
 	QVERIFY(result->value.has_value() || result->error.has_value());
 	QVERIFY(server.requests.size() <= 3);
+}
+
+void ApiNetworkTest::listBodyLimitsPreserveOnlyWholePages_data()
+{
+	QTest::addColumn<bool>("individualOverflow");
+	QTest::newRow("aggregate-overflow") << false;
+	QTest::newRow("individual-overflow") << true;
+}
+
+void ApiNetworkTest::listBodyLimitsPreserveOnlyWholePages()
+{
+	QFETCH(bool, individualOverflow);
+	const QString cursor = QStringLiteral("page/+%2F");
+	const auto first = fixture::page({fixture::stream(QStringLiteral("first"))}, cursor);
+	const auto second =
+		fixture::page({fixture::stream(QStringLiteral("second")), fixture::stream(QStringLiteral("third"))},
+			      QStringLiteral("later"));
+	QVERIFY(first.size() < second.size());
+	HttpServer server;
+	QVERIFY(server.listen());
+	server.handler = [&](const auto &request) {
+		HttpServer::reply(request, server.requests.size() == 1 ? first : second);
+	};
+	Limits limits;
+	limits.pageWalkBytes = first.size() + second.size() - 1;
+	limits.restBodyBytes = second.size() - int(individualOverflow);
+	APIClient api(limits);
+	api.configure(server.origin(), {1, 1});
+	std::optional<Result<Collection<Stream>>> result;
+	api.getAllStreams(this, [&](auto, auto value) { result = std::move(value); });
+	QTRY_VERIFY_WITH_TIMEOUT(result.has_value(), 3000);
+	QCOMPARE(server.requests.size(), 2);
+	const QUrlQuery query(QUrl::fromEncoded("http://local" + server.requests.back().target));
+	QCOMPARE(query.queryItemValue(QStringLiteral("cursor"), QUrl::FullyDecoded), cursor);
+	if (individualOverflow) {
+		QVERIFY(!result->value);
+		QVERIFY(result->error);
+		QCOMPARE(result->error->kind, ErrorKind::Limit);
+	} else {
+		QVERIFY(*result);
+		QVERIFY(!result->error);
+		QVERIFY(!result->value->complete);
+		QCOMPARE(result->value->items.size(), 1);
+		QCOMPARE(result->value->items.front().id, QStringLiteral("first"));
+		QCOMPARE(result->value->nextCursor, cursor);
+		QCOMPARE(result->value->bytes, first.size());
+	}
 }
 
 void ApiNetworkTest::httpProblemsAndDecodeFailures_data()
@@ -486,7 +532,8 @@ void ApiNetworkTest::sseControlForcesSnapshotWithoutFollowingUrl()
 	QVERIFY(server.listen());
 	server.handler = [](const auto &request) {
 		HttpServer::stream(
-			request, "event: resync_required\ndata: {\"snapshot_url\":\"http://127.0.0.1:9/private\"}\n\n");
+			request,
+			"event: resync_required\ndata: {\"reason\":\"cursor_expired\",\"snapshot_url\":\"/arbitrary\"}\n\n");
 	};
 	EventClient client;
 	bool error = false;

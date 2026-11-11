@@ -6,6 +6,7 @@
 #include "core/state-store.hpp"
 
 #include <QElapsedTimer>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QThread>
 #include <QTimer>
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <utility>
 
 namespace gost {
@@ -51,6 +53,8 @@ public:
 	std::deque<qint64> starts;
 	Phase nextPhase = Phase::Handshake;
 	int failures = 0;
+	int sseRejectionStatus = 0;
+	int sseRejectionAttempts = 0;
 	bool stopped = false;
 	bool active = false;
 	bool profileResolved = false;
@@ -60,8 +64,14 @@ public:
 
 	void syncPreferences()
 	{
-		state.setPreferences(settings.autoConnect(), settings.reconnect(), settings.unsaved(), settings.error(),
-				     settings.errorKey());
+		state.setPreferences(settings.autoConnect(), settings.reconnect(), settings.sseRejectionRetries(),
+				     settings.unsaved(), settings.error(), settings.errorKey());
+	}
+
+	void clearSseRejection()
+	{
+		sseRejectionStatus = 0;
+		sseRejectionAttempts = 0;
 	}
 
 	void invalidate(bool connection)
@@ -70,8 +80,11 @@ public:
 			++context.connection;
 		++context.selection;
 		retry.stop();
+		clearSseRejection();
 		api.cancelAll();
 		events.close();
+		if (!connection && active)
+			state.setConnection(state.serverOrigin(), ConnectionStatus::Connecting);
 	}
 
 	void configure() { api.configure(QUrl(state.serverOrigin()), context); }
@@ -84,17 +97,46 @@ public:
 				   profileResolved, std::move(notice), std::move(noticeKey));
 	}
 
-	void schedule(Phase phase, const api::Error &error)
+	void stopWithReason(ConnectionStatus status, QString message, QString key)
 	{
-		Q_UNUSED(error);
+		const auto expected = context;
+		const QPointer<ConnectionController> guard = &owner;
+		active = false;
+		retry.stop();
+		state.markRuntimeStale();
+		if (guard && !stopped && !active && context == expected)
+			state.setConnection(state.serverOrigin(), status, std::move(message), std::move(key));
+	}
+
+	bool rejectionLimitReached() const
+	{
+		const int limit = settings.sseRejectionRetries();
+		return limit != SettingsStore::UnlimitedSseRejectionRetries && sseRejectionAttempts >= limit;
+	}
+
+	void stopAfterRejection()
+	{
+		const bool badRequest = sseRejectionStatus == 400;
+		stopWithReason(
+			ConnectionStatus::Error,
+			badRequest ? QStringLiteral("Сервер отклонил запрос подписки на события (HTTP 400).")
+				   : QStringLiteral("Конфликт состояния сервера при подписке на события (HTTP 409)."),
+			badRequest ? QStringLiteral("Error.SseBadRequest") : QStringLiteral("Error.SseConflict"));
+	}
+
+	void schedule(Phase phase)
+	{
 		if (!active || stopped)
 			return;
-		state.markRuntimeStale();
+		if (phase == Phase::Snapshot && sseRejectionStatus &&
+		    (!settings.reconnect() || rejectionLimitReached())) {
+			stopAfterRejection();
+			return;
+		}
 		if (!settings.reconnect()) {
-			active = false;
-			state.setConnection(state.serverOrigin(), ConnectionStatus::Error,
-					    QStringLiteral("Нет связи с сервером. Повторите подключение."),
-					    QStringLiteral("Error.ConnectionLost"));
+			stopWithReason(ConnectionStatus::Error,
+				       QStringLiteral("Нет связи с сервером. Повторите подключение."),
+				       QStringLiteral("Error.ConnectionLost"));
 			return;
 		}
 		nextPhase = phase;
@@ -104,16 +146,24 @@ public:
 		const int base = std::min(30000, 1000 * (1 << exponent));
 		const int jitter = QRandomGenerator::global()->bounded(std::max(1, base / 5));
 		const int delay = std::clamp(base - base / 10 + jitter, 1000, 30000);
-		state.setConnection(state.serverOrigin(), ConnectionStatus::Reconnecting,
-				    QStringLiteral("Нет связи с сервером. Ожидается повторное подключение."),
-				    QStringLiteral("Error.Reconnecting"));
+		const auto expected = context;
+		const QPointer<ConnectionController> guard = &owner;
 		retry.start(delay);
+		state.markRuntimeStale();
+		if (guard && current(expected))
+			state.setConnection(state.serverOrigin(), ConnectionStatus::Reconnecting,
+					    QStringLiteral("Нет связи с сервером. Ожидается повторное подключение."),
+					    QStringLiteral("Error.Reconnecting"));
 	}
 
 	void start(Phase phase)
 	{
 		if (!active || stopped)
 			return;
+		if (phase == Phase::Snapshot && sseRejectionStatus && rejectionLimitReached()) {
+			stopAfterRejection();
+			return;
+		}
 		const auto now = clock.elapsed();
 		while (!starts.empty() && now - starts.front() >= 10000)
 			starts.pop_front();
@@ -130,6 +180,8 @@ public:
 			return;
 		}
 		if (phase == Phase::Snapshot) {
+			if (sseRejectionStatus && sseRejectionAttempts < std::numeric_limits<int>::max())
+				++sseRejectionAttempts;
 			snapshot();
 			return;
 		}
@@ -137,7 +189,7 @@ public:
 			if (!current(ctx))
 				return;
 			if (!result) {
-				schedule(Phase::Handshake, result.error.value_or(api::Error{}));
+				schedule(Phase::Handshake);
 				return;
 			}
 			state.setReady(std::move(*result.value));
@@ -147,7 +199,7 @@ public:
 				if (!current(capsContext))
 					return;
 				if (!caps) {
-					schedule(Phase::Handshake, caps.error.value_or(api::Error{}));
+					schedule(Phase::Handshake);
 					return;
 				}
 				state.setCapabilities(std::move(*caps.value));
@@ -158,7 +210,7 @@ public:
 					if (!current(listContext))
 						return;
 					if (!streams) {
-						schedule(Phase::Handshake, streams.error.value_or(api::Error{}));
+						schedule(Phase::Handshake);
 						return;
 					}
 					const bool complete = streams.value->complete;
@@ -168,10 +220,6 @@ public:
 					resolveSelection(state.profileNotice(), state.profileNoticeKey());
 					if (!current(listContext))
 						return;
-					if (!complete) {
-						schedule(Phase::Handshake, api::Error{});
-						return;
-					}
 					snapshot();
 				});
 			});
@@ -184,7 +232,7 @@ public:
 			if (!current(ctx))
 				return;
 			if (!result || !state.installAnchor(*result.value)) {
-				schedule(Phase::Snapshot, result.error.value_or(api::Error{}));
+				schedule(Phase::Snapshot);
 				return;
 			}
 			if (!current(ctx))
@@ -193,12 +241,49 @@ public:
 		});
 	}
 
+	void handleSseFailure(const api::Error &error, bool requiresSnapshot)
+	{
+		const int status = error.httpStatus;
+		if (error.kind == api::ErrorKind::Http) {
+			if (status == 400 || status == 409) {
+				sseRejectionStatus = status;
+				schedule(Phase::Snapshot);
+				return;
+			}
+			if (status == 204) {
+				stopWithReason(ConnectionStatus::Disconnected,
+					       QStringLiteral("Сервер завершил подписку на события."),
+					       QStringLiteral("Error.SseEnded"));
+				return;
+			}
+			if (status == 404) {
+				stopWithReason(ConnectionStatus::Error,
+					       QStringLiteral("На сервере не найден маршрут событий (HTTP 404)."),
+					       QStringLiteral("Error.SseNotFound"));
+				return;
+			}
+			if (status != 408 && status != 429 && (status < 500 || status > 599)) {
+				stopWithReason(ConnectionStatus::Error,
+					       QStringLiteral("Сервер отклонил подписку на события."),
+					       QStringLiteral("Error.SseRejected"));
+				return;
+			}
+		}
+		if (error.kind == api::ErrorKind::Tls) {
+			stopWithReason(ConnectionStatus::Error, error.message, QStringLiteral("Error.SseTls"));
+			return;
+		}
+		if (error.kind == api::ErrorKind::Contract && status == 200) {
+			stopWithReason(ConnectionStatus::Error,
+				       QStringLiteral("Ответ сервера не содержит поток событий SSE."),
+				       QStringLiteral("Error.SseInvalidContentType"));
+			return;
+		}
+		schedule(requiresSnapshot ? Phase::Snapshot : Phase::Events);
+	}
+
 	void subscribe()
 	{
-		const auto expected = context;
-		state.setConnection(state.serverOrigin(), ConnectionStatus::Connected);
-		if (!current(expected))
-			return;
 		events.subscribe(
 			QUrl(state.serverOrigin()), state.runtime().cursor, context, &owner,
 			[this](auto ctx, const api::RuntimeEvent &event) {
@@ -209,13 +294,18 @@ public:
 				if (!current(ctx))
 					return false;
 				failures = 0;
-				state.setConnection(state.serverOrigin(), ConnectionStatus::Connected);
 				return true;
 			},
 			[this](auto ctx, api::Error error, bool requiresSnapshot) {
 				if (!current(ctx))
 					return;
-				schedule(requiresSnapshot ? Phase::Snapshot : Phase::Events, error);
+				handleSseFailure(error, requiresSnapshot);
+			},
+			[this](auto ctx) {
+				if (!current(ctx))
+					return;
+				clearSseRejection();
+				state.setConnection(state.serverOrigin(), ConnectionStatus::Connected);
 			});
 	}
 
@@ -330,8 +420,14 @@ void ConnectionController::setReconnect(bool enabled)
 	if (impl_->stopped)
 		return;
 	impl_->settings.setReconnect(enabled);
-	if (!enabled && impl_->retry.isActive())
+	if (!enabled && (impl_->retry.isActive() || impl_->state.connectionStatus() == ConnectionStatus::Reconnecting))
 		disconnectFromServer();
+}
+
+void ConnectionController::setSseRejectionRetries(int retries)
+{
+	if (!impl_->stopped)
+		impl_->settings.setSseRejectionRetries(retries);
 }
 
 void ConnectionController::shutdown()

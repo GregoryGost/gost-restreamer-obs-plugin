@@ -9,6 +9,7 @@ class QLabel;
 namespace gost {
 
 class StateStore;
+class StatusLabel;
 
 class RestreamDock final : public QWidget {
 	Q_OBJECT
@@ -23,11 +24,11 @@ private:
 	void refresh();
 	StateStore &stateStore_;
 	TextLookup text_;
-	QLabel *server_ = nullptr;
+	StatusLabel *server_ = nullptr;
 	QLabel *stream_ = nullptr;
 	QLabel *notice_ = nullptr;
 	QLabel *profile_ = nullptr;
-	QLabel *streaming_ = nullptr;
+	StatusLabel *streaming_ = nullptr;
 };
 
 } // namespace gost

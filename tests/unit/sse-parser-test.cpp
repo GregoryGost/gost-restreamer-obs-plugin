@@ -10,6 +10,7 @@ private slots:
 	void fragmentedUnicodeAndLineEndings_data();
 	void fragmentedUnicodeAndLineEndings();
 	void commentsAndUnknownFieldsDoNotCreateEvents();
+	void unfinishedFrameIsNotPublished_data();
 	void unfinishedFrameIsNotPublished();
 	void invalidUtf8IsRejected_data();
 	void invalidUtf8IsRejected();
@@ -64,12 +65,21 @@ void SSEParserTest::commentsAndUnknownFieldsDoNotCreateEvents()
 	QCOMPARE(frame.id, QStringLiteral("cursor"));
 }
 
+void SSEParserTest::unfinishedFrameIsNotPublished_data()
+{
+	QTest::addColumn<QByteArray>("unfinishedData");
+	QTest::newRow("complete-code-point") << QByteArray("{\"state\":\"RUNNING\"}");
+	QTest::newRow("partial-code-point") << QByteArray::fromHex("e2");
+}
+
 void SSEParserTest::unfinishedFrameIsNotPublished()
 {
+	QFETCH(QByteArray, unfinishedData);
 	SSEParser parser;
-	QVERIFY(parser.feed("event: state\nid: unfinished\ndata: {\"state\":\"RUNNING\"}"));
+	QVERIFY(parser.feed("event: state\nid: unfinished\ndata: " + unfinishedData));
 	QVERIFY(!parser.hasFrame());
-	parser.finish();
+	QVERIFY(parser.finish());
+	QVERIFY(!parser.hasError());
 	QVERIFY(!parser.hasFrame());
 }
 
@@ -90,6 +100,7 @@ void SSEParserTest::invalidUtf8IsRejected()
 	const auto wire = "data: " + invalid + "\n\n";
 	parser.feed(wire);
 	QVERIFY(parser.hasError());
+	QCOMPARE(parser.error().kind, ErrorKind::Decode);
 	QVERIFY(!parser.hasFrame());
 }
 

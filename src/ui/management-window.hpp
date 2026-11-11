@@ -9,11 +9,13 @@ class QLineEdit;
 class QCheckBox;
 class QComboBox;
 class QPushButton;
+class QSpinBox;
 
 namespace gost {
 
 class StateStore;
 class ConnectionController;
+class StatusLabel;
 
 class ManagementWindow final : public QWidget {
 	Q_OBJECT
@@ -31,14 +33,16 @@ private:
 	QLineEdit *apiUrl_ = nullptr;
 	QCheckBox *autoConnect_ = nullptr;
 	QCheckBox *reconnect_ = nullptr;
+	QSpinBox *sseRejectionRetries_ = nullptr;
 	QComboBox *streams_ = nullptr;
 	QString displayedSelectionId_;
 	QPushButton *connectButton_ = nullptr;
 	QPushButton *disconnectButton_ = nullptr;
-	QLabel *connectionStatus_ = nullptr;
+	StatusLabel *connectionStatus_ = nullptr;
 	QLabel *connectionMessage_ = nullptr;
+	QLabel *advancedSettingsMessage_ = nullptr;
 	QLabel *profile_ = nullptr;
-	QLabel *streaming_ = nullptr;
+	StatusLabel *streaming_ = nullptr;
 };
 
 } // namespace gost

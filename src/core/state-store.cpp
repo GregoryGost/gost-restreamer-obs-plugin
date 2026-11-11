@@ -1,4 +1,5 @@
 #include "state-store.hpp"
+#include "settings-store.hpp"
 #include "api/json-decoder.hpp"
 
 #include <QThread>
@@ -41,7 +42,11 @@ template<class T> void eraseInstances(QVector<T> &nodes, const QSet<QString> &in
 }
 } // namespace
 
-StateStore::StateStore(QObject *parent) : QObject(parent) {}
+StateStore::StateStore(QObject *parent)
+	: QObject(parent),
+	  sseRejectionRetries_(SettingsStore::DefaultSseRejectionRetries)
+{
+}
 
 const std::optional<QString> &StateStore::profileName() const noexcept
 {
@@ -91,6 +96,10 @@ bool StateStore::autoConnect() const noexcept
 bool StateStore::reconnect() const noexcept
 {
 	return reconnect_;
+}
+int StateStore::sseRejectionRetries() const noexcept
+{
+	return sseRejectionRetries_;
 }
 const QString &StateStore::safeError() const noexcept
 {
@@ -168,10 +177,12 @@ void StateStore::setConnection(QString origin, ConnectionStatus status, QString 
 	emit serverStateChanged();
 }
 
-void StateStore::setPreferences(bool autoConnect, bool reconnect, bool unsaved, QString settingsError, QString errorKey)
+void StateStore::setPreferences(bool autoConnect, bool reconnect, int sseRejectionRetries, bool unsaved,
+				QString settingsError, QString errorKey)
 {
 	autoConnect_ = autoConnect;
 	reconnect_ = reconnect;
+	sseRejectionRetries_ = sseRejectionRetries;
 	settingsUnsaved_ = unsaved;
 	settingsError_ = std::move(settingsError);
 	settingsErrorKey_ = std::move(errorKey);

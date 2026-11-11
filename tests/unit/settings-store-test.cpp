@@ -35,6 +35,8 @@ private slots:
 	void invalidOrigins_data();
 	void invalidOrigins();
 	void persistsOnlyPreferencesAndPairBindings();
+	void migratesRetryPreferenceWithExistingBinding_data();
+	void migratesRetryPreferenceWithExistingBinding();
 	void normalRenamePreservesEveryServerAcrossRestart();
 	void switchesAndDuplicatesHaveIndependentIdentity();
 	void removedLocatorDoesNotIdentifyRecreatedProfile();
@@ -115,6 +117,48 @@ void SettingsStoreTest::persistsOnlyPreferencesAndPairBindings()
 	QVERIFY(QJsonDocument::fromJson(document).isObject());
 	for (const auto *forbidden : {"publication_key", "stream_key", "endpoint", "cursor", "baseline", "metrics"})
 		QVERIFY2(!document.contains(QByteArray("\"") + forbidden + "\""), forbidden);
+}
+
+void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding_data()
+{
+	QTest::addColumn<int>("retries");
+	QTest::newRow("disabled") << 0;
+	QTest::newRow("finite") << 7;
+	QTest::newRow("unlimited") << -1;
+}
+
+void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding()
+{
+	QFETCH(int, retries);
+	WorkspaceTemp temp(QStringLiteral("retry-preference"));
+	QVERIFY(temp.isValid());
+	const auto file = temp.filePath(QStringLiteral("settings.json"));
+	const QByteArray legacy = R"({"schema_version":1,"server_origin":"http://server","auto_connect":false,
+"reconnect":false,"profiles":[{"uuid":"644ee3d5-bc59-4345-8a9e-3b3fc5de1f59","name":"A","locator":"profiles/a"}],
+"bindings":[{"origin":"http://server","profile_uuid":"644ee3d5-bc59-4345-8a9e-3b3fc5de1f59","stream_id":"saved"}]})";
+	const auto origin = QStringLiteral("http://server");
+	const auto uuid = QStringLiteral("644ee3d5-bc59-4345-8a9e-3b3fc5de1f59");
+	QVERIFY(write(file, legacy));
+	{
+		SettingsStore settings(file);
+		QVERIFY(settings.load());
+		QCOMPARE(settings.sseRejectionRetries(), 3);
+		QCOMPARE(settings.selectedStream(origin, uuid), QStringLiteral("saved"));
+		QCOMPARE(contents(file), legacy);
+		settings.setSseRejectionRetries(retries);
+		QVERIFY(!settings.unsaved());
+	}
+	const auto document = QJsonDocument::fromJson(contents(file)).object();
+	QCOMPARE(document.value(QStringLiteral("schema_version")).toInt(), 2);
+	QVERIFY(document.value(QStringLiteral("sse_rejection_retries")).isDouble());
+	QCOMPARE(document.value(QStringLiteral("sse_rejection_retries")).toInt(-2), retries);
+	SettingsStore restored(file);
+	QVERIFY(restored.load());
+	QCOMPARE(restored.sseRejectionRetries(), retries);
+	QCOMPARE(restored.serverOrigin(), origin);
+	QVERIFY(!restored.autoConnect());
+	QVERIFY(!restored.reconnect());
+	QCOMPARE(restored.selectedStream(origin, uuid), QStringLiteral("saved"));
 }
 
 void SettingsStoreTest::normalRenamePreservesEveryServerAcrossRestart()
@@ -233,6 +277,11 @@ void SettingsStoreTest::corruptAndUnknownSchemaAreNeverOverwritten_data()
 	QTest::addColumn<QByteArray>("bytes");
 	QTest::newRow("corrupt") << QByteArray("{broken");
 	QTest::newRow("unknown") << QByteArray("{\"schema_version\":999,\"owner_data\":\"preserve\"}");
+	const QByteArray retryDocument = R"({"schema_version":2,"server_origin":"","auto_connect":false,
+"reconnect":true,"profiles":[],"bindings":[],"sse_rejection_retries":)";
+	QTest::newRow("out-of-range-retries") << retryDocument + "-2}";
+	QTest::newRow("fractional-retries") << retryDocument + "1.5}";
+	QTest::newRow("string-retries") << retryDocument + "\"3\"}";
 }
 
 void SettingsStoreTest::corruptAndUnknownSchemaAreNeverOverwritten()

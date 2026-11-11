@@ -1,7 +1,7 @@
 #include "restream-dock.hpp"
 
 #include "core/state-store.hpp"
-#include "ui/connection-text.hpp"
+#include "ui/status-label.hpp"
 
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -10,6 +10,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <optional>
 #include <utility>
 
 namespace gost {
@@ -34,10 +35,8 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 
 	auto *observations = new QFormLayout;
 	observations->setRowWrapPolicy(QFormLayout::WrapLongRows);
-	server_ = new QLabel(this);
+	server_ = new StatusLabel(this);
 	server_->setObjectName(QStringLiteral("serverObservation"));
-	server_->setTextFormat(Qt::PlainText);
-	server_->setWordWrap(true);
 	observations->addRow(text_("Server.Label"), server_);
 	stream_ = new QLabel(this);
 	stream_->setObjectName(QStringLiteral("streamObservation"));
@@ -49,9 +48,8 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	profile_->setWordWrap(true);
 	profile_->setTextFormat(Qt::PlainText);
 	observations->addRow(text_("OBS.Profile"), profile_);
-	streaming_ = new QLabel(this);
+	streaming_ = new StatusLabel(this);
 	streaming_->setObjectName(QStringLiteral("obsStreaming"));
-	streaming_->setWordWrap(true);
 	observations->addRow(text_("OBS.Streaming"), streaming_);
 	layout->addLayout(observations);
 	notice_ = new QLabel(this);
@@ -79,13 +77,13 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 
 void RestreamDock::refresh()
 {
-	server_->setText(stateStore_.serverOrigin().isEmpty()
-				 ? text_("Observation.NoData")
-				 : text_(connectionTextKey(stateStore_.connectionStatus())));
+	const auto connection = stateStore_.connectionStatus();
+	const auto observedConnection = stateStore_.serverOrigin().isEmpty() ? std::nullopt : std::optional{connection};
+	server_->setConnectionStatus(text_, observedConnection);
 	const auto streamName = stateStore_.selectedStreamName();
 	stream_->setText(streamName.isEmpty() ? text_("Observation.NoData") : streamName);
 	QStringList notices;
-	if (stateStore_.connectionStatus() != ConnectionStatus::Connected) {
+	if (connection != ConnectionStatus::Connected) {
 		notices.append(text_("Server.NotConnected"));
 	}
 	if (!stateStore_.safeErrorKey().isEmpty()) {
@@ -98,9 +96,7 @@ void RestreamDock::refresh()
 	notice_->setVisible(!notices.isEmpty());
 	const auto &profile = stateStore_.profileName();
 	profile_->setText(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData"));
-	const auto active = stateStore_.streamingActive();
-	streaming_->setText(active ? text_(*active ? "OBS.StreamingActive" : "OBS.StreamingInactive")
-				   : text_("Observation.NoData"));
+	streaming_->setStreamingStatus(text_, stateStore_.streamingActive());
 }
 
 } // namespace gost

@@ -10,6 +10,9 @@ Error makeError(ErrorKind kind, int status)
 	case ErrorKind::Transport:
 		message = QStringLiteral("Соединение с сервером прервано.");
 		break;
+	case ErrorKind::Tls:
+		message = QStringLiteral("Не удалось установить защищённое соединение с сервером.");
+		break;
 	case ErrorKind::Timeout:
 		message = QStringLiteral("Истекло время ожидания сервера.");
 		break;

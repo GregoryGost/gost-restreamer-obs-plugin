@@ -13,6 +13,7 @@
 
 #include <QAbstractItemView>
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QEvent>
@@ -21,9 +22,12 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QMap>
+#include <QPalette>
+#include <QScopeGuard>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QScrollBar>
+#include <QSpinBox>
 #include <QStackedWidget>
 #include <QTabWidget>
 #include <QTest>
@@ -81,11 +85,12 @@ private slots:
 	void observesCurrentProfileAndStreaming();
 	void bothViewsFollowObservations_data();
 	void bothViewsFollowObservations();
+	void statusAppearanceFollowsStateAndPalette();
 	void managementWindowIsLazyAndReused_data();
 	void managementWindowIsLazyAndReused();
 	void dockStaysCompact();
-	void managementHasSixInternalPages_data();
-	void managementHasSixInternalPages();
+	void managementNavigationHasLocalizedPagesAndIcons_data();
+	void managementNavigationHasLocalizedPagesAndIcons();
 	void failedDockRegistrationReleasesResources();
 	void registrationExceptionReleasesAcquiredResources_data();
 	void registrationExceptionReleasesAcquiredResources();
@@ -99,6 +104,8 @@ private slots:
 	void largeStreamListAndRuntimeTrafficAllowGuiProgress();
 	void runtimeUpdatePreservesOpenStreamPopup();
 	void savedStreamIsUnconfirmedUntilListIsComplete();
+	void partialStreamListWarnsAndAllowsSelection_data();
+	void partialStreamListWarnsAndAllowsSelection();
 };
 
 void PluginLifecycleTest::stateStartsUnobserved()
@@ -242,6 +249,61 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 	QCOMPARE(stream->text(), text("Observation.NoData"));
 }
 
+void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
+{
+	const auto savedPalette = QApplication::palette();
+	const auto restorePalette = qScopeGuard([&] { QApplication::setPalette(savedPalette); });
+	QPalette palette = savedPalette;
+	palette.setColor(QPalette::Window, QColor(QStringLiteral("#1c1f26")));
+	palette.setColor(QPalette::WindowText, QColor(QStringLiteral("#ecedf2")));
+	QApplication::setPalette(palette);
+
+	gost::StateStore state;
+	const auto text = localeLookup();
+	gost::RestreamDock dock(state, text);
+	gost::ManagementWindow window(state, text);
+	auto *server = dock.findChild<QLabel *>(QStringLiteral("serverObservation"));
+	auto *connection = window.findChild<QLabel *>(QStringLiteral("connectionStatus"));
+	auto *dockStreaming = dock.findChild<QLabel *>(QStringLiteral("obsStreaming"));
+	auto *windowStreaming = window.findChild<QLabel *>(QStringLiteral("obsStreaming"));
+	QVERIFY(server && connection && dockStreaming && windowStreaming);
+
+	for (auto *label : {server, connection, dockStreaming, windowStreaming}) {
+		label->ensurePolished();
+		QVERIFY(label->font().bold());
+		QCOMPARE(label->palette().color(QPalette::WindowText), palette.color(QPalette::WindowText));
+	}
+
+	const QString origin = QStringLiteral("http://127.0.0.1:8080");
+	using gost::ConnectionStatus;
+	for (const auto status : {ConnectionStatus::Connecting, ConnectionStatus::Reconnecting}) {
+		state.setConnection(origin, status);
+		for (auto *label : {server, connection})
+			QCOMPARE(label->palette().color(QPalette::WindowText), QColor(QStringLiteral("#ffd078")));
+	}
+	state.setConnection(origin, ConnectionStatus::Error);
+	for (auto *label : {server, connection})
+		QCOMPARE(label->palette().color(QPalette::WindowText), QColor(QStringLiteral("#ff8992")));
+
+	state.setConnection(origin, ConnectionStatus::Connected);
+	state.setObsState(QStringLiteral("Profile"), true);
+	for (auto *label : {server, connection, dockStreaming, windowStreaming})
+		QCOMPARE(label->palette().color(QPalette::WindowText), QColor(QStringLiteral("#6bdf91")));
+
+	palette.setColor(QPalette::Window, QColor(QStringLiteral("#f6f7f8")));
+	palette.setColor(QPalette::WindowText, QColor(QStringLiteral("#202226")));
+	QApplication::setPalette(palette);
+	for (auto *label : {server, connection, dockStreaming, windowStreaming})
+		QCOMPARE(label->palette().color(QPalette::WindowText), QColor(QStringLiteral("#155d32")));
+
+	state.setConnection(origin, ConnectionStatus::Disconnected);
+	state.setObsState(QStringLiteral("Profile"), false);
+	for (auto *label : {server, connection, dockStreaming, windowStreaming}) {
+		QVERIFY(label->font().bold());
+		QCOMPARE(label->palette().color(QPalette::WindowText), palette.color(QPalette::WindowText));
+	}
+}
+
 void PluginLifecycleTest::managementWindowIsLazyAndReused()
 {
 	QFETCH(QString, locale);
@@ -304,36 +366,40 @@ void PluginLifecycleTest::dockStaysCompact()
 	QVERIFY(dock->findChildren<QStackedWidget *>().isEmpty());
 }
 
-void PluginLifecycleTest::managementHasSixInternalPages_data()
+void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons_data()
 {
 	QTest::addColumn<QString>("locale");
 	QTest::addColumn<QStringList>("pages");
 	QTest::newRow("russian") << QStringLiteral("ru-RU")
 				 << QStringList{QStringLiteral("Потоки"),           QStringLiteral("Выходы"),
 						QStringLiteral("Группы и профили"), QStringLiteral("Заглушки"),
-						QStringLiteral("Диагностика"),      QStringLiteral("Настройки")};
+						QStringLiteral("Диагностика"),      QStringLiteral("Настройки"),
+						QStringLiteral("Расширенные")};
 	QTest::newRow("english") << QStringLiteral("en-US") << QStringList{QStringLiteral("Streams"),
 									   QStringLiteral("Outputs"),
 									   QStringLiteral("Groups and profiles"),
 									   QStringLiteral("Fallback"),
 									   QStringLiteral("Diagnostics"),
-									   QStringLiteral("Settings")};
+									   QStringLiteral("Settings"),
+									   QStringLiteral("Advanced")};
 }
 
-void PluginLifecycleTest::managementHasSixInternalPages()
+void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons()
 {
 	QFETCH(QString, locale);
 	QFETCH(QStringList, pages);
+	const auto text = localeLookup(locale);
 	gost::StateStore state;
-	gost::ManagementWindow window(state, localeLookup(locale));
+	gost::ManagementWindow window(state, text);
 	auto *navigation = window.findChild<QListWidget *>();
 	auto *stack = window.findChild<QStackedWidget *>();
 	QVERIFY(navigation);
 	QVERIFY(stack);
-	QCOMPARE(navigation->count(), 6);
-	QCOMPARE(stack->count(), 6);
+	QCOMPARE(navigation->count(), pages.size());
+	QCOMPARE(stack->count(), pages.size());
 	for (int index = 0; index < pages.size(); ++index) {
 		QCOMPARE(navigation->item(index)->text(), pages.at(index));
+		QVERIFY(!navigation->item(index)->icon().pixmap(navigation->iconSize()).isNull());
 		navigation->setCurrentRow(index);
 		QCOMPARE(stack->currentIndex(), index);
 		QVERIFY(stack->currentWidget());
@@ -346,6 +412,13 @@ void PluginLifecycleTest::managementHasSixInternalPages()
 		 locale == QStringLiteral("ru-RU") ? QStringLiteral("Группы") : QStringLiteral("Groups"));
 	QCOMPARE(tabs->tabText(1),
 		 locale == QStringLiteral("ru-RU") ? QStringLiteral("Профили") : QStringLiteral("Profiles"));
+	auto *retries = stack->currentWidget()->findChild<QSpinBox *>(QStringLiteral("sseRejectionRetries"));
+	auto *message = stack->currentWidget()->findChild<QLabel *>(QStringLiteral("advancedSettingsMessage"));
+	QVERIFY(retries && message);
+	QVERIFY(message->isHidden());
+	state.setPreferences(false, true, 3, true);
+	QVERIFY(!message->isHidden());
+	QCOMPARE(message->text(), text("Settings.Unsaved"));
 }
 
 void PluginLifecycleTest::failedDockRegistrationReleasesResources()
@@ -832,6 +905,124 @@ void PluginLifecycleTest::savedStreamIsUnconfirmedUntilListIsComplete()
 	stream.name = QStringLiteral("Подтверждённый поток");
 	state.setStreams({stream}, true);
 	QCOMPARE(selector->currentText(), stream.name);
+}
+
+void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::newRow("russian") << QStringLiteral("ru-RU");
+	QTest::newRow("english") << QStringLiteral("en-US");
+}
+
+void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
+{
+	QFETCH(QString, locale);
+	WorkspaceTemp temp(QStringLiteral("partial-stream-list"));
+	QVERIFY(temp.isValid());
+	HttpServer server;
+	QVERIFY(server.listen());
+	const auto first = fixture::page({fixture::stream(QStringLiteral("received"))}, QStringLiteral("next-page"));
+	const auto second = fixture::page({fixture::stream(QStringLiteral("saved"))});
+	int readyRequests = 0;
+	int pageRequests = 0;
+	int snapshotRequests = 0;
+	int eventRequests = 0;
+	HttpServer::Request firstSubscription;
+	HttpServer::Request selectedSubscription;
+	server.handler = [&](const auto &request) {
+		if (request.target.startsWith("/api/v1/health/ready")) {
+			++readyRequests;
+			HttpServer::reply(request, R"({"status":"ready","reason":""})");
+		} else if (request.target.startsWith("/api/v1/system/capabilities")) {
+			HttpServer::reply(request, fixture::capabilities());
+		} else if (request.target.startsWith("/api/v1/streams")) {
+			++pageRequests;
+			HttpServer::reply(request, request.target.contains("cursor=") ? second : first);
+		} else if (request.target.startsWith("/api/v1/events/snapshot")) {
+			++snapshotRequests;
+			HttpServer::reply(request, R"({"cursor":"anchor","sessions":[],"gpu":null})");
+		} else if (request.target.startsWith("/api/v1/events?")) {
+			if (++eventRequests == 1)
+				firstSubscription = request;
+			else
+				selectedSubscription = request;
+		}
+	};
+	const auto path = temp.filePath(QStringLiteral("settings.json"));
+	gost::SettingsStore settings(path);
+	settings.setAutoConnect(false);
+	gost::StateStore state;
+	gost::api::Limits limits;
+	limits.pageWalkBytes = first.size() + second.size() - 1;
+	gost::api::APIClient api(limits);
+	gost::api::EventClient events;
+	gost::ConnectionController controller(state, settings, api, events);
+	controller.observeProfile(gost::FrontendEvent::FinishedLoading,
+				  {QStringLiteral("A"), QStringLiteral("profiles/a"), {QStringLiteral("A")}, true});
+	QVERIFY(state.profileResolved());
+	const auto origin = server.origin().toString();
+	const auto profileId = settings.profileUuid();
+	QVERIFY(settings.setSelectedStream(origin, profileId, QStringLiteral("saved")));
+	const auto text = localeLookup(locale);
+	gost::ManagementWindow window(state, text, nullptr, &controller);
+	window.show();
+	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
+	auto *selector = window.findChild<QComboBox *>(QStringLiteral("streamSelector"));
+	auto *reconnect = window.findChild<QCheckBox *>(QStringLiteral("reconnect"));
+	auto *message = window.findChild<QLabel *>(QStringLiteral("connectionMessage"));
+	auto *retries = window.findChild<QSpinBox *>(QStringLiteral("sseRejectionRetries"));
+	QVERIFY(navigation && selector && reconnect && message && retries);
+	navigation->setCurrentRow(5);
+	QVERIFY(selector->isVisible());
+	QVERIFY(!retries->isVisible());
+	reconnect->setChecked(false);
+	navigation->setCurrentRow(6);
+	QVERIFY(retries->isVisible());
+	QVERIFY(!retries->isEnabled());
+	navigation->setCurrentRow(5);
+	reconnect->setChecked(true);
+	navigation->setCurrentRow(6);
+	QVERIFY(retries->isEnabled());
+	QCOMPARE(retries->value(), 3);
+	retries->setValue(-1);
+	QCOMPARE(settings.sseRejectionRetries(), -1);
+	gost::SettingsStore restored(path);
+	QCOMPARE(restored.sseRejectionRetries(), -1);
+	navigation->setCurrentRow(5);
+
+	controller.connectToServer(origin);
+	QTRY_VERIFY_WITH_TIMEOUT(firstSubscription.socket, 3000);
+	QCOMPARE(state.connectionStatus(), gost::ConnectionStatus::Connecting);
+	QCOMPARE(readyRequests, 1);
+	QCOMPARE(pageRequests, 2);
+	QCOMPARE(snapshotRequests, 1);
+	QCOMPARE(eventRequests, 1);
+	QVERIFY(!state.streamsComplete());
+	QCOMPARE(state.selectedStreamId(), QStringLiteral("saved"));
+	QVERIFY(!state.selectionAvailable());
+	QVERIFY(restored.load());
+	QCOMPARE(restored.selectedStream(origin, profileId), QStringLiteral("saved"));
+	QVERIFY(message->isVisible());
+	QVERIFY(message->text().contains(text("Stream.ListIncomplete")));
+	QCOMPARE(selector->currentText(), text("Stream.Unconfirmed").arg(QStringLiteral("saved")));
+	QVERIFY(selector->isEnabled());
+	const int receivedIndex = selector->findData(QStringLiteral("received"));
+	QVERIFY(receivedIndex > 0);
+	selector->setCurrentIndex(receivedIndex);
+	QCOMPARE(state.selectedStreamId(), QStringLiteral("received"));
+	QVERIFY(state.selectionAvailable());
+	QVERIFY(restored.load());
+	QCOMPARE(restored.selectedStream(origin, profileId), QStringLiteral("received"));
+	QTRY_VERIFY_WITH_TIMEOUT(firstSubscription.socket.isNull(), 2000);
+	QTRY_VERIFY_WITH_TIMEOUT(selectedSubscription.socket, 3000);
+	QCOMPARE(eventRequests, 2);
+	QCOMPARE(snapshotRequests, 2);
+	QCOMPARE(state.connectionStatus(), gost::ConnectionStatus::Connecting);
+	HttpServer::stream(selectedSubscription);
+	QTRY_COMPARE_WITH_TIMEOUT(state.connectionStatus(), gost::ConnectionStatus::Connected, 2000);
+	QCOMPARE(state.selectedStreamId(), QStringLiteral("received"));
+	QVERIFY(message->text().contains(text("Stream.ListIncomplete")));
+	controller.shutdown();
 }
 
 QTEST_MAIN(PluginLifecycleTest)

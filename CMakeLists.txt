@@ -48,7 +48,7 @@ target_sources(
     src/obs/obs-controller.cpp
     src/obs/obs-controller.hpp
     src/ui/text-lookup.hpp
-    src/ui/connection-text.hpp
+    src/ui/status-label.hpp
     src/ui/restream-dock.cpp
     src/ui/restream-dock.hpp
     src/ui/management-window.cpp
