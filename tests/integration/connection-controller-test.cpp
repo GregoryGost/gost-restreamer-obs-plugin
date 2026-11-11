@@ -178,6 +178,8 @@ private slots:
 	void profileSwitchRestoresOnlyItsBinding();
 	void dockMetadataRequiresExactSessionForSelectedStream_data();
 	void dockMetadataRequiresExactSessionForSelectedStream();
+	void partialOutputReadPreservesOnlyTheSameSession_data();
+	void partialOutputReadPreservesOnlyTheSameSession();
 	void resumedSubscriptionRefreshesOnlyAcceptedMetricLane();
 	void reconnectUsesConfirmedCursor();
 	void handshakeTimeoutRetriesWithoutPrematureConnection();
@@ -388,6 +390,159 @@ void ConnectionControllerTest::dockMetadataRequiresExactSessionForSelectedStream
 		QVERIFY(!state.dockServer().session);
 		QVERIFY(state.dockServer().outputs.isEmpty());
 	}
+	QVERIFY(readOnly(server));
+	controller.shutdown();
+}
+
+void ConnectionControllerTest::partialOutputReadPreservesOnlyTheSameSession_data()
+{
+	QTest::addColumn<QString>("boundary");
+	for (const auto *boundary : {"detach", "complete-list", "session", "stream", "profile"})
+		QTest::newRow(boundary) << QString::fromLatin1(boundary);
+}
+
+void ConnectionControllerTest::partialOutputReadPreservesOnlyTheSameSession()
+{
+	// Известный attached Output намеренно отсутствует в runtime. Повторный обход получает только
+	// первый элемент: следующая страница превышает общий бюджет, оставаясь допустимым HTTP-ответом.
+	// Только явный detach, полный список или новая идентичность могут отменить прежний состав.
+	QFETCH(QString, boundary);
+	WorkspaceTemp temp(QStringLiteral("partial-output-metadata"));
+	QVERIFY(temp.isValid());
+	HttpServer server;
+	QVERIFY(server.listen());
+	int phase = 0;
+	int outputReads = 0;
+	QString streamId = QStringLiteral("stream");
+	QString sessionId = QStringLiteral("session");
+	const auto output = [&](const QString &id, bool attached = true) {
+		auto value = fixture::output();
+		value.insert(QStringLiteral("id"), id);
+		value.insert(QStringLiteral("session_id"), sessionId);
+		value.insert(QStringLiteral("attached"), attached);
+		auto destination = fixture::destination();
+		destination.insert(QStringLiteral("stream_id"), streamId);
+		destination.insert(QStringLiteral("name"), id + QStringLiteral(" name"));
+		value.insert(QStringLiteral("destination"), destination);
+		return value;
+	};
+	const auto exactSession = [&] {
+		auto value = fixture::session();
+		value.insert(QStringLiteral("id"), sessionId);
+		value.insert(QStringLiteral("stream_id"), streamId);
+		value.insert(QStringLiteral("stream"), fixture::stream(streamId));
+		return value;
+	};
+	const auto complete = fixture::page({output(QStringLiteral("known")), output(QStringLiteral("seen"))});
+	const auto first = fixture::page({output(QStringLiteral("seen"))}, QStringLiteral("next"));
+	auto large = output(QStringLiteral("omitted"));
+	auto destination = large.value(QStringLiteral("destination")).toObject();
+	destination.insert(QStringLiteral("name"), QString(20000, QLatin1Char('x')));
+	large.insert(QStringLiteral("destination"), destination);
+	const auto second = fixture::page({large});
+	const auto budget = qMax(complete.size(), first.size()) + 64;
+	QVERIFY(first.size() < budget && second.size() > budget);
+	server.handler = [&](const auto &request) {
+		const QUrl url = QUrl::fromEncoded("http://local" + request.target);
+		const auto path = url.path();
+		if (path == QStringLiteral("/api/v1/streams")) {
+			HttpServer::reply(request,
+					  fixture::page({fixture::stream(), fixture::stream(QStringLiteral("other"))}));
+		} else if (path == QStringLiteral("/api/v1/events/snapshot")) {
+			auto runtime = dockRuntimeSession(QStringLiteral("session"), QStringLiteral("epoch:1"),
+							  QStringLiteral("epoch:2"));
+			runtime.insert(QStringLiteral("outputs"), QJsonArray{});
+			HttpServer::reply(request,
+					  fixture::bytes({{QStringLiteral("cursor"), QStringLiteral("partial-anchor")},
+							  {QStringLiteral("sessions"), QJsonArray{runtime}},
+							  {QStringLiteral("gpu"), QJsonValue::Null}}));
+		} else if (path == QStringLiteral("/api/v1/streams/") + streamId + QStringLiteral("/sessions")) {
+			HttpServer::reply(request, QUrlQuery(url).queryItemValue(QStringLiteral("state")) ==
+								   QStringLiteral("RUNNING")
+							   ? fixture::page({exactSession()})
+							   : fixture::page({}));
+		} else if (path == QStringLiteral("/api/v1/sessions/") + sessionId) {
+			HttpServer::reply(request, fixture::bytes(exactSession()));
+		} else if (path == QStringLiteral("/api/v1/sessions/") + sessionId + QStringLiteral("/outputs")) {
+			if (QUrlQuery(url).hasQueryItem(QStringLiteral("cursor"))) {
+				HttpServer::reply(request, second);
+			} else {
+				++outputReads;
+				if (phase == 0)
+					HttpServer::reply(request, complete);
+				else if (phase == 2 && boundary == QStringLiteral("complete-list"))
+					HttpServer::reply(request, fixture::page({output(QStringLiteral("seen"))}));
+				else if (phase == 2 && boundary == QStringLiteral("detach"))
+					HttpServer::reply(request,
+							  fixture::page({output(QStringLiteral("known"), false)},
+									QStringLiteral("next")));
+				else
+					HttpServer::reply(request, fixture::page({output(QStringLiteral("seen"))},
+										 QStringLiteral("next")));
+			}
+		} else {
+			respond(request);
+		}
+	};
+	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	settings.setAutoConnect(false);
+	StateStore state;
+	Limits limits;
+	limits.pageWalkBytes = budget;
+	APIClient api(limits);
+	EventClient events;
+	ConnectionController controller(state, settings, api, events);
+	controller.observeProfile(FrontendEvent::FinishedLoading, profile());
+	QVERIFY(settings.setSelectedStream(server.origin().toString(), settings.profileUuid(), streamId));
+	controller.connectToServer(server.origin().toString());
+	QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().outputsStatus.complete, 3000);
+	QCOMPARE(state.dockServer().outputs.size(), 2);
+	QVERIFY(state.runtime().sessions.value(sessionId).outputs.isEmpty());
+	QVERIFY(state.dockServer().outputs.value(QStringLiteral("known")).attached);
+	const auto refresh = [&](quint64 revision) {
+		auto event = fixture::event(QStringLiteral("state"), QStringLiteral("refresh-%1").arg(revision));
+		event.insert(QStringLiteral("observation"), fixture::observation(QStringLiteral("epoch:1"), revision));
+		subscription(server).socket->write(fixture::frame(event));
+	};
+	phase = 1;
+	QVERIFY(subscription(server).socket);
+	refresh(21);
+	QTRY_VERIFY_WITH_TIMEOUT(outputReads == 2 &&
+					 state.dockServer().outputsStatus.availability == RuntimeAvailability::Fresh &&
+					 !state.dockServer().outputsStatus.complete,
+				 3000);
+	QCOMPARE(state.dockServer().outputs.size(), 2);
+	QCOMPARE(state.dockServer().outputs.value(QStringLiteral("known")).name, QStringLiteral("known name"));
+	QVERIFY(state.dockServer().outputs.value(QStringLiteral("known")).attached);
+	QVERIFY(!state.dockServer().outputs.contains(QStringLiteral("omitted")));
+	phase = 2;
+	if (boundary == QStringLiteral("session")) {
+		sessionId = QStringLiteral("replacement-session");
+		refresh(22);
+	} else if (boundary == QStringLiteral("stream")) {
+		streamId = QStringLiteral("other");
+		controller.selectStream(streamId);
+	} else if (boundary == QStringLiteral("profile")) {
+		controller.observeProfile(FrontendEvent::ProfileChanged, profile(QStringLiteral("B")));
+		QVERIFY(state.dockServer().outputs.isEmpty());
+		QVERIFY(settings.setSelectedStream(server.origin().toString(), settings.profileUuid(), streamId));
+		controller.selectStream(streamId);
+	} else {
+		refresh(22);
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(
+		outputReads >= 3 && state.dockServer().outputsStatus.availability == RuntimeAvailability::Fresh, 3000);
+	QVERIFY(state.dockServer().session);
+	QCOMPARE(state.dockServer().session->id, sessionId);
+	if (boundary == QStringLiteral("detach")) {
+		QVERIFY(state.dockServer().outputs.contains(QStringLiteral("known")));
+		QVERIFY(!state.dockServer().outputs.value(QStringLiteral("known")).attached);
+		QVERIFY(state.dockServer().outputs.contains(QStringLiteral("seen")));
+	} else {
+		QVERIFY(!state.dockServer().outputs.contains(QStringLiteral("known")));
+		QVERIFY(state.dockServer().outputs.contains(QStringLiteral("seen")));
+	}
+	QCOMPARE(state.dockServer().outputsStatus.complete, boundary == QStringLiteral("complete-list"));
 	QVERIFY(readOnly(server));
 	controller.shutdown();
 }

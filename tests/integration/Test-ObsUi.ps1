@@ -38,6 +38,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Drawing
 $nativeSource = @'
 using System;
 using System.Text;
@@ -59,6 +60,8 @@ public static class ObsWindowInspection {
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr window, IntPtr deviceContext, uint flags);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
 }
 '@
 Add-Type -TypeDefinition $nativeSource
@@ -361,13 +364,53 @@ function Assert-DockObservations {
     Assert-OwnedElement $dockElement
     $labelsCondition = [System.Windows.Automation.AndCondition]::new($processCondition,
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, 'QLabel'))
-    $expectedIdle = if ($russian) { 'Остановлена' } else { 'Stopped' }
+    $expectedProfile = if ($russian) { 'Профиль OBS: Isolated' } else { 'OBS profile: Isolated' }
+    $expectedIdle = if ($russian) { 'Трансляция остановлена' } else { 'Streaming stopped' }
     Wait-Condition {
         $names = @($dockElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $labelsCondition) |
             ForEach-Object { Assert-OwnedElement $_; $_.Current.Name })
-        @($names | Where-Object { $_ -ceq 'Isolated' }).Count -eq 1 -and
+        @($names | Where-Object { $_ -ceq $expectedProfile }).Count -eq 1 -and
             @($names | Where-Object { $_ -ceq $expectedIdle }).Count -eq 1
     } 'Dock не показывает наблюдаемые тестовый профиль и остановленную трансляцию OBS.'
+}
+
+function Save-OwnedDockImage {
+    # PrintWindow снимает только подтверждённое окно Dock, не содержимое чужих окон рабочего стола.
+    # Файл остаётся рядом с результатами собственной portable-копии; DPI записывается как измеренный факт.
+    Assert-OwnedDock $dockWindow
+    $position = Read-DockPosition $dockWindow
+    if ($position.Width -le 0 -or $position.Height -le 0 -or
+        $position.Width -gt 8192 -or $position.Height -gt 8192) {
+        throw 'Недопустимый размер собственного Dock для снимка.'
+    }
+    $fixtureRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $executable))
+    $resultRoot = (Resolve-Path -LiteralPath (Join-Path $fixtureRoot 'config/obs-studio/test-results')).Path
+    if (-not $resultRoot.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase)) { throw 'Каталог снимка должен находиться в workspace.' }
+    $imagePath = Join-Path $resultRoot "launch-$Launch-dock.png"
+    $bitmap = [Drawing.Bitmap]::new($position.Width, $position.Height)
+    try {
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $context = $graphics.GetHdc()
+            try {
+                Assert-OwnedDock $dockWindow
+                if (-not [ObsWindowInspection]::PrintWindow($dockWindow, $context, 2)) {
+                    throw 'Не удалось получить снимок собственного Dock.'
+                }
+            } finally { $graphics.ReleaseHdc($context) }
+        } finally { $graphics.Dispose() }
+        $bitmap.Save($imagePath, [Drawing.Imaging.ImageFormat]::Png)
+    } finally { $bitmap.Dispose() }
+    $imageHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $imageStream = [IO.File]::OpenRead($imagePath)
+        try {
+            $imageHash = [BitConverter]::ToString($imageHasher.ComputeHash($imageStream)).Replace('-', '')
+        } finally { $imageStream.Dispose() }
+    } finally { $imageHasher.Dispose() }
+    return [pscustomobject]@{ Path = $imagePath; SHA256 = $imageHash
+        Width = $position.Width; Height = $position.Height; Dpi = [ObsWindowInspection]::GetDpiForWindow($dockWindow) }
 }
 
 function Observe-ManagementActivation {
@@ -450,6 +493,7 @@ if ($Launch -eq 1) {
     }
 }
 Assert-DockObservations
+$dockScreenshot = Save-OwnedDockImage
 if (@(Get-ManagementWindows).Count -ne 0) { throw 'Расширенное окно создано до нажатия шестерёнки.' }
 Invoke-Gear
 Wait-Condition { @(Get-VisibleManagementWindows).Count -eq 1 } 'Расширенное окно не открылось.'
@@ -612,7 +656,8 @@ try {
         Check = 'ObsUi'; Locale = $Locale; ProcessId = $ObsProcessId; ManagementHandle = $managementHandle
         Launch = $Launch; DockVisibilityRestored = ($Launch -eq 2); DockPositionVerified = ($Launch -eq 2)
         DockLeft = $dockPosition.Left; DockTop = $dockPosition.Top; DockProfileAndIdleVerified = $true
-        Pages = 6; GearReuse = $true; CloseHideReopen = $true; MinimizeRestore = $minimizeVerified
+        DockScreenshot = $dockScreenshot
+        Pages = $pages.Count; GearReuse = $true; CloseHideReopen = $true; MinimizeRestore = $minimizeVerified
         ReopenedHandle = $reopenedHandle; NativeHandleRecreated = ($reopenedHandle -ne $managementHandle)
         SelectedSectionPreserved = $true
         ActivationAfterGear = $activationAfterGear; ActivationAfterRestore = $activationAfterRestore

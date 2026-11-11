@@ -206,7 +206,7 @@ fixtures и существенной конфигурации, включая н
 
 - Проект требует CMake 3.28 или новее.
 - Выбран генератор `Visual Studio 17 2022`, x64, v143 и SDK 10.0.26100.0. Ninja не используется: Windows bootstrap шаблона зависит от VS platform и дочернего configure с `-A`.
-- Configure preset `windows-x64`, build/test presets `windows-x64` (RelWithDebInfo) и `windows-x64-release` (Release), test preset `windows-x64-offline`; binary directory `build_x64/`. CI preset — `windows-ci-x64`; его наличие не подтверждает приёмку CI. Выпуск версии в папку `build` (как пример `cmake --install build_x64 --config RelWithDebInfo`).
+- Configure preset `windows-x64`, build/test presets `windows-x64` (RelWithDebInfo) и `windows-x64-release` (Release), test preset `windows-x64-offline`; binary directory `build_x64/`. CI preset — `windows-ci-x64`; его наличие не подтверждает приёмку CI. Готовый каталог плагина обязательно обновлять в `build/install/` по порядку «Итоговая сборка в build/install» ниже.
 - Основа CMake — официальный `obsproject/obs-plugintemplate`, ревизия `3e7d7ac3b5342cd7d9b88890b9c70b472d1520fc`. Зависимости выбираются по проектным `buildspec.json` и presets; версии из upstream-шаблона не наследуются автоматически.
 - Windows-размещение следует формату OBS 33: `gost-restreamer-obs-plugin/gost-restreamer-obs-plugin.dll` и соседний `data/`. Структуры staging, portable-проверки и пакета должны быть согласованы. Загрузку и локализации проверять только в portable OBS внутри workspace с учётом `Validation Workspace Boundary`.
 - Используются frontend API, Qt и Network; `ENABLE_FRONTEND_API`/`ENABLE_QT` включены.
@@ -262,6 +262,7 @@ fixtures и существенной конфигурации, включая н
 
 - Widgets enabled: yes. UI находится в `src/ui/`; страницы размещаются внутри `ManagementWindow`.
 - UI состоит из `RestreamDock` и одного повторно используемого `ManagementWindow`; страницы и редакторы находятся внутри расширенного окна. Dock не содержит вкладок и форм настроек.
+- Dock следует текущей теме OBS и её варианту: фон, границы, текст и кнопки обновляются при смене оформления. Компоновка содержит отдельные блоки состояния, локальных OBS-метрик, серверного входа и выходов; оформление не фиксирует собственную тёмную тему.
 - Виджеты получают данные из общего `StateStore`, не выполняют HTTP сами. UI и GUI-facing models изменяются в GUI thread; workers используют безопасную queued передачу с проверенным временем жизни.
 - Закрытие расширенного окна не завершает эфир, не удаляет Dock и не уничтожает общее состояние. Shutdown OBS снимает callbacks, отменяет принадлежащие плагину запросы/таймеры и соблюдает допустимую фазу OBS lifecycle.
 - Форм `.ui` и собственных model/view targets нет; сборка включает AUTOMOC. Generated outputs не редактировать.
@@ -320,6 +321,101 @@ fixtures и существенной конфигурации, включая н
 экземпляру. Пользовательские настройки OBS не заменяют изолированную среду.
 Offscreen-проверки, загрузка DLL, нативное поведение интерфейса и live-приёмка
 имеют отдельные границы подтверждения.
+
+### Итоговая сборка в build/install
+
+После изменений кода плагина, его ресурсов или сборочной конфигурации перед
+завершением задачи обязательно собрать актуальный плагин и обновить готовый
+каталог `build/install/gost-restreamer-obs-plugin/`. Промежуточная DLL в
+`build_x64/` сама по себе не завершает подготовку сборки для владельца.
+
+По умолчанию использовать RelWithDebInfo. Из корня workspace в PowerShell
+выполнить последовательно, переходя к следующему шагу только при успехе:
+
+```powershell
+cmake --build --preset windows-x64
+cmake --install build_x64 --config RelWithDebInfo
+```
+
+Для новой среды сначала выполнить `cmake --preset windows-x64`.
+При явно выбранном Release использовать `windows-x64-release` и устанавливать
+с `--config Release`: сборка и установка должны относиться к одной конфигурации.
+Проверить, что фактический install prefix остаётся внутри workspace в
+`build/install/`; системное размещение плагина этим не разрешается.
+
+После установки проверить совпадение SHA256 DLL с результатом выбранной
+сборки и обеих локализаций с `data/locale/`, наличие доступного PDB и раскладку
+OBS 33: DLL в корне каталога плагина, рядом `data/locale/`. Для проверки PE x64,
+экспортов и точности файлов использовать `tests/integration/Test-PluginArtifact.ps1`
+с `-PluginRoot build/install/gost-restreamer-obs-plugin`, `-ExpectedBinary`
+выбранной сборки и явным путём `-Dumpbin`. В ответе владельцу указывать путь
+к готовому каталогу. Если сборка, установка или проверка не прошла, явно сообщать
+об отказе и не представлять прежнее содержимое `build/install/` как актуальное.
+
+### Запуск OBS для нативных UI-проверок
+
+Для следующих проверок использовать этот порядок запуска и подготовки фокуса.
+Он дополняет `Validation Workspace Boundary` и применяется только в рамках
+разрешённой пользователем проверки.
+
+1. Подготовить отдельную portable OBS 33.0.1 внутри `build/test-workspace/`:
+   собственные `config/`, `plugins/`, пустые профиль и коллекция `Isolated`,
+   актуальная DLL и обе локализации. Для каждой локали — отдельная конфигурация.
+   Базовый сценарий — `tests/integration/Test-PortableObs.ps1`; он требует
+   свежую копию без `config/` и сам создаёт тестовые данные. Последующие проверки
+   оформления могут использовать уже подготовленную собственную копию.
+2. Проверить рабочий стол запускающего процесса, OBS и UIA-помощника.
+   Для видимой проверки они должны работать на интерактивном `Default`.
+   В этой среде обычный запуск команды из песочницы может попасть на отдельный
+   `CodexSandboxDesktop-*`: окно там недоступно пользователю, ожидание ручного
+   щелчка не решает проблему. В таком случае использовать предусмотренный средой
+   разрешённый запуск вне песочницы (`sandbox_permissions: require_escalated`),
+   сохраняя все файлы внутри workspace. Вызывать сценарий непосредственно
+   оператором PowerShell `&` из этого запускающего процесса. Принадлежность
+   desktop проверять через `GetThreadDesktop`/`GetUserObjectInformationW`,
+   активный desktop — через `OpenInputDesktop`; не переключать desktop вручную.
+3. Для видимой проверки запускать OBS через `ProcessStartInfo` с
+   `UseShellExecute=false`, `WindowStyle=Normal`, рабочим каталогом `bin/64bit`
+   и аргументами `--portable --multi --disable-updater
+   --disable-missing-files-check --profile Isolated --collection Isolated`.
+   `WindowStyle=Normal` задаёт видимость окна; режим проверки остаётся Portable.
+   В текущем базовом runner задан `WindowStyle=Hidden`; видимый запуск был
+   проверен отдельным помощником. Удалять из среды дочернего OBS переменные
+   `OBS_PLUGINS_PATH`, `OBS_LEGACY_PLUGINS_PATH`, `OBS_LEGACY_PLUGINS_DATA_PATH`,
+   `QT_PLUGIN_PATH`, `QT_QPA_PLATFORM`, `QT_QPA_PLATFORM_PLUGIN_PATH`.
+   `TEMP`/`TMP` OBS и помощника направлять в собственный каталог workspace.
+4. Готовность подтверждать новым журналом текущего запуска: `Portable mode:
+   true`, загрузка GOST Restreamer, `Startup complete` и единственный собственный
+   главный HWND. Зафиксировать PID, точный путь EXE, время старта и HWND.
+   Перед каждым действием повторять проверки процесса/окна; для UIA-элементов
+   проверять `ProcessId`. Сверять путь и SHA256 реально загруженной DLL,
+   а также Qt Core/Gui/Widgets 6.11.1 из этой portable-копии.
+5. UI Automation выполнять отдельным скрытым Windows PowerShell 5.1
+   (`powershell.exe -NoLogo -NoProfile -NonInteractive -Mta -EncodedCommand`),
+   передавая идентичность OBS явно. Основные проверки принадлежности и фокуса
+   находятся в `tests/integration/Test-ObsUi.ps1`. Перед действиями меню
+   проверять `Assert-OwnedElement $main`, вызывать `$main.SetFocus()`, затем
+   `Prepare-OwnedMainForeground` и требовать `Verified=true`, подтверждённый
+   через `GetForegroundWindow`. Одного результата `SetForegroundWindow`
+   недостаточно. При отказе остановить UI-действия и сохранить диагностику.
+   Подготовку фокуса главного OBS отделять от проверки активации окна управления:
+   после шестерёнки его активация должна наблюдаться без принудительного фокуса.
+6. Настройки OBS искать среди потомков собственного главного окна; использовать
+   полный `AutomationId` и доступные UIA patterns. Если `SetFocus()` элемента
+   не изменил фактический фокус, перепроверить его и foreground. В проверенном
+   сценарии навигация и выбор варианта оформления выполнялись адресными
+   `WM_KEYDOWN`/`WM_KEYUP` собственного Settings HWND, включая Tab до списка
+   вариантов; перед клавишами подтверждались процесс, окно и текущий фокус.
+   Глобальные клавиши и клики, присоединение к чужой очереди ввода не применять.
+   Исходный вариант оформления восстановить; после Cancel дождаться закрытия
+   настроек перед завершением OBS.
+7. Снимать только собственный Dock через `PrintWindow`, сохранять PNG/SHA256
+   и фактический `GetDpiForWindow`. В результатах отдельно проверять успех
+   помощника и сценария, foreground, штатное завершение OBS и отсутствие
+   оставшихся собственных процессов. Один exit code запускающего сценария
+   не доказывает успех: вспомогательный runner может записать `Error` в JSON
+   и завершиться с кодом 0. Закрывать только повторно подтверждённый собственный
+   HWND через `WM_CLOSE`; принудительная очистка после отказа не считается PASS.
 
 ## Documentation And Integrations
 

@@ -8,7 +8,8 @@
 
 class QLabel;
 class QPushButton;
-class QStringListModel;
+class QStandardItemModel;
+class QListView;
 
 namespace gost {
 
@@ -61,12 +62,14 @@ private:
 	StatusLabel *streaming_ = nullptr;
 	QLabel *localStats_ = nullptr;
 	QLabel *serverDataNotice_ = nullptr;
-	QLabel *session_ = nullptr;
-	QLabel *groups_ = nullptr;
-	QLabel *fallback_ = nullptr;
+	StatusLabel *session_ = nullptr;
+	StatusLabel *groups_ = nullptr;
+	StatusLabel *fallback_ = nullptr;
+	StatusLabel *input_ = nullptr;
 	QLabel *ingest_ = nullptr;
 	QLabel *outputSummary_ = nullptr;
-	QStringListModel *outputs_ = nullptr;
+	QStandardItemModel *outputs_ = nullptr;
+	QListView *outputList_ = nullptr;
 	QPushButton *reset_ = nullptr;
 	bool refreshScheduled_ = false;
 };

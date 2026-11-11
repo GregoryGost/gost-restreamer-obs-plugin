@@ -25,15 +25,19 @@
 #include <QListWidget>
 #include <QMap>
 #include <QPalette>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QScrollBar>
+#include <QScrollArea>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTabWidget>
 #include <QTest>
+#include <QTextDocument>
+#include <QTextTable>
 #include <QToolButton>
 #include <QTimer>
 
@@ -78,6 +82,15 @@ void dispatchQueuedEvents()
 	QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 }
 
+QString displayedText(const QLabel *label)
+{
+	if (label->textFormat() == Qt::PlainText)
+		return label->text();
+	QTextDocument document;
+	document.setHtml(label->text());
+	return document.toPlainText();
+}
+
 } // namespace
 
 // QApplication/offscreen проверяет настоящее владение Qt, сигналы, виджеты и цикл событий при
@@ -101,7 +114,14 @@ private slots:
 	void managementWindowIsLazyAndReused_data();
 	void managementWindowIsLazyAndReused();
 	void dockStaysCompact();
+	void dockCardsFitNarrowWidths_data();
+	void dockCardsFitNarrowWidths();
+	void dockActionsRemainLocalAndKeyboardAccessible();
+	void dockStatusAxesRemainIndependent_data();
+	void dockStatusAxesRemainIndependent();
 	void dockResetChangesOnlyDisplayedAccumulators();
+	void dockCounterPeriodsFollowIndependentSources_data();
+	void dockCounterPeriodsFollowIndependentSources();
 	void dockShowsNativeCounterLimitsIndependently_data();
 	void dockShowsNativeCounterLimitsIndependently();
 	void dockKeepsLastValuesOnlyInTheSameContext_data();
@@ -367,13 +387,16 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 	auto *server = frontend.content->findChild<QLabel *>(QStringLiteral("serverObservation"));
 	auto *stream = frontend.content->findChild<QLabel *>(QStringLiteral("streamObservation"));
 	QVERIFY(dockProfile && windowProfile && dockStreaming && windowStreaming && server && stream);
-	for (auto *label : {dockProfile, windowProfile, dockStreaming, windowStreaming, server, stream})
+	for (auto *label : {windowProfile, dockStreaming, windowStreaming, server})
 		QCOMPARE(label->text(), text("Observation.NoData"));
+	QCOMPARE(dockProfile->text(), text("Dock.ProfileValue").arg(text("Observation.NoData")));
+	QCOMPARE(stream->text(), text("Dock.SelectedStream").arg(text("Observation.NoData")));
 	frontend.profile = QStringLiteral("<b>Профиль & OBS</b>");
 	frontend.streaming = true;
 	frontend.emitEvent(gost::FrontendEvent::FinishedLoading);
+	QCOMPARE(dockProfile->text(), text("Dock.ProfileValue").arg(frontend.profile));
+	QCOMPARE(windowProfile->text(), frontend.profile);
 	for (auto *label : {dockProfile, windowProfile}) {
-		QCOMPARE(label->text(), frontend.profile);
 		QCOMPARE(label->textFormat(), Qt::PlainText);
 	}
 	QCOMPARE(dockStreaming->text(), text("Dock.ObsStreaming"));
@@ -382,12 +405,12 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 	frontend.profile = QStringLiteral("Переименованный профиль");
 	frontend.streaming = false;
 	frontend.emitEvent(gost::FrontendEvent::ProfileChanged);
-	QCOMPARE(dockProfile->text(), frontend.profile);
+	QCOMPARE(dockProfile->text(), text("Dock.ProfileValue").arg(frontend.profile));
 	QCOMPARE(windowProfile->text(), frontend.profile);
 	QCOMPARE(dockStreaming->text(), text("Dock.ObsStopped"));
 	QCOMPARE(windowStreaming->text(), text("OBS.StreamingInactive"));
 	QCOMPARE(server->text(), text("Observation.NoData"));
-	QCOMPARE(stream->text(), text("Observation.NoData"));
+	QCOMPARE(stream->text(), text("Dock.SelectedStream").arg(text("Observation.NoData")));
 }
 
 void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
@@ -438,7 +461,8 @@ void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
 	palette.setColor(QPalette::WindowText, QColor(QStringLiteral("#202226")));
 	QApplication::setPalette(palette);
 	for (auto *label : {server, connection, dockStreaming, windowStreaming})
-		QCOMPARE(label->palette().color(QPalette::WindowText), QColor(QStringLiteral("#155d32")));
+		QTRY_COMPARE_WITH_TIMEOUT(label->palette().color(QPalette::WindowText),
+					  QColor(QStringLiteral("#155d32")), 1000);
 
 	state.setConnection(origin, ConnectionStatus::Disconnected);
 	state.setObsState(QStringLiteral("Profile"), false);
@@ -507,12 +531,320 @@ void PluginLifecycleTest::dockStaysCompact()
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
 	QVERIFY(lifecycle.load());
 	const auto *dock = frontend.content.data();
-	QCOMPARE(dock->findChildren<QToolButton *>().size(), 1);
+	QCOMPARE(dock->findChildren<QToolButton *>(QStringLiteral("managementButton")).size(), 1);
 	QVERIFY(dock->findChildren<QTabWidget *>().isEmpty());
 	QVERIFY(dock->findChildren<QLineEdit *>().isEmpty());
 	QVERIFY(dock->findChildren<QComboBox *>().isEmpty());
 	QVERIFY(dock->findChildren<QListWidget *>().isEmpty());
 	QVERIFY(dock->findChildren<QStackedWidget *>().isEmpty());
+}
+
+void PluginLifecycleTest::dockCardsFitNarrowWidths_data()
+{
+	QTest::addColumn<int>("width");
+	QTest::addColumn<int>("outputCount");
+	QTest::addColumn<QString>("locale");
+	for (const int width : {300, 360, 400})
+		for (const int count : {0, 1, 20})
+			for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")})
+				QTest::newRow(qPrintable(QStringLiteral("%1-%2-%3").arg(width).arg(count).arg(locale)))
+					<< width << count << locale;
+}
+
+void PluginLifecycleTest::dockCardsFitNarrowWidths()
+{
+	// Настоящие layout и QTextDocument проверяют переносы и доступность областей без снимка экрана.
+	// Длинные имена содержат буквальную HTML-разметку; ни имя, ни серверный статус не должны её выполнять.
+	QFETCH(int, width);
+	QFETCH(int, outputCount);
+	QFETCH(QString, locale);
+	using namespace gost;
+	using namespace gost::api;
+	StateStore state;
+	const auto text = localeLookup(locale);
+	const QString longName = QStringLiteral("<b>Очень длинное название & канала с дополнительными словами</b>");
+	Stream stream;
+	stream.id = QStringLiteral("stream");
+	stream.name = longName;
+	state.setConnection(QStringLiteral("http://127.0.0.1:8080"), ConnectionStatus::Connected);
+	state.setStreams({stream}, true);
+	state.setSelection(stream.id, true, {}, {}, QStringLiteral("profile"));
+	state.setObsState(longName, false);
+	state.setObsStatistics({.phase = ObsStreamingPhase::Stopped,
+				.fps = 59.75,
+				.renderTimeNs = 340000,
+				.render = FrameCounters{19, 483552},
+				.encode = FrameCounters{3, 150336},
+				.observed = true});
+	RuntimeSession session;
+	session.sessionId = QStringLiteral("session");
+	session.observation = {FieldState::Value, Observation{.instanceId = QStringLiteral("session-instance"),
+							      .state = QStringLiteral("RUNNING")}};
+	Input input;
+	input.connected = true;
+	input.metrics.state = FieldState::Value;
+	auto &media = input.metrics.value.media;
+	media.format = {.videoCodec = QStringLiteral("h264<test>"), .width = 2560, .height = 1440};
+	media.rates.fps = {.status = QStringLiteral("available"), .value = {FieldState::Value, 47.25}};
+	media.rates.payloadBitrate = {.status = QStringLiteral("available"), .value = {FieldState::Value, 8370000.0}};
+	session.input = {FieldState::Value, input};
+	DockServerState metadata;
+	metadata.session = DockSession{session.sessionId, QStringLiteral("RUNNING"), false};
+	metadata.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
+	for (int index = 0; index < outputCount; ++index) {
+		RuntimeOutput output;
+		output.outputId = QStringLiteral("output-%1").arg(index);
+		output.instanceId = QStringLiteral("output-instance-%1").arg(index);
+		output.state = index == 0 ? QStringLiteral("<b>UNRECOGNIZED</b>") : QStringLiteral("PUBLISHING");
+		metadata.outputs.insert(output.outputId, {longName + QString::number(index), true, true});
+		session.outputs.append(output);
+	}
+	QVERIFY(state.installAnchor({QStringLiteral("geometry-anchor"), {session}, {FieldState::Null, {}}}));
+	state.setDockServer(metadata);
+	RestreamDock dock(state, text);
+	dock.resize(width, 560);
+	dock.show();
+	auto *details = dock.findChild<QScrollArea *>(QStringLiteral("dockDetailsScroll"));
+	auto *outputs = dock.findChild<QListView *>(QStringLiteral("outputList"));
+	auto *reset = dock.findChild<QPushButton *>(QStringLiteral("statsResetButton"));
+	auto *gear = dock.findChild<QToolButton *>(QStringLiteral("managementButton"));
+	QVERIFY(details && outputs && reset && gear);
+	QTRY_COMPARE_WITH_TIMEOUT(outputs->model()->rowCount(), qMax(outputCount, 1), 1000);
+	QCOMPARE(dock.width(), width);
+	QCOMPARE(dock.height(), 560);
+	QCOMPARE(details->horizontalScrollBar()->maximum(), 0);
+	QCOMPARE(outputs->horizontalScrollBar()->maximum(), 0);
+	for (const auto *name : {"stateCard", "obsStatisticsCard", "inputCard", "outputsCard"}) {
+		auto *card = dock.findChild<QWidget *>(QString::fromLatin1(name));
+		QVERIFY(card);
+		QVERIFY(card->width() > 0 && card->width() <= dock.width());
+	}
+	for (auto *widget : {static_cast<QWidget *>(gear), static_cast<QWidget *>(reset)}) {
+		const QRect mapped(widget->mapTo(&dock, QPoint{}), widget->size());
+		QVERIFY(dock.rect().contains(mapped));
+		QVERIFY(!widget->visibleRegion().isEmpty());
+	}
+	for (const auto *name : {"streamObservation", "obsProfile"}) {
+		auto *label = dock.findChild<QLabel *>(QString::fromLatin1(name));
+		QVERIFY(label);
+		QCOMPARE(label->text(),
+			 text(qstrcmp(name, "obsProfile") == 0 ? "Dock.ProfileValue" : "Dock.SelectedStream")
+				 .arg(longName));
+		QCOMPARE(label->textFormat(), Qt::PlainText);
+		QVERIFY(label->wordWrap());
+		QVERIFY(label->height() >= label->heightForWidth(label->width()));
+	}
+	const auto *statistics = dock.findChild<QLabel *>(QStringLiteral("obsStatistics"));
+	QVERIFY(statistics);
+	const auto local = displayedText(statistics);
+	QVERIFY(local.contains(locale == QStringLiteral("ru-RU") ? QStringLiteral("59,75") : QStringLiteral("59.75")));
+	QVERIFY(local.contains(text("Dock.RenderLabel")));
+	const auto *ingest = dock.findChild<QLabel *>(QStringLiteral("ingestStatistics"));
+	QVERIFY(ingest);
+	const auto inputText = displayedText(ingest);
+	QVERIFY(inputText.contains(QStringLiteral("H264<TEST>")));
+	QVERIFY(inputText.contains(QStringLiteral("2560 × 1440")));
+	QVERIFY(inputText.contains(locale == QStringLiteral("ru-RU") ? QStringLiteral("47,25")
+								     : QStringLiteral("47.25")));
+	QVERIFY(inputText.contains(locale == QStringLiteral("ru-RU") ? QStringLiteral("8,37")
+								     : QStringLiteral("8.37")));
+	if (outputCount == 0) {
+		QCOMPARE(outputs->model()->index(0, 0).data().toString(), text("Observation.NoData"));
+		QVERIFY(!outputs->indexWidget(outputs->model()->index(0, 0)));
+		QVERIFY(outputs->isHidden() || outputs->height() <= 80);
+	} else {
+		auto *row = outputs->indexWidget(outputs->model()->index(0, 0));
+		QVERIFY(row);
+		auto *name = row->findChild<QLabel *>(QStringLiteral("outputName"));
+		auto *status = row->findChild<QLabel *>(QStringLiteral("outputStatus"));
+		auto *rate = row->findChild<QLabel *>(QStringLiteral("outputBitrate"));
+		auto *extra = row->findChild<QLabel *>(QStringLiteral("outputDetails"));
+		QVERIFY(name && status && rate && extra);
+		QCOMPARE(name->text(), longName + QStringLiteral("0"));
+		QCOMPARE(name->textFormat(), Qt::PlainText);
+		QVERIFY(name->font().bold());
+		QCOMPARE(status->text(), text("Dock.UnknownStatus"));
+		QCOMPARE(status->property("statusTone").toString(), QStringLiteral("neutral"));
+		QCOMPARE(rate->text(), text("Observation.NoData"));
+		QVERIFY(!extra->text().isEmpty());
+		auto *action = row->findChild<QToolButton *>(QStringLiteral("outputActionsButton"));
+		QVERIFY(action && !action->isEnabled());
+		if (outputCount > 1) {
+			QTRY_VERIFY_WITH_TIMEOUT(outputs->verticalScrollBar()->maximum() > 0, 1000);
+			outputs->scrollToBottom();
+			QVERIFY(outputs->verticalScrollBar()->value() > 0);
+		}
+	}
+	if (qEnvironmentVariableIsSet("GOST_TEST_CAPTURE_DOCK")) {
+		const auto path = QStringLiteral(GOST_TEST_WORKSPACE_DIR) + QStringLiteral("/dock-preview-") +
+				  QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png");
+		QVERIFY(dock.grab().save(path));
+		auto *outputsCard = dock.findChild<QWidget *>(QStringLiteral("outputsCard"));
+		QVERIFY(outputsCard);
+		details->ensureWidgetVisible(outputsCard);
+		const auto outputsPath = QStringLiteral(GOST_TEST_WORKSPACE_DIR) +
+					 QStringLiteral("/dock-outputs-preview-") +
+					 QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png");
+		QVERIFY(dock.grab().save(outputsPath));
+		const auto cardPath = QStringLiteral(GOST_TEST_WORKSPACE_DIR) +
+				      QStringLiteral("/dock-outputs-card-preview-") +
+				      QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png");
+		QVERIFY(outputsCard->grab().save(cardPath));
+	}
+}
+
+void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
+{
+	// На неактивные будущие действия отправляются и мышь, и клавиатура. Проверяется реальная граница
+	// lifecycle с локальным HTTP-сервером; работающая шестерёнка открывает тот же экземпляр управления.
+	WorkspaceTemp temp(QStringLiteral("dock-local-actions"));
+	QVERIFY(temp.isValid());
+	HttpServer server;
+	QVERIFY(server.listen());
+	server.handler = [&](const auto &request) {
+		if (request.target.startsWith("/api/v1/health/ready"))
+			HttpServer::reply(request, R"({"status":"ready","reason":""})");
+		else if (request.target.startsWith("/api/v1/system/capabilities"))
+			HttpServer::reply(request, fixture::capabilities());
+		else if (request.target.startsWith("/api/v1/streams"))
+			HttpServer::reply(request, fixture::page({}));
+		else if (request.target.startsWith("/api/v1/events/snapshot"))
+			HttpServer::reply(request, R"({"cursor":"actions-anchor","sessions":[],"gpu":null})");
+		else
+			HttpServer::stream(request);
+	};
+	FakeFrontend frontend;
+	gost::PluginLifecycle lifecycle(frontend, localeLookup(),
+					{.settingsFile = temp.filePath(QStringLiteral("settings.json"))});
+	QVERIFY(lifecycle.load());
+	lifecycle.settingsStore()->setAutoConnect(false);
+	frontend.emitEvent(gost::FrontendEvent::FinishedLoading);
+	lifecycle.connectionController()->connectToServer(server.origin().toString());
+	QTRY_COMPARE_WITH_TIMEOUT(lifecycle.stateStore()->connectionStatus(), gost::ConnectionStatus::Connected, 3000);
+	auto *dock = frontend.content.data();
+	frontend.host->show();
+	frontend.dock->show();
+	const auto requests = server.requests.size();
+	const auto sample = lifecycle.stateStore()->obsStatistics();
+	for (const auto *name : {"broadcastStartButton", "broadcastPauseButton", "broadcastResumeButton",
+				 "broadcastStopButton", "outputsStartButton", "outputsRestartButton"}) {
+		auto *button = dock->findChild<QPushButton *>(QString::fromLatin1(name));
+		QVERIFY(button);
+		QVERIFY(!button->isHidden());
+		QVERIFY(!button->isEnabled());
+		QSignalSpy clicked(button, &QPushButton::clicked);
+		QVERIFY(clicked.isValid());
+		QTest::mouseClick(button, Qt::LeftButton);
+		QTest::keyClick(button, Qt::Key_Space);
+		QCOMPARE(clicked.count(), 0);
+	}
+	dispatchQueuedEvents();
+	QCOMPARE(server.requests.size(), requests);
+	QVERIFY(lifecycle.stateStore()->obsStatistics() == sample);
+	QVERIFY(!frontend.streaming);
+	auto *gear = dock->findChild<QToolButton *>(QStringLiteral("managementButton"));
+	auto *reset = dock->findChild<QPushButton *>(QStringLiteral("statsResetButton"));
+	QVERIFY(gear && reset);
+	QVERIFY(gear->focusPolicy() != Qt::NoFocus);
+	QVERIFY(reset->focusPolicy() != Qt::NoFocus);
+	gear->setFocus();
+	QTest::keyClick(gear, Qt::Key_Space);
+	QTRY_COMPARE_WITH_TIMEOUT(managementWindows().size(), 1, 1000);
+	auto *window = managementWindows().front();
+	window->close();
+	gear->setFocus();
+	QTest::keyClick(gear, Qt::Key_Space);
+	QCOMPARE(managementWindows().size(), 1);
+	QCOMPARE(managementWindows().front(), window);
+	QVERIFY(window->isVisible());
+	QCOMPARE(server.requests.size(), requests);
+}
+
+void PluginLifecycleTest::dockStatusAxesRemainIndependent_data()
+{
+	QTest::addColumn<QString>("sessionState");
+	QTest::addColumn<QString>("outputState");
+	QTest::addColumn<QString>("sessionTone");
+	QTest::addColumn<QString>("outputTone");
+	QTest::newRow("running-failed-output") << QStringLiteral("RUNNING") << QStringLiteral("FAILED")
+					       << QStringLiteral("active") << QStringLiteral("error");
+	QTest::newRow("starting-stopped-output") << QStringLiteral("STARTING") << QStringLiteral("STOPPED")
+						 << QStringLiteral("pending") << QStringLiteral("neutral");
+	QTest::newRow("failed-publishing-output") << QStringLiteral("FAILED") << QStringLiteral("PUBLISHING")
+						  << QStringLiteral("error") << QStringLiteral("active");
+}
+
+void PluginLifecycleTest::dockStatusAxesRemainIndependent()
+{
+	QFETCH(QString, sessionState);
+	QFETCH(QString, outputState);
+	QFETCH(QString, sessionTone);
+	QFETCH(QString, outputTone);
+	using namespace gost;
+	using namespace gost::api;
+	const auto savedPalette = QApplication::palette();
+	const auto restorePalette = qScopeGuard([&] { QApplication::setPalette(savedPalette); });
+	StateStore state;
+	Stream stream;
+	stream.id = QStringLiteral("stream");
+	state.setStreams({stream}, true);
+	state.setConnection(QStringLiteral("http://127.0.0.1:8080"), ConnectionStatus::Connected);
+	state.setSelection(stream.id, true, {}, {}, QStringLiteral("profile"));
+	state.setObsStatistics({.phase = ObsStreamingPhase::Starting, .observed = true});
+	RuntimeSession session;
+	session.sessionId = QStringLiteral("session");
+	session.observation = {FieldState::Value,
+			       Observation{.instanceId = QStringLiteral("session-instance"), .state = sessionState}};
+	Input input;
+	input.connected = false;
+	session.input = {FieldState::Value, input};
+	RuntimeOutput output;
+	output.outputId = QStringLiteral("output");
+	output.instanceId = QStringLiteral("output-instance");
+	output.state = outputState;
+	session.outputs.append(output);
+	QVERIFY(state.installAnchor({QStringLiteral("axes-anchor"), {session}, {FieldState::Null, {}}}));
+	DockServerState metadata;
+	metadata.session = DockSession{session.sessionId, sessionState, false};
+	metadata.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputs.insert(output.outputId, {QStringLiteral("Channel"), true, true});
+	state.setDockServer(metadata);
+	RestreamDock dock(state, localeLookup());
+	dock.show();
+	auto *list = dock.findChild<QListView *>(QStringLiteral("outputList"));
+	QVERIFY(list);
+	QTRY_COMPARE_WITH_TIMEOUT(list->model()->rowCount(), 1, 1000);
+	auto *row = list->indexWidget(list->model()->index(0, 0));
+	QVERIFY(row);
+	auto *outputLabel = row->findChild<QLabel *>(QStringLiteral("outputStatus"));
+	auto *sessionLabel = dock.findChild<QLabel *>(QStringLiteral("sessionObservation"));
+	auto *inputLabel = dock.findChild<QLabel *>(QStringLiteral("inputObservation"));
+	auto *obsLabel = dock.findChild<QLabel *>(QStringLiteral("obsStreaming"));
+	QVERIFY(outputLabel && sessionLabel && inputLabel && obsLabel);
+	QCOMPARE(sessionLabel->property("statusTone").toString(), sessionTone);
+	QCOMPARE(outputLabel->property("statusTone").toString(), outputTone);
+	QCOMPARE(inputLabel->property("statusTone").toString(), QStringLiteral("neutral"));
+	QCOMPARE(obsLabel->property("statusTone").toString(), QStringLiteral("pending"));
+	for (const bool dark : {true, false}) {
+		QPalette palette = savedPalette;
+		palette.setColor(QPalette::Window, QColor(dark ? "#161b22" : "#f1ece6"));
+		palette.setColor(QPalette::WindowText, QColor(dark ? "#ded9d3" : "#292d32"));
+		QApplication::setPalette(palette);
+		for (auto *label : {outputLabel, sessionLabel, inputLabel, obsLabel})
+			label->ensurePolished();
+		QTRY_COMPARE_WITH_TIMEOUT(inputLabel->palette().color(QPalette::WindowText),
+					  palette.color(QPalette::WindowText), 1000);
+		QVERIFY(obsLabel->palette().color(QPalette::WindowText) != palette.color(QPalette::WindowText));
+		QCOMPARE(sessionLabel->property("statusTone").toString(), sessionTone);
+		QCOMPARE(outputLabel->property("statusTone").toString(), outputTone);
+		QVERIFY(!sessionLabel->text().isEmpty() && !outputLabel->text().isEmpty());
+	}
+	state.setObsStatistics({.phase = ObsStreamingPhase::Stopping, .observed = true});
+	QTRY_COMPARE_WITH_TIMEOUT(obsLabel->property("statusTone").toString(), QStringLiteral("pending"), 1000);
+	state.setObsStatistics({.phase = ObsStreamingPhase::Stopped, .observed = true});
+	QTRY_COMPARE_WITH_TIMEOUT(obsLabel->property("statusTone").toString(), QStringLiteral("neutral"), 1000);
 }
 
 void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
@@ -522,11 +854,12 @@ void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
 	gost::StateStore state;
 	const auto text = localeLookup(QStringLiteral("en-US"));
 	gost::RestreamDock dock(state, text);
+	dock.show();
 	auto *reset = dock.findChild<QPushButton *>(QStringLiteral("statsResetButton"));
 	const auto *statistics = dock.findChild<QLabel *>(QStringLiteral("obsStatistics"));
 	QVERIFY(reset && statistics);
 	QVERIFY(!reset->isEnabled());
-	QVERIFY(statistics->text().contains(QStringLiteral("No data")));
+	QVERIFY(displayedText(statistics).contains(QStringLiteral("No data")));
 
 	gost::ObsStatistics sample{.phase = gost::ObsStreamingPhase::Streaming,
 				   .videoEpoch = 1,
@@ -541,14 +874,18 @@ void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
 				   .observed = true};
 	state.setObsStatistics(sample);
 	QTRY_VERIFY_WITH_TIMEOUT(reset->isEnabled(), 1000);
-	const auto before = statistics->text();
+	const auto before = displayedText(statistics);
 	const QStringList rates{QStringLiteral("58.75"), QStringLiteral("6.37 Mbps"), QStringLiteral("0.34 ms")};
 	for (const auto &rate : rates)
 		QVERIFY(before.contains(rate));
-	reset->click();
-	QVERIFY(statistics->text() != before);
+	for (const auto &value : {QStringLiteral("12 / 150 (8.0%)"), QStringLiteral("3 / 40 (7.5%)"),
+				  QStringLiteral("1 / 25 (4.0%)"), QStringLiteral("4.77 MiB")})
+		QVERIFY(before.contains(value));
+	reset->setFocus();
+	QTest::keyClick(reset, Qt::Key_Space);
+	QVERIFY(displayedText(statistics) != before);
 	for (const auto &rate : rates)
-		QVERIFY(statistics->text().contains(rate));
+		QVERIFY(displayedText(statistics).contains(rate));
 	// Сброс меняет представление накоплений, сохраняя исходную выборку и мгновенные скорости.
 	QVERIFY(state.obsStatistics() == sample);
 
@@ -556,9 +893,139 @@ void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
 	sample.encode = gost::FrameCounters{4, 60};
 	sample.network = gost::FrameCounters{1, 29};
 	state.setObsStatistics(sample);
-	QTRY_VERIFY_WITH_TIMEOUT(statistics->text().contains(QStringLiteral("(20.0%)")), 1000);
-	QVERIFY(statistics->text().contains(QStringLiteral("(5.0%)")));
-	QVERIFY(statistics->text().contains(QStringLiteral("(0.0%)")));
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(statistics).contains(QStringLiteral("(20.0%)")), 1000);
+	QVERIFY(displayedText(statistics).contains(QStringLiteral("(5.0%)")));
+	QVERIFY(displayedText(statistics).contains(QStringLiteral("(0.0%)")));
+}
+
+void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::addColumn<bool>("replaceOutput");
+	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")}) {
+		QTest::newRow(qPrintable(locale + QStringLiteral("-output-replacement"))) << locale << true;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-network-regression"))) << locale << false;
+	}
+}
+
+void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources()
+{
+	// Общая подпись допустима, пока периоды совпадают. Замена output не сбрасывает накопления видео,
+	// а регресс сети не сбрасывает байты; точные пары и подписи строк обнаруживают смешение этих источников.
+	QFETCH(QString, locale);
+	QFETCH(bool, replaceOutput);
+	using namespace gost;
+	StateStore state;
+	const auto text = localeLookup(locale);
+	const bool russian = locale == QStringLiteral("ru-RU");
+	RestreamDock dock(state, text);
+	auto *reset = dock.findChild<QPushButton *>(QStringLiteral("statsResetButton"));
+	const auto *statistics = dock.findChild<QLabel *>(QStringLiteral("obsStatistics"));
+	QVERIFY(reset && statistics);
+	const auto rows = [&] {
+		QMap<QString, QString> result;
+		QTextDocument document;
+		document.setHtml(statistics->text());
+		for (auto *frame : document.rootFrame()->childFrames()) {
+			auto *table = qobject_cast<QTextTable *>(frame);
+			if (!table || table->columns() != 2)
+				continue;
+			for (int row = 0; row < table->rows(); ++row) {
+				const auto cellText = [&](int column) {
+					const auto cell = table->cellAt(row, column);
+					auto cursor = cell.firstCursorPosition();
+					cursor.setPosition(cell.lastCursorPosition().position(),
+							   QTextCursor::KeepAnchor);
+					return cursor.selectedText();
+				};
+				result.insert(cellText(0), cellText(1));
+			}
+		}
+		return result;
+	};
+	const auto verifyRows = [&](const QString &render, const QString &encode, const QString &network,
+				    const QString &sent) {
+		const auto values = rows();
+		QCOMPARE(values.value(text("Dock.RenderDropsLabel")), render);
+		QCOMPARE(values.value(text("Dock.EncodeDropsLabel")), encode);
+		QCOMPARE(values.value(text("Dock.NetworkDropsLabel")), network);
+		QCOMPARE(values.value(text("Dock.SentLabel")), sent);
+	};
+	ObsStatistics sample{.phase = ObsStreamingPhase::Streaming,
+			     .videoEpoch = 1,
+			     .outputEpoch = 1,
+			     .sentBytes = 1048576,
+			     .render = FrameCounters{12, 150},
+			     .encode = FrameCounters{3, 40},
+			     .network = FrameCounters{8, 100},
+			     .observed = true};
+	state.setObsStatistics(sample);
+	QTRY_VERIFY_WITH_TIMEOUT(reset->isEnabled(), 1000);
+	verifyRows(russian ? QStringLiteral("12 / 150 (8,0%)") : QStringLiteral("12 / 150 (8.0%)"),
+		   russian ? QStringLiteral("3 / 40 (7,5%)") : QStringLiteral("3 / 40 (7.5%)"),
+		   russian ? QStringLiteral("8 / 100 (8,0%)") : QStringLiteral("8 / 100 (8.0%)"),
+		   russian ? QStringLiteral("1,00 МиБ") : QStringLiteral("1.00 MiB"));
+	QCOMPARE(displayedText(statistics).count(text("Dock.PeriodRun")), 1);
+	reset->click();
+	QCOMPARE(displayedText(statistics).count(text("Dock.PeriodReset")), 1);
+	QCOMPARE(displayedText(statistics).count(text("Dock.PeriodRun")), 0);
+	QVERIFY(state.obsStatistics() == sample);
+
+	sample.render = FrameCounters{14, 160};
+	sample.encode = FrameCounters{4, 60};
+	sample.network = FrameCounters{10, 110};
+	sample.sentBytes = 3145728;
+	state.setObsStatistics(sample);
+	const auto twenty = russian ? QStringLiteral("2 / 10 (20,0%)") : QStringLiteral("2 / 10 (20.0%)");
+	QTRY_COMPARE_WITH_TIMEOUT(rows().value(text("Dock.RenderDropsLabel")), twenty, 1000);
+	verifyRows(twenty, russian ? QStringLiteral("1 / 20 (5,0%)") : QStringLiteral("1 / 20 (5.0%)"), twenty,
+		   russian ? QStringLiteral("2,00 МиБ") : QStringLiteral("2.00 MiB"));
+	QCOMPARE(displayedText(statistics).count(text("Dock.PeriodReset")), 1);
+
+	sample.render = FrameCounters{18, 190};
+	sample.encode = FrameCounters{5, 80};
+	sample.sentBytes = 4194304;
+	if (replaceOutput) {
+		sample.outputEpoch = 2;
+		sample.network = FrameCounters{3, 50};
+	} else {
+		sample.network = FrameCounters{2, 120};
+	}
+	state.setObsStatistics(sample);
+	const auto networkPeriod = text(replaceOutput ? "Dock.PeriodRun" : "Dock.PeriodNewSample");
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(statistics).contains(networkPeriod), 1000);
+	if (!replaceOutput) {
+		QCOMPARE(
+			rows().value(text("Dock.NetworkDropsLabel")),
+			text("Dock.CountPeriod")
+				.arg(text("Dock.Pair")
+					     .arg(QStringLiteral("0"), QStringLiteral("0"), text("Observation.NoData")),
+				     networkPeriod));
+		sample.network = FrameCounters{5, 130};
+		sample.sentBytes = 5242880;
+		state.setObsStatistics(sample);
+		QTRY_VERIFY_WITH_TIMEOUT(
+			displayedText(statistics).contains(russian ? QStringLiteral("30,0%") : QStringLiteral("30.0%")),
+			1000);
+	}
+	const auto sinceReset = text("Dock.PeriodReset");
+	verifyRows(
+		text("Dock.CountPeriod")
+			.arg(russian ? QStringLiteral("6 / 40 (15,0%)") : QStringLiteral("6 / 40 (15.0%)"), sinceReset),
+		text("Dock.CountPeriod")
+			.arg(russian ? QStringLiteral("2 / 40 (5,0%)") : QStringLiteral("2 / 40 (5.0%)"), sinceReset),
+		text("Dock.CountPeriod")
+			.arg(replaceOutput
+				     ? (russian ? QStringLiteral("3 / 50 (6,0%)") : QStringLiteral("3 / 50 (6.0%)"))
+				     : (russian ? QStringLiteral("3 / 10 (30,0%)") : QStringLiteral("3 / 10 (30.0%)")),
+			     networkPeriod),
+		text("Dock.CountPeriod")
+			.arg(russian ? QStringLiteral("4,00 МиБ") : QStringLiteral("4.00 MiB"),
+			     replaceOutput ? networkPeriod : sinceReset));
+	QCOMPARE(displayedText(statistics).count(sinceReset), replaceOutput ? 2 : 3);
+	QCOMPARE(displayedText(statistics).count(networkPeriod), replaceOutput ? 2 : 1);
+	QCOMPARE(displayedText(statistics).count(text(replaceOutput ? "Dock.PeriodNewSample" : "Dock.PeriodRun")), 0);
+	QVERIFY(state.obsStatistics() == sample);
 }
 
 void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently_data()
@@ -595,22 +1062,17 @@ void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently()
 	QCOMPARE(observed.encodeLimited, sample.encodeLimited);
 	QCOMPARE(observed.networkLimited, sample.networkLimited);
 	state.setObsStatistics(observed);
-	QTRY_VERIFY_WITH_TIMEOUT(statistics->text().contains(QStringLiteral("48.25")), 1000);
-	const auto lines = statistics->text().split(QLatin1Char('\n'));
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(statistics).contains(QStringLiteral("48.25")), 1000);
 	QStringList counterValues;
 	for (int i = 0; i < 3; ++i) {
 		counterValues.append(i == limitedCounter ? text("Dock.ChangeUnavailable")
-							 : text("Dock.PairPeriod")
+							 : text("Dock.Pair")
 								   .arg(QString::number(i + 5), QStringLiteral("100"),
-									QStringLiteral("%1.0%").arg(i + 5),
-									text("Dock.PeriodRun")));
+									QStringLiteral("%1.0%").arg(i + 5)));
 	}
-	const auto counterLines =
-		text("Dock.LocalCounters")
-			.arg(counterValues.at(0), counterValues.at(1), counterValues.at(2), text("Observation.NoData"))
-			.split(QLatin1Char('\n'));
-	for (const auto &line : counterLines)
-		QCOMPARE(lines.count(line), 1);
+	for (const auto &value : counterValues)
+		QCOMPARE(displayedText(statistics).count(value), 1);
+	QVERIFY(displayedText(statistics).contains(text("Dock.PeriodRun")));
 }
 
 void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext_data()
@@ -706,7 +1168,7 @@ void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
 	state.setDockServer(metadata);
 	dock.resize(360, 560);
 	dock.show();
-	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(currentRate), 1000);
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(ingest).contains(currentRate), 1000);
 	QVERIFY(sessionLabel->text().contains(currentSession));
 	QVERIFY(!notice->text().contains(lastValues));
 	QCOMPARE(outputs->model()->rowCount(), 20);
@@ -748,11 +1210,11 @@ void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
 	QTRY_VERIFY_WITH_TIMEOUT(notice->text().contains(noCurrentData), 1000);
 	QVERIFY(notice->text().contains(lastValues));
 	const auto lastBitrate = text("Dock.LastValue").arg(text("Dock.Megabits").arg(lastRate));
-	QVERIFY(ingest->text().contains(lastBitrate));
-	QVERIFY(!ingest->text().contains(currentRate));
+	QVERIFY(displayedText(ingest).contains(lastBitrate));
+	QVERIFY(!displayedText(ingest).contains(currentRate));
 	state.setConnection(origin, ConnectionStatus::Connected);
 	QTRY_VERIFY_WITH_TIMEOUT(notice->text().contains(lastValues), 1000);
-	QVERIFY(ingest->text().contains(lastBitrate));
+	QVERIFY(displayedText(ingest).contains(lastBitrate));
 
 	metric.cursor = QStringLiteral("exact-metric-after-reconnect");
 	metric.observation.revision = 2;
@@ -760,30 +1222,30 @@ void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
 	metric.input = {FieldState::Value, input};
 	QVERIFY(state.applyEvent(metric));
 	QCOMPARE(state.dockServer().sessionStatus.availability, RuntimeAvailability::Stale);
-	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(resumedRate), 1000);
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(ingest).contains(resumedRate), 1000);
 	const auto resumedBitrate = text("Dock.Megabits").arg(resumedRate);
 	const auto lastResumedBitrate = text("Dock.LastValue").arg(resumedBitrate);
-	QVERIFY(!ingest->text().contains(lastResumedBitrate));
+	QVERIFY(!displayedText(ingest).contains(lastResumedBitrate));
 	QVERIFY(!sessionLabel->text().contains(currentSession));
 
 	state.markRuntimeStale();
 	state.setConnection(origin, ConnectionStatus::Reconnecting);
-	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(lastResumedBitrate), 1000);
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(ingest).contains(lastResumedBitrate), 1000);
 	session.observation->instanceId = QStringLiteral("replacement:1");
 	session.outputs.front().instanceId = QStringLiteral("replacement:2");
 	inputBitrate.value = {FieldState::Value, 12370000.0};
 	session.input = {FieldState::Value, input};
 	QVERIFY(state.installAnchor({QStringLiteral("replacement-anchor"), {session}, {FieldState::Null, {}}}, true));
 	state.setObsStatistics({.fps = 43.0, .observed = true});
-	QTRY_VERIFY_WITH_TIMEOUT(localStatistics->text().contains(QStringLiteral("43")), 1000);
-	QVERIFY(ingest->text().contains(lastResumedBitrate));
-	QVERIFY(!ingest->text().contains(replacementRate));
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(localStatistics).contains(QStringLiteral("43")), 1000);
+	QVERIFY(displayedText(ingest).contains(lastResumedBitrate));
+	QVERIFY(!displayedText(ingest).contains(replacementRate));
 	state.setConnection(origin, ConnectionStatus::Connected);
-	QTRY_VERIFY_WITH_TIMEOUT(ingest->text().contains(replacementRate), 1000);
-	QVERIFY(!ingest->text().contains(resumedRate));
+	QTRY_VERIFY_WITH_TIMEOUT(displayedText(ingest).contains(replacementRate), 1000);
+	QVERIFY(!displayedText(ingest).contains(resumedRate));
 
 	state.setSelection(streamId, true, {}, {}, QStringLiteral("profile-b"));
-	QTRY_VERIFY_WITH_TIMEOUT(!ingest->text().contains(replacementRate), 1000);
+	QTRY_VERIFY_WITH_TIMEOUT(!displayedText(ingest).contains(replacementRate), 1000);
 	QVERIFY(!notice->text().contains(lastValues));
 	QVERIFY(!sessionLabel->text().contains(currentSession));
 }

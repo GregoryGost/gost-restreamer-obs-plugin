@@ -5,14 +5,19 @@
 #include "ui/status-label.hpp"
 
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QListView>
 #include <QLocale>
 #include <QPalette>
+#include <QPainter>
 #include <QPushButton>
 #include <QSet>
-#include <QStringListModel>
+#include <QStandardItemModel>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QResizeEvent>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -33,13 +38,158 @@ bool fresh(RuntimeAvailability evidence)
 
 QLabel *valueLabel(QWidget *parent, const char *name)
 {
-	// Серверные имена/значения показываются обычным текстом, чтобы '<...>' не интерпретировалось как HTML.
+	// По умолчанию серверные имена показываются обычным текстом. Табличные значения ниже отдельно
+	// экранируются при сборке HTML, поэтому '<...>' из серверного ответа не становится разметкой.
 	auto *label = new QLabel(parent);
 	label->setObjectName(QString::fromLatin1(name));
 	label->setTextFormat(Qt::PlainText);
 	label->setWordWrap(true);
+	label->setMinimumWidth(0);
+	auto policy = label->sizePolicy();
+	policy.setHorizontalPolicy(QSizePolicy::Ignored);
+	label->setSizePolicy(policy);
 	return label;
 }
+
+void bold(QWidget *widget)
+{
+	auto font = widget->font();
+	font.setBold(true);
+	widget->setFont(font);
+}
+
+// Цвета карточки вычисляются из текущей палитры при рисовании. Смена темы не сохраняет старый фон
+// и не требует stylesheet, который мог бы повторно инициировать StyleChange у всего дерева.
+class DockCard final : public QWidget {
+public:
+	using QWidget::QWidget;
+
+protected:
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter painter(this);
+		painter.setRenderHint(QPainter::Antialiasing);
+		const auto base = palette().color(QPalette::Window);
+		const auto text = palette().color(QPalette::WindowText);
+		const auto blend = [&](int weight) {
+			return QColor((base.red() * (100 - weight) + text.red() * weight) / 100,
+				      (base.green() * (100 - weight) + text.green() * weight) / 100,
+				      (base.blue() * (100 - weight) + text.blue() * weight) / 100);
+		};
+		painter.setBrush(blend(4));
+		painter.setPen(blend(22));
+		painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6);
+	}
+};
+
+QVBoxLayout *card(QVBoxLayout *parent, const char *name, const QString &title)
+{
+	auto *widget = new DockCard;
+	widget->setObjectName(QString::fromLatin1(name));
+	auto *layout = new QVBoxLayout(widget);
+	layout->setContentsMargins(10, 10, 10, 10);
+	layout->setSpacing(8);
+	auto *heading = valueLabel(widget, "cardTitle");
+	heading->setText(title);
+	bold(heading);
+	layout->addWidget(heading);
+	parent->addWidget(widget);
+	return layout;
+}
+
+QString tableRow(const QString &label, const QString &value, bool emphasis = false)
+{
+	const auto formatted = value.toHtmlEscaped();
+	return QStringLiteral("<tr><td valign='top'>%1</td><td valign='top'>%2</td></tr>\n")
+		.arg(label.toHtmlEscaped(), emphasis ? QStringLiteral("<b>%1</b>").arg(formatted) : formatted);
+}
+
+QString table(const QString &rows)
+{
+	return QStringLiteral("<table width='100%' cellspacing='0' cellpadding='2'>%1</table>").arg(rows);
+}
+
+QPushButton *futureButton(QWidget *parent, const TextLookup &text, const char *key, const char *name)
+{
+	auto *button = new QPushButton(text(key), parent);
+	button->setObjectName(QString::fromLatin1(name));
+	button->setEnabled(false);
+	button->setToolTip(text("Dock.ControlsUnavailable"));
+	button->setAccessibleDescription(text("Dock.ControlsUnavailable"));
+	button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+	return button;
+}
+
+class OutputRow final : public QWidget {
+public:
+	explicit OutputRow(const TextLookup &text, QWidget *parent) : QWidget(parent)
+	{
+		setAutoFillBackground(true);
+		setBackgroundRole(QPalette::Window);
+		auto *layout = new QGridLayout(this);
+		layout->setContentsMargins(4, 8, 4, 8);
+		layout->setHorizontalSpacing(8);
+		layout->setVerticalSpacing(4);
+		name = valueLabel(this, "outputName");
+		bold(name);
+		status = new StatusLabel(this);
+		status->setObjectName(QStringLiteral("outputStatus"));
+		auto statusPolicy = status->sizePolicy();
+		statusPolicy.setHorizontalPolicy(QSizePolicy::Ignored);
+		status->setSizePolicy(statusPolicy);
+		rate = valueLabel(this, "outputBitrate");
+		rate->setAlignment(Qt::AlignRight | Qt::AlignTop);
+		details = valueLabel(this, "outputDetails");
+		auto *action = new QToolButton(this);
+		action->setObjectName(QStringLiteral("outputActionsButton"));
+		action->setText(QString::fromUtf8("…"));
+		action->setEnabled(false);
+		action->setToolTip(text("Dock.ControlsUnavailable"));
+		action->setAccessibleName(text("Dock.OutputActions"));
+		layout->addWidget(name, 0, 0, 1, 2);
+		layout->addWidget(action, 0, 2);
+		layout->addWidget(status, 1, 0);
+		layout->addWidget(rate, 1, 1, 1, 2);
+		layout->addWidget(details, 2, 0, 1, 3);
+		layout->setColumnStretch(0, 1);
+		layout->setColumnStretch(1, 1);
+	}
+
+	QLabel *name;
+	StatusLabel *status;
+	QLabel *rate;
+	QLabel *details;
+};
+
+class OutputList final : public QListView {
+public:
+	using QListView::QListView;
+
+	void updateHeights()
+	{
+		// Сохраняем модель и виджеты при телеметрии. Меняется только высота действительно изменившейся
+		// строки; положение прокрутки не сбрасывается при поступлении очередного измерения.
+		int total = 0;
+		for (int row = 0; row < model()->rowCount(); ++row) {
+			const auto index = model()->index(row, 0);
+			auto *widget = indexWidget(index);
+			const int height = widget ? widget->heightForWidth(viewport()->width())
+						  : fontMetrics().height() + 4;
+			const QSize hint(qMax(1, viewport()->width()), qMax(fontMetrics().height() + 4, height));
+			if (index.data(Qt::SizeHintRole).toSize() != hint)
+				model()->setData(index, hint, Qt::SizeHintRole);
+			total += hint.height();
+		}
+		setFixedHeight(qMin(total + 2, fontMetrics().height() * 11));
+	}
+
+protected:
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QListView::resizeEvent(event);
+		updateHeights();
+	}
+};
 
 const char *sessionKey(const QString &state)
 {
@@ -93,7 +243,8 @@ QString bitrate(const QLocale &locale, const TextLookup &text, double bitsPerSec
 	return text("Dock.Megabits").arg(locale.toString(bitsPerSecond / 1000000.0, 'f', 2));
 }
 
-QString counterText(const QLocale &locale, const TextLookup &text, const StatsBaseline &baseline)
+QString counterText(const QLocale &locale, const TextLookup &text, const StatsBaseline &baseline,
+		    bool includePeriod = true)
 {
 	// Предел имеет собственное представление. Процент берётся из той же пары дельт baseline,
 	// не вычисляется от полного total; каждый счётчик сохраняет свой период после разрыва.
@@ -104,14 +255,15 @@ QString counterText(const QLocale &locale, const TextLookup &text, const StatsBa
 		return text("Observation.NoData");
 	const auto count = locale.toString(reading.counters->count);
 	if (!reading.counters->total)
-		return text("Dock.CountPeriod").arg(count, text(periodKey(reading.period)));
+		return includePeriod ? text("Dock.CountPeriod").arg(count, text(periodKey(reading.period))) : count;
 	const auto percent = reading.percent ? locale.toString(*reading.percent, 'f', 1) + QLatin1Char('%')
 					     : text("Observation.NoData");
-	return text("Dock.PairPeriod")
-		.arg(count, locale.toString(*reading.counters->total), percent, text(periodKey(reading.period)));
+	const auto pair = text("Dock.Pair").arg(count, locale.toString(*reading.counters->total), percent);
+	return includePeriod ? text("Dock.CountPeriod").arg(pair, text(periodKey(reading.period))) : pair;
 }
 
-QString bytesText(const QLocale &locale, const TextLookup &text, const StatsBaseline &baseline)
+QString bytesText(const QLocale &locale, const TextLookup &text, const StatsBaseline &baseline,
+		  bool includePeriod = true)
 {
 	const auto reading = baseline.reading();
 	if (reading.limited)
@@ -119,7 +271,8 @@ QString bytesText(const QLocale &locale, const TextLookup &text, const StatsBase
 	if (!reading.counters)
 		return text("Observation.NoData");
 	const auto mib = locale.toString(static_cast<double>(reading.counters->count) / (1024.0 * 1024.0), 'f', 2);
-	return text("Dock.CountPeriod").arg(text("Dock.Mebibytes").arg(mib), text(periodKey(reading.period)));
+	const auto value = text("Dock.Mebibytes").arg(mib);
+	return includePeriod ? text("Dock.CountPeriod").arg(value, text(periodKey(reading.period))) : value;
 }
 
 std::optional<StatsBaseline::Counters> frames(const std::optional<FrameCounters> &value)
@@ -211,7 +364,7 @@ struct OutputStatistics {
 	}
 };
 
-void updateRows(QStringListModel &model, const QStringList &rows)
+void updateRows(QStandardItemModel &model, const QStringList &rows)
 {
 	// Изменяем только различающиеся строки, сохраняя существующую модель и положение списка при телеметрии.
 	const int count = static_cast<int>(rows.size());
@@ -221,7 +374,7 @@ void updateRows(QStringListModel &model, const QStringList &rows)
 	else if (previous < count)
 		model.insertRows(previous, count - previous);
 	for (int i = 0; i < count; ++i) {
-		const auto index = model.index(i);
+		const auto index = model.index(i, 0);
 		if (model.data(index).toString() != rows.at(i))
 			model.setData(index, rows.at(i));
 	}
@@ -267,9 +420,14 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	// Сигналы подключаются с контекстом виджета: его удаление OBS отменяет отложенные обновления.
 	// runtimeAboutToBecomeStale обрабатывается отдельно и сразу, до отложенного общего refresh().
 	setObjectName(QStringLiteral("restreamDock"));
+	setMinimumWidth(0);
 	auto *layout = new QVBoxLayout(this);
+	layout->setContentsMargins(10, 10, 10, 10);
+	layout->setSpacing(8);
 	auto *header = new QHBoxLayout;
-	auto *title = new QLabel(text_("Plugin.Name"), this);
+	auto *title = valueLabel(this, "dockTitle");
+	title->setText(text_("Plugin.Name"));
+	bold(title);
 	header->addWidget(title, 1);
 	auto *gear = new QToolButton(this);
 	gear->setObjectName(QStringLiteral("managementButton"));
@@ -278,72 +436,109 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	gear->setAccessibleName(text_("Management.Open"));
 	header->addWidget(gear);
 	layout->addLayout(header);
-
-	auto *observations = new QFormLayout;
-	observations->setRowWrapPolicy(QFormLayout::WrapLongRows);
 	server_ = new StatusLabel(this);
 	server_->setObjectName(QStringLiteral("serverObservation"));
-	observations->addRow(text_("Server.Label"), server_);
-	stream_ = new QLabel(this);
-	stream_->setObjectName(QStringLiteral("streamObservation"));
-	stream_->setTextFormat(Qt::PlainText);
-	stream_->setWordWrap(true);
-	observations->addRow(text_("Stream.Label"), stream_);
-	profile_ = new QLabel(this);
-	profile_->setObjectName(QStringLiteral("obsProfile"));
-	profile_->setWordWrap(true);
-	profile_->setTextFormat(Qt::PlainText);
-	observations->addRow(text_("OBS.Profile"), profile_);
-	streaming_ = new StatusLabel(this);
-	streaming_->setObjectName(QStringLiteral("obsStreaming"));
-	observations->addRow(text_("Dock.Obs"), streaming_);
-	layout->addLayout(observations);
-	notice_ = new QLabel(this);
-	notice_->setTextFormat(Qt::PlainText);
-	notice_->setWordWrap(true);
-	layout->addWidget(notice_);
-	session_ = valueLabel(this, "sessionObservation");
-	groups_ = valueLabel(this, "groupObservation");
-	fallback_ = valueLabel(this, "fallbackObservation");
-	serverDataNotice_ = valueLabel(this, "serverDataNotice");
-	layout->addWidget(session_);
-	layout->addWidget(groups_);
-	layout->addWidget(fallback_);
-	layout->addWidget(serverDataNotice_);
-	localStats_ = valueLabel(this, "obsStatistics");
-	ingest_ = valueLabel(this, "ingestStatistics");
-	layout->addWidget(localStats_);
-	layout->addWidget(ingest_);
-	outputSummary_ = valueLabel(this, "outputSummary");
-	layout->addWidget(outputSummary_);
-	auto *outputList = new QListView(this);
+	layout->addWidget(server_);
+	stream_ = valueLabel(this, "streamObservation");
+	bold(stream_);
+	layout->addWidget(stream_);
+	profile_ = valueLabel(this, "obsProfile");
+	layout->addWidget(profile_);
+
+	auto *state = card(layout, "stateCard", text_("Dock.State"));
+	auto *observations = new QFormLayout;
+	observations->setContentsMargins(0, 0, 0, 0);
+	observations->setSpacing(4);
+	observations->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	observations->setRowWrapPolicy(QFormLayout::WrapLongRows);
+	const auto axis = [&](const char *name, const char *key) {
+		auto *label = new StatusLabel(this);
+		label->setObjectName(QString::fromLatin1(name));
+		auto policy = label->sizePolicy();
+		policy.setHorizontalPolicy(QSizePolicy::Ignored);
+		label->setSizePolicy(policy);
+		observations->addRow(text_(key), label);
+		return label;
+	};
+	streaming_ = axis("obsStreaming", "Dock.Obs");
+	input_ = axis("inputObservation", "Dock.InputLabel");
+	session_ = axis("sessionObservation", "Dock.SessionLabel");
+	groups_ = axis("groupObservation", "Dock.GroupsLabel");
+	fallback_ = axis("fallbackObservation", "Dock.FallbackLabel");
+	state->addLayout(observations);
+
+	// Шапка, независимые состояния и основные действия остаются снаружи прокрутки.
+	// На небольшой высоте подробные метрики доступны без увеличения минимальной высоты Dock.
+	auto *scroll = new QScrollArea(this);
+	scroll->setObjectName(QStringLiteral("dockDetailsScroll"));
+	scroll->setFrameShape(QFrame::NoFrame);
+	scroll->setWidgetResizable(true);
+	scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	scroll->setMinimumHeight(fontMetrics().height() * 3);
+	auto *content = new QWidget;
+	auto *details = new QVBoxLayout(content);
+	details->setContentsMargins(0, 0, 0, 0);
+	details->setSpacing(8);
+	notice_ = valueLabel(content, "dockNotice");
+	details->addWidget(notice_);
+	serverDataNotice_ = valueLabel(content, "serverDataNotice");
+	details->addWidget(serverDataNotice_);
+	auto *localCard = card(details, "obsStatisticsCard", text_("Dock.StatisticsTitle"));
+	localStats_ = valueLabel(content, "obsStatistics");
+	localStats_->setTextFormat(Qt::RichText);
+	localCard->addWidget(localStats_);
+	auto *inputCard = card(details, "inputCard", text_("Dock.InputTitle"));
+	ingest_ = valueLabel(content, "ingestStatistics");
+	ingest_->setTextFormat(Qt::RichText);
+	inputCard->addWidget(ingest_);
+	auto *outputCard = card(details, "outputsCard", text_("Dock.OutputsTitle"));
+	outputSummary_ = valueLabel(content, "outputSummary");
+	outputCard->addWidget(outputSummary_);
+	auto *outputList = new OutputList(content);
+	outputList_ = outputList;
 	outputList->setObjectName(QStringLiteral("outputList"));
 	outputList->setAccessibleName(text_("Dock.Outputs"));
 	outputList->setEditTriggers(QAbstractItemView::NoEditTriggers);
+	outputList->setFrameShape(QFrame::NoFrame);
 	outputList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	outputList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
 	outputList->setResizeMode(QListView::Adjust);
 	outputList->setWordWrap(true);
-	outputList->setMinimumHeight(fontMetrics().height() * 2);
-	outputs_ = new QStringListModel(outputList);
+	outputList->setMinimumWidth(0);
+	outputs_ = new QStandardItemModel(0, 1, outputList);
 	outputList->setModel(outputs_);
-	layout->addWidget(outputList, 1);
-	reset_ = new QPushButton(text_("Dock.ResetCounters"), this);
+	outputCard->addWidget(outputList);
+	auto *batch = new QVBoxLayout;
+	batch->setSpacing(4);
+	batch->addWidget(futureButton(content, text_, "Dock.StartOutputs", "outputsStartButton"));
+	batch->addWidget(futureButton(content, text_, "Dock.RestartOutputs", "outputsRestartButton"));
+	outputCard->addLayout(batch);
+	details->addStretch();
+	scroll->setWidget(content);
+	layout->addWidget(scroll, 1);
+
+	auto *commands = new QGridLayout;
+	commands->setSpacing(4);
+	commands->addWidget(futureButton(this, text_, "Dock.Start", "broadcastStartButton"), 0, 0);
+	commands->addWidget(futureButton(this, text_, "Dock.Stop", "broadcastStopButton"), 0, 1);
+	commands->addWidget(futureButton(this, text_, "Dock.Pause", "broadcastPauseButton"), 1, 0);
+	commands->addWidget(futureButton(this, text_, "Dock.Resume", "broadcastResumeButton"), 1, 1);
+	layout->addLayout(commands);
+	auto *footer = new QHBoxLayout;
+	reset_ = new QPushButton(text_("Dock.ResetShort"), this);
 	reset_->setObjectName(QStringLiteral("statsResetButton"));
+	reset_->setFlat(true);
 	reset_->setToolTip(text_("Dock.ResetHint"));
-	layout->addWidget(reset_);
+	reset_->setAccessibleName(text_("Dock.ResetCounters"));
+	footer->addWidget(reset_);
+	footer->addStretch();
 	if (!version.isEmpty()) {
-		auto *versionLabel = new QLabel(text_("Plugin.Version").arg(version), this);
-		versionLabel->setObjectName(QStringLiteral("pluginVersion"));
-		versionLabel->setTextFormat(Qt::PlainText);
-		auto font = versionLabel->font();
-		font.setPointSizeF(qMax(8.0, font.pointSizeF() - 1.0));
-		versionLabel->setFont(font);
-		auto palette = versionLabel->palette();
-		palette.setColor(QPalette::WindowText, palette.color(QPalette::Disabled, QPalette::WindowText));
-		versionLabel->setPalette(palette);
-		layout->addWidget(versionLabel, 0, Qt::AlignRight);
+		auto *versionLabel = valueLabel(this, "pluginVersion");
+		versionLabel->setText(text_("Plugin.Version").arg(version));
+		versionLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+		footer->addWidget(versionLabel);
 	}
+	layout->addLayout(footer);
 	connect(gear, &QToolButton::clicked, this, &RestreamDock::managementRequested);
 	connect(reset_, &QPushButton::clicked, this, &RestreamDock::resetStatistics);
 	connect(&stateStore_, &StateStore::obsStateChanged, this, &RestreamDock::refreshObservations);
@@ -402,11 +597,28 @@ void RestreamDock::refresh()
 	else if (sample.phase == ObsStreamingPhase::Stopped)
 		bitrateStatus = "Dock.ObsNotStreaming";
 	const auto bitRate = sample.bitrate ? bitrate(locale, text_, *sample.bitrate) : text_(bitrateStatus);
-	localStats_->setText(
-		text_("Dock.LocalRates").arg(fps, renderTime, bitRate) + QLatin1Char('\n') +
-		text_("Dock.LocalCounters")
-			.arg(counterText(locale, text_, stats.render), counterText(locale, text_, stats.encode),
-			     counterText(locale, text_, stats.network), bytesText(locale, text_, stats.sent)));
+	std::optional<StatsBaseline::Period> commonPeriod;
+	bool differentPeriods = false;
+	for (const auto *baseline : {&stats.render, &stats.encode, &stats.network, &stats.sent}) {
+		const auto reading = baseline->reading();
+		if (!reading.counters)
+			continue;
+		if (commonPeriod && *commonPeriod != reading.period)
+			differentPeriods = true;
+		commonPeriod = reading.period;
+	}
+	const bool perCounterPeriod = differentPeriods;
+	const auto localRows =
+		tableRow(text_("Dock.FpsLabel"), fps, true) + tableRow(text_("Dock.BitrateLabel"), bitRate, true) +
+		tableRow(text_("Dock.RenderLabel"), renderTime) +
+		tableRow(text_("Dock.RenderDropsLabel"), counterText(locale, text_, stats.render, perCounterPeriod)) +
+		tableRow(text_("Dock.EncodeDropsLabel"), counterText(locale, text_, stats.encode, perCounterPeriod)) +
+		tableRow(text_("Dock.NetworkDropsLabel"), counterText(locale, text_, stats.network, perCounterPeriod)) +
+		tableRow(text_("Dock.SentLabel"), bytesText(locale, text_, stats.sent, perCounterPeriod));
+	localStats_->setText(table(localRows) +
+			     (commonPeriod && !differentPeriods
+				      ? QStringLiteral("<p>%1</p>").arg(text_(periodKey(*commonPeriod)).toHtmlEscaped())
+				      : QString{}));
 	localStats_->setToolTip(text_("Dock.CounterHint"));
 	refreshServer();
 	const bool serverCanReset = std::any_of(stats.outputs.cbegin(), stats.outputs.cend(),
@@ -421,7 +633,8 @@ void RestreamDock::refreshObservations()
 	const auto observedConnection = stateStore_.serverOrigin().isEmpty() ? std::nullopt : std::optional{connection};
 	server_->setConnectionStatus(text_, observedConnection);
 	const auto streamName = stateStore_.selectedStreamName();
-	stream_->setText(streamName.isEmpty() ? text_("Observation.NoData") : streamName);
+	stream_->setText(
+		text_("Dock.SelectedStream").arg(streamName.isEmpty() ? text_("Observation.NoData") : streamName));
 	QStringList notices;
 	if (connection != ConnectionStatus::Connected) {
 		notices.append(text_("Server.NotConnected"));
@@ -435,7 +648,8 @@ void RestreamDock::refreshObservations()
 	notice_->setText(notices.join(QLatin1Char('\n')));
 	notice_->setVisible(!notices.isEmpty());
 	const auto &profile = stateStore_.profileName();
-	profile_->setText(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData"));
+	profile_->setText(
+		text_("Dock.ProfileValue").arg(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData")));
 	const auto &statistics = stateStore_.obsStatistics();
 	if (statistics.observed)
 		streaming_->setStreamingPhase(text_, statistics.phase);
@@ -478,9 +692,20 @@ void RestreamDock::refreshServer()
 	}
 	const auto sessionEvidence = stateStore_.runtimeEvidence(sessionInstance);
 	const auto status = sessionCurrent ? text_(sessionKey(server.session->state)) : noData;
-	session_->setText(!sessionCurrent                 ? text_("Dock.SessionUnavailable").arg(noData)
-			  : server.session->desiredPaused ? text_("Dock.SessionPaused").arg(status)
-							  : status);
+	using Tone = StatusLabel::Tone;
+	const auto sessionTone = !sessionCurrent                                      ? Tone::Neutral
+				 : server.session->state == QStringLiteral("RUNNING") ? Tone::Active
+				 : server.session->state == QStringLiteral("STARTING") ||
+						 server.session->state == QStringLiteral("STOPPING")
+					 ? Tone::Pending
+				 : server.session->state == QStringLiteral("FAILED") ||
+						 server.session->state == QStringLiteral("INTERRUPTED")
+					 ? Tone::Error
+					 : Tone::Neutral;
+	session_->setStatus(!sessionCurrent                 ? noData
+			    : server.session->desiredPaused ? text_("Dock.SessionPaused").arg(status)
+							    : status,
+			    sessionTone);
 
 	int live = 0;
 	int fallback = 0;
@@ -509,7 +734,8 @@ void RestreamDock::refreshServer()
 		sources.append(text_("Dock.NoSourceCount").arg(locale.toString(noSource)));
 	if (unknownSource)
 		sources.append(text_("Dock.UnknownStatus"));
-	groups_->setText(text_("Dock.Groups").arg(sources.isEmpty() ? noData : sources.join(QStringLiteral(" · "))));
+	groups_->setStatus(sources.isEmpty() ? noData : sources.join(QStringLiteral(" · ")),
+			   live > 0 || fallback > 0 ? Tone::Active : Tone::Neutral);
 
 	QString fallbackStatus = noData;
 	if (connected && fresh(server.fallback.availability) && server.fallback.assigned) {
@@ -522,7 +748,8 @@ void RestreamDock::refreshServer()
 		if (!server.fallback.pendingGenerationId.isEmpty())
 			fallbackStatus = text_("Dock.FallbackWithPending").arg(fallbackStatus);
 	}
-	fallback_->setText(text_("Dock.FallbackStatus").arg(fallbackStatus));
+	// READY описывает подготовленный файл, поэтому остаётся нейтральным и не обещает готовую Session.
+	fallback_->setStatus(fallbackStatus, Tone::Neutral);
 	fallback_->setToolTip(text_("Dock.FallbackHint"));
 
 	const auto *input = session && session->input ? &*session->input : nullptr;
@@ -540,6 +767,7 @@ void RestreamDock::refreshServer()
 	const auto inputStatus = inputCurrent && input
 					 ? text_(input->connected ? "Dock.InputConnected" : "Dock.InputDisconnected")
 					 : noData;
+	input_->setStatus(inputStatus, inputCurrent && input && input->connected ? Tone::Active : Tone::Neutral);
 	QStringList inputFormat;
 	if (inputMetricsCurrent && inputMetrics) {
 		const auto &format = inputMetrics->media.format;
@@ -553,9 +781,10 @@ void RestreamDock::refreshServer()
 	const auto ingestBitrate =
 		stats.inputBitrate.display(inputMetrics ? &inputMetrics->media.rates.payloadBitrate : nullptr,
 					   inputMetricsCurrent, true, locale, text_);
-	ingest_->setText(text_("Dock.Input")
-				 .arg(inputStatus, inputFormat.isEmpty() ? noData : inputFormat.join(QLatin1Char(' ')),
-				      ingestFps, ingestBitrate));
+	ingest_->setText(table(tableRow(text_("Dock.FormatLabel"),
+					inputFormat.isEmpty() ? noData : inputFormat.join(QLatin1Char(' '))) +
+			       tableRow(text_("Dock.FpsLabel"), ingestFps) +
+			       tableRow(text_("Dock.BitrateLabel"), ingestBitrate)));
 	bool retained = (stats.inputFps.stale && stats.inputFps.last) ||
 			(stats.inputBitrate.stale && stats.inputBitrate.last);
 
@@ -588,6 +817,14 @@ void RestreamDock::refreshServer()
 			++it;
 	}
 	QStringList outputRows;
+	struct RowValues {
+		QString name;
+		QString status;
+		QString rate;
+		QString details;
+		Tone tone;
+	};
+	QVector<RowValues> rowValues;
 	int streaming = 0;
 	bool complete = sessionCurrent && fresh(server.outputsStatus.availability) && server.outputsStatus.complete;
 	// Сводка «N из M» допустима только при полном составе и известном состоянии каждой строки.
@@ -650,10 +887,42 @@ void RestreamDock::refreshServer()
 		outputRows.append(text_("Dock.OutputRow")
 					  .arg(name, label, currentBitrate, last(cache.reconnects), queue,
 					       last(cache.queueDrops), last(cache.deliveryDrops)));
+		const auto tone = !statusCurrent                                  ? Tone::Neutral
+				  : output->state == QStringLiteral("PUBLISHING") ? Tone::Active
+				  : output->state == QStringLiteral("CONNECTING") ||
+						  output->state == QStringLiteral("RETRYING")
+					  ? Tone::Pending
+				  : output->state == QStringLiteral("FAILED") ? Tone::Error
+									      : Tone::Neutral;
+		rowValues.append(
+			{name, label, currentBitrate,
+			 text_("Dock.OutputDetails")
+				 .arg(last(cache.reconnects), queue, last(cache.queueDrops), last(cache.deliveryDrops)),
+			 tone});
 	}
 	if (outputRows.isEmpty())
 		outputRows.append(noData);
 	updateRows(*outputs_, outputRows);
+	for (int row = 0; row < outputs_->rowCount(); ++row) {
+		const auto index = outputs_->index(row, 0);
+		if (rowValues.isEmpty()) {
+			if (outputList_->indexWidget(index))
+				outputList_->setIndexWidget(index, nullptr);
+			continue;
+		}
+		auto *widget = static_cast<OutputRow *>(outputList_->indexWidget(index));
+		if (!widget) {
+			widget = new OutputRow(text_, outputList_->viewport());
+			outputList_->setIndexWidget(index, widget);
+		}
+		const auto &values = rowValues.at(row);
+		widget->name->setText(values.name);
+		widget->status->setStatus(values.status, values.tone);
+		widget->rate->setText(values.rate);
+		widget->details->setText(values.details);
+		widget->setAccessibleName(outputRows.at(row));
+	}
+	static_cast<OutputList *>(outputList_)->updateHeights();
 	outputSummary_->setText(
 		complete && !rows.isEmpty()
 			? text_("Dock.OutputCount").arg(locale.toString(streaming), locale.toString(rows.size()))

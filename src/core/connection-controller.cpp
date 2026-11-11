@@ -235,7 +235,8 @@ public:
 	}
 
 	// Каждый Output должен принадлежать точной Session и выбранному Stream; дубликат ID отвергает
-	// весь новый состав. Неполный успешный обход сохраняется с complete=false, не как полный нулевой список.
+	// весь результат. При complete=false отсутствие ID в полученной части не подтверждает detach:
+	// обновляем найденные записи, а остальные сохраняем до полного чтения.
 	void readDockOutputs(const DockBatch &batch, const QString &sessionId)
 	{
 		api.getAllOutputs(
@@ -245,14 +246,18 @@ public:
 					return;
 				if (!batch->dirty && result) {
 					QMap<QString, DockOutput> outputs;
+					if (!result.value->complete)
+						outputs = batch->next.outputs;
+					QSet<QString> receivedIds;
 					bool valid = true;
 					for (const auto &output : result.value->items) {
-						if (!validDockId(output.id) || outputs.contains(output.id) ||
+						if (!validDockId(output.id) || receivedIds.contains(output.id) ||
 						    output.sessionId != sessionId ||
 						    output.destination.streamId != batch->selection.streamId) {
 							valid = false;
 							break;
 						}
+						receivedIds.insert(output.id);
 						outputs.insert(output.id, {output.destination.name, output.attached,
 									   output.desiredRunning});
 					}

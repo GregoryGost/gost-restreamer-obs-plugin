@@ -7,6 +7,7 @@
 #include <QEvent>
 #include <QLabel>
 #include <QPalette>
+#include <QPainter>
 
 #include <optional>
 
@@ -18,12 +19,26 @@ namespace gost {
 // Виджет не наблюдает StateStore сам: владелец явно передаёт нужную ось состояния.
 class StatusLabel final : public QLabel {
 public:
+	enum class Tone { Neutral, Active, Pending, Error };
+
 	explicit StatusLabel(QWidget *parent) : QLabel(parent)
 	{
 		setTextFormat(Qt::PlainText);
 		setWordWrap(true);
+		setContentsMargins(12, 0, 0, 0);
 		updateStyle();
 		qApp->installEventFilter(this);
+	}
+
+	void setStatus(const QString &text, Tone tone)
+	{
+		setText(text);
+		const char *names[] = {"neutral", "active", "pending", "error"};
+		setProperty("statusTone", QString::fromLatin1(names[static_cast<int>(tone)]));
+		if (tone_ != tone) {
+			tone_ = tone;
+			updateStyle();
+		}
 	}
 
 	void setConnectionStatus(const TextLookup &text, std::optional<ConnectionStatus> status)
@@ -84,6 +99,16 @@ public:
 	}
 
 protected:
+	void paintEvent(QPaintEvent *event) override
+	{
+		QLabel::paintEvent(event);
+		QPainter painter(this);
+		painter.setRenderHint(QPainter::Antialiasing);
+		painter.setPen(Qt::NoPen);
+		painter.setBrush(indicatorColor_);
+		painter.drawEllipse(QRectF(1, (fontMetrics().height() - 6) / 2.0, 6, 6));
+	}
+
 	bool eventFilter(QObject *watched, QEvent *event) override
 	{
 		if (event->type() == QEvent::ApplicationPaletteChange && watched == qApp)
@@ -91,22 +116,18 @@ protected:
 		return QLabel::eventFilter(watched, event);
 	}
 
-private:
-	enum class Tone { Neutral, Active, Pending, Error };
-
-	void setStatus(const QString &text, Tone tone)
+	void changeEvent(QEvent *event) override
 	{
-		setText(text);
-		if (tone_ != tone) {
-			tone_ = tone;
+		QLabel::changeEvent(event);
+		if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)
 			updateStyle();
-		}
 	}
 
+private:
 	void updateStyle()
 	{
-		// Используется палитра приложения OBS. Меняем stylesheet только при отличии, чтобы повторное
-		// поступление того же статуса не запускало лишние перерасчёты оформления/геометрии.
+		// При смене темы палитра родителя ещё может быть прежней, поэтому берём новую палитру приложения.
+		// Меняем stylesheet только при отличии, чтобы повтор того же статуса не пересчитывал оформление.
 		const auto palette = QApplication::palette();
 		const bool dark = palette.color(QPalette::Window).lightness() < 128;
 		QString color;
@@ -125,12 +146,14 @@ private:
 			break;
 		}
 
+		indicatorColor_ = QColor(color);
 		const auto style = QStringLiteral("font-weight: bold; color: %1;").arg(color);
 		if (style != styleSheet())
 			setStyleSheet(style);
 	}
 
 	Tone tone_ = Tone::Neutral;
+	QColor indicatorColor_;
 };
 
 } // namespace gost
