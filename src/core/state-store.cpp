@@ -14,6 +14,7 @@ constexpr qsizetype MaxRuntimeObservations = 10000;
 
 qsizetype observationCount(const api::RuntimeSession &session)
 {
+	// Учитывается и контейнер Session без observation: создание пустых родителей тоже расходует бюджет.
 	return 1 + (session.observation ? 1 : 0) + session.groups.size() + session.outputs.size() +
 	       session.ffmpeg.size();
 }
@@ -25,6 +26,7 @@ template<class T> api::JsonField<T> present(T value)
 
 bool validIdentity(const QString &value)
 {
+	// Ограничение относится к непрозрачному ключу дерева, а не к формату UUID/числа сервера.
 	return !value.isEmpty() && value.size() <= 4096 && !value.contains(QChar::Null);
 }
 
@@ -302,6 +304,8 @@ void StateStore::setDetails(DetailState details)
 
 void StateStore::markRuntimeStale()
 {
+	// Сначала даём Dock сохранить последние принятые значения. Если пометить их устаревшими раньше
+	// уведомления, отложенное обновление виджета уже не сможет принять их как последнее свежее измерение.
 	emit runtimeAboutToBecomeStale();
 	markStale(runtime_.availability);
 	if (!pendingAnchor_)
@@ -362,6 +366,9 @@ void StateStore::clearServerState(bool preserveDock)
 
 bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription)
 {
+	// next/watermarks/instances остаются локальными до конца проверки: отказ последнего потомка
+	// не должен оставить наполовину заменённый runtime. instanceId уникален во всём дереве,
+	// outputId — внутри Session; повтор конфигурационного groupId допускается для разных исполнений.
 	Q_ASSERT(QThread::currentThread() == thread());
 	if (!validIdentity(anchor.cursor))
 		return false;
@@ -373,6 +380,7 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 			return false;
 		instances.insert(observation.instanceId);
 		auto &lanes = watermarks[observation.instanceId];
+		// У ревизии состояния из снимка нет обещания совпадать с ревизией последующего измерения.
 		lanes.state = observation.revision;
 		if (!observation.state.isEmpty())
 			lanes.evidence.state = RuntimeAvailability::Fresh;
@@ -434,6 +442,10 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 
 bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyChanged)
 {
+	// Для Session и её потомков сначала проверяем форму события и принадлежность исполнения.
+	// Изменения Session и ревизий готовим в копиях, затем проверяем размер всего дерева и только
+	// после этого заменяем рабочие данные, продвигаем cursor и уведомляем UI. Ревизии сравниваются
+	// лишь у одного instanceId и отдельно для state/metrics; порядок непрозрачных cursor не сравнивается.
 	Q_ASSERT(QThread::currentThread() == thread());
 	if (dockTopologyChanged)
 		*dockTopologyChanged = false;
@@ -441,7 +453,9 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		return false;
 	if (event.cursor == runtime_.cursor)
 		return true;
+	// Курсор непрозрачен: равенство обнаруживает повтор, но числовое или лексическое сравнение недопустимо.
 	if (event.owner == QStringLiteral("system")) {
+		// GPU имеет отдельную идентичность/шкалу. Запоздалое removed старого экземпляра не стирает новый.
 		if (!validIdentity(event.observation.instanceId))
 			return false;
 		if (event.kind == QStringLiteral("removed")) {
@@ -490,6 +504,8 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 	if (ffmpegOwner && event.groupInstanceId == instance)
 		return false;
 	for (const auto &existingSession : runtime_.sessions) {
+		// Уже известное исполнение не может сменить тип/Session/родителя под тем же instanceId.
+		// Проверка выполняется до создания недостающих узлов, включая временного родителя FFmpeg.
 		if (existingSession.observation && existingSession.observation->instanceId == instance &&
 		    (!sessionOwner || existingSession.sessionId != event.sessionId))
 			return false;
@@ -535,6 +551,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 	bool lanesChanged = false;
 	QSet<QString> removed;
 	auto removeSession = [&] {
+		// Удаление или замена исполнения Session также удаляет записи ревизий всех его потомков.
 		if (session.observation)
 			removed.insert(session.observation->instanceId);
 		for (const auto &group : session.groups)
@@ -547,6 +564,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		session.sessionId = event.sessionId;
 	};
 	auto removeGroup = [&](const QString &groupInstance) {
+		// Удаляется точный экземпляр группы и его FFmpeg, а не все группы с тем же конфигурационным ID.
 		removed.insert(groupInstance);
 		for (const auto &ffmpeg : session.ffmpeg)
 			if (ffmpeg.groupInstanceId == groupInstance)
@@ -610,6 +628,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			ignored = true;
 		} else {
 			if (found == session.outputs.end()) {
+				// Новое исполнение того же Output вытесняет старое вместе с его ревизиями и подтверждениями свежести.
 				for (const auto &old : session.outputs)
 					if (old.outputId == event.outputId)
 						removed.insert(old.instanceId);
@@ -632,6 +651,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		} else {
 			auto parent = findInstance(session.groups, event.groupInstanceId);
 			if (parent == session.groups.end()) {
+				// Событие дочернего FFmpeg может прийти раньше родителя; известен только ID экземпляра группы.
 				api::RuntimeGroup unknown;
 				unknown.instanceId = event.groupInstanceId;
 				session.groups.push_back(std::move(unknown));
@@ -648,8 +668,12 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		}
 	}
 	if (!ignored) {
+		// Принятое событие может не менять поле: старая ревизия state/metrics всё равно потребляется,
+		// но не обновляет evidence. Input и attempt являются границами жизненного цикла и сбрасывают
+		// соответствующую телеметрию независимо от ранее большой ревизии metrics.
 		lanesChanged = true;
 		if (attemptEvent) {
+			// Новая попытка сбрасывает наблюдения FFmpeg независимо от прежней численной ревизии.
 			ffmpeg->metrics = {};
 			ffmpeg->state.clear();
 			ffmpeg->observedAt = {};
@@ -658,6 +682,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			lanes.evidence.metrics = RuntimeAvailability::Unknown;
 			lanes.evidence.state = RuntimeAvailability::Unknown;
 		} else if (inputEvent) {
+			// Жизненный цикл входа использует revision=0 и начинает новую последовательность измерений.
 			if (event.observation.revision != 0)
 				return false;
 			session.input = event.input;
@@ -703,6 +728,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			count += observationCount(existingSession);
 	if (count > MaxRuntimeObservations)
 		return false;
+	// Только полностью проверенная копия заменяет Session; отказ выше не продвигает курсор и ревизии.
 	if (eraseSession)
 		runtime_.sessions.remove(event.sessionId);
 	else if (!ignored || runtime_.sessions.contains(event.sessionId))

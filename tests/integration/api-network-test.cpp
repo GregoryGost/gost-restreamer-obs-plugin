@@ -20,6 +20,8 @@
 using namespace gost::api;
 
 namespace {
+// Фабрика считает реальное обращение к выбору proxy, затем разрешает прямое соединение.
+// Это позволяет отделить обход фабрики собственным менеджером от случайно успешной сети.
 class CountingProxyFactory final : public QNetworkProxyFactory {
 public:
 	explicit CountingProxyFactory(std::atomic_int &queries) : queries_(queries) {}
@@ -34,6 +36,9 @@ private:
 };
 } // namespace
 
+// Интеграция настоящего Qt Network с одноразовой HTTP-фикстурой, без сервера рестримера и OBS.
+// QTRY_* обрабатывают цикл событий Qt до наблюдаемого результата/запроса; их timeout — предел теста,
+// а не обещанная задержка продукта. Все обработчики и сервер работают в том же потоке приложения теста.
 class ApiNetworkTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -84,6 +89,9 @@ void ApiNetworkTest::everyListPreservesOpaqueCursorAndFilters_data()
 
 void ApiNetworkTest::everyListPreservesOpaqueCursorAndFilters()
 {
+	// Одинаковая проверка проходит все верхние и вложенные семейства. Курсор включает разделители,
+	// Unicode и уже закодированный процент: повторное чтение проверяет точное значение после одного
+	// URL-декодирования, а не просто наличие query. Вторая страница с пустым cursor завершает обход.
 	QFETCH(int, family);
 	QFETCH(QString, path);
 	HttpServer server;
@@ -213,6 +221,8 @@ void ApiNetworkTest::incompleteWalkCannotReportSuccess_data()
 }
 void ApiNetworkTest::incompleteWalkCannotReportSuccess()
 {
+	// «Успех» здесь означает полноту списка. Предел общего обхода может вернуть успешную часть,
+	// но complete обязан остаться false; цикл cursor/ошибка страницы не должны выглядеть полным списком.
 	QFETCH(int, failure);
 	HttpServer server;
 	QVERIFY(server.listen());
@@ -261,6 +271,7 @@ void ApiNetworkTest::listBodyLimitsPreserveOnlyWholePages()
 	};
 	Limits limits;
 	limits.pageWalkBytes = first.size() + second.size() - 1;
+	// Разница в один байт отделяет ошибку отдельного тела от допустимого частичного результата всего обхода.
 	limits.restBodyBytes = second.size() - int(individualOverflow);
 	APIClient api(limits);
 	api.configure(server.origin(), {1, 1});
@@ -298,6 +309,8 @@ void ApiNetworkTest::httpProblemsAndDecodeFailures_data()
 }
 void ApiNetworkTest::httpProblemsAndDecodeFailures()
 {
+	// Ошибка HTTP отличается от неверного JSON при 200. Синтетические секреты в Problem могут
+	// сохраниться в структурированных данных, но не должны попадать в общее пользовательское message.
 	QFETCH(int, status);
 	QFETCH(QByteArray, body);
 	QFETCH(int, kind);
@@ -325,6 +338,9 @@ void ApiNetworkTest::httpProblemsAndDecodeFailures()
 
 void ApiNetworkTest::cancellationAndOldContextAreObservable()
 {
+	// Сервер удерживает два ответа и выпускает старый после configure. Только новый контекст может
+	// получить успешный DTO. Для cancelAll оракул — закрытие сокета; обязательный callback Cancelled
+	// не требуется контрактом, поэтому отсутствие уведомления также допустимо.
 	HttpServer server;
 	QVERIFY(server.listen());
 	APIClient api;
@@ -379,6 +395,7 @@ void ApiNetworkTest::receiverDestructionSuppressesCallback()
 	QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 1, 2000);
 	receiver.reset();
 	HttpServer::reply(server.requests.front(), R"({"status":"ready","reason":""})");
+	// Новый успешный запрос служит барьером обработки событий после уничтожения прежнего получателя.
 	bool barrier = false;
 	api.getReady(this, [&](auto, auto) { barrier = true; });
 	QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 2, 2000);
@@ -396,6 +413,8 @@ void ApiNetworkTest::deadlinesAndBodyBudgets_data()
 }
 void ApiNetworkTest::deadlinesAndBodyBudgets()
 {
+	// В двух строках сервер намеренно вообще не отвечает, а независимые таймеры имеют разные сроки.
+	// Третья строка отвечает сразу и пересекает только размер тела; таймаут не должен маскировать Limit.
 	QFETCH(int, failure);
 	HttpServer server;
 	QVERIFY(server.listen());
@@ -418,6 +437,8 @@ void ApiNetworkTest::deadlinesAndBodyBudgets()
 
 void ApiNetworkTest::activeAndQueuedRequestsAreBounded()
 {
+	// Три GET при одном активном и одном ожидающем дают ровно один отказ допуска. Последовательная
+	// выдача ответов проверяет освобождение слота и факт, что третий запрос не отправлялся на сервер.
 	HttpServer server;
 	QVERIFY(server.listen());
 	Limits limits;
@@ -458,6 +479,8 @@ void ApiNetworkTest::sseValidatesStatusMediaAndIdentity_data()
 }
 void ApiNetworkTest::sseValidatesStatusMediaAndIdentity()
 {
+	// Каждая строка ломает один слой: статус, MIME, SSE event, SSE id или JSON. Ни один плохой кадр
+	// не должен дойти до потребителя/подтвердить cursor; несовместимость события требует повторной синхронизации.
 	QFETCH(int, failure);
 	HttpServer server;
 	QVERIFY(server.listen());
@@ -494,6 +517,8 @@ void ApiNetworkTest::sseValidatesStatusMediaAndIdentity()
 
 void ApiNetworkTest::sseAcknowledgesOnlyAppliedEvents()
 {
+	// Первый обработчик принимает событие, второй возвращает false. Курсор проверяется после
+	// завершения callback, чтобы не принять полученный из сети id за уже применённое наблюдение.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [](const auto &request) {
@@ -518,6 +543,7 @@ void ApiNetworkTest::sseAcknowledgesOnlyAppliedEvents()
 	QTRY_COMPARE_WITH_TIMEOUT(received, 1, 2000);
 	QCOMPARE(client.confirmedCursor(), QStringLiteral("opaque-z"));
 	accept = false;
+	// Порядок курсоров намеренно не лексический: отвергнутое событие не меняет подтверждённую позицию.
 	server.requests.front().socket->write(
 		fixture::frame(fixture::event(QStringLiteral("state"), QStringLiteral("opaque-a"))));
 	QTRY_COMPARE_WITH_TIMEOUT(received, 2, 2000);
@@ -528,6 +554,8 @@ void ApiNetworkTest::sseAcknowledgesOnlyAppliedEvents()
 
 void ApiNetworkTest::sseControlForcesSnapshotWithoutFollowingUrl()
 {
+	// snapshot_url намеренно указывает на произвольный путь: управляющий кадр должен лишь сообщить
+	// requiresSnapshot, а выбор закреплённого маршрута снимка принадлежит контроллеру.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [](const auto &request) {
@@ -557,6 +585,8 @@ void ApiNetworkTest::sseControlForcesSnapshotWithoutFollowingUrl()
 
 void ApiNetworkTest::sseHasIndependentLifetimeAndShutdown()
 {
+	// Событие приходит позже REST deadline=1 мс, но внутри собственного SSE idle. Успех доказывает
+	// независимость бюджетов. После shutdown следующий оборот Qt не должен доставить записанный хвост.
 	HttpServer server;
 	QVERIFY(server.listen());
 	Limits limits;
@@ -594,6 +624,7 @@ void ApiNetworkTest::sseHasIndependentLifetimeAndShutdown()
 
 void ApiNetworkTest::maximumDocumentsMeasureEventLoopGap()
 {
+	// Измеряется наблюдаемый разрыв цикла Qt на предельных документах; жёсткая гарантия задержки не утверждается.
 	HttpServer server;
 	QVERIFY(server.listen());
 	Limits limits;
@@ -653,6 +684,9 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers_data()
 
 void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 {
+	// Один ID содержит пробел, косую черту, разделители параметров и фрагмента URL, '%' и кириллицу. Сравнивается
+	// исходный адрес в строке запроса, включая оба сегмента вложенных маршрутов; иначе QUrl мог бы скрыть
+	// ошибку нормализации при чтении уже разобранного пути. Значения DTO проверяются независимо.
 	QFETCH(int, family);
 	QFETCH(QByteArray, path);
 	HttpServer server;
@@ -788,6 +822,8 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 
 void ApiNetworkTest::sseYieldsBetweenBoundedBatches()
 {
+	// Восемь кадров уже доступны одним ответом, бюджет равен двум. singleShot из первого callback
+	// обязан выполниться до третьей доставки: это барьер возврата управления Qt, без измерения скорости CPU.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [](const auto &request) {
@@ -821,6 +857,8 @@ void ApiNetworkTest::sseYieldsBetweenBoundedBatches()
 
 void ApiNetworkTest::heartbeatKeepsTransportAliveWithoutInventingEvents()
 {
+	// Не менее восьми heartbeat занимают дольше одного idle=250 мс. Живой транспорт не должен
+	// породить ни прикладное событие, ни ошибку, ни продвижение cursor при отсутствии data.
 	HttpServer server;
 	QVERIFY(server.listen());
 	QTimer heartbeats;
@@ -857,6 +895,8 @@ void ApiNetworkTest::heartbeatKeepsTransportAliveWithoutInventingEvents()
 
 void ApiNetworkTest::replacingSubscriptionDuringDeliveryDiscardsOldContext()
 {
+	// Новый subscribe выполняется синхронно из старого EventHandler. В старом ответе ещё семь кадров:
+	// они и возвращённое true старого обработчика не вправе изменить новую подписку/confirmed cursor.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [&](const auto &request) {
@@ -881,6 +921,7 @@ void ApiNetworkTest::replacingSubscriptionDuringDeliveryDiscardsOldContext()
 		[&](auto context, const auto &) {
 			contextsValid = contextsValid && context == RequestContext{1, 1};
 			++oldDeliveries;
+			// Новая подписка создаётся внутри доставки: остаток старого пакета и его подтверждение должны исчезнуть.
 			client.subscribe(
 				server.origin(), QStringLiteral("new-anchor"), {2, 1}, this,
 				[&](auto newContext, const auto &) {
@@ -901,6 +942,9 @@ void ApiNetworkTest::replacingSubscriptionDuringDeliveryDiscardsOldContext()
 
 void ApiNetworkTest::explicitServerConnectionBypassesApplicationProxyFactory()
 {
+	// Петлевой интерфейс может обходить прокси сам по правилам Qt, поэтому используется собственный частный IPv4
+	// адрес и контрольный менеджер. Глобальная фабрика меняется только внутри отдельного тестового
+	// процесса и восстанавливается qScopeGuard при любом выходе. Нет подходящего адреса — QSKIP.
 	QHostAddress localAddress;
 	for (const auto &address : QNetworkInterface::allAddresses())
 		if (address.protocol() == QAbstractSocket::IPv4Protocol && address.isPrivateUse() &&
@@ -933,6 +977,7 @@ void ApiNetworkTest::explicitServerConnectionBypassesApplicationProxyFactory()
 	};
 	queries = 0;
 	{
+		// Контрольный клиент доказывает, что фабрика действительно активна перед проверкой собственных клиентов.
 		QNetworkAccessManager control;
 		auto *reply =
 			control.get(QNetworkRequest(origin.resolved(QUrl(QStringLiteral("/api/v1/health/ready")))));

@@ -1,3 +1,4 @@
+# QApplication работает без нативного окна OBS; проверку загрузки DLL, DPI и реальной темы это не заменяет.
 add_executable(gost-restreamer-lifecycle-test unit/plugin-lifecycle-test.cpp fixtures/fake-frontend.hpp)
 target_link_libraries(gost-restreamer-lifecycle-test PRIVATE gost-restreamer-core Qt6::Test)
 target_include_directories(gost-restreamer-lifecycle-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -21,10 +22,14 @@ set_tests_properties(
   PROPERTIES LABELS "backend;readonly" SKIP_RETURN_CODE 77 TIMEOUT 15
 )
 
+# И явные временные каталоги, и TEMP/TMP дочерних тестов остаются внутри рабочего каталога проекта.
 set(GOST_TEST_WORKSPACE_DIR "${PROJECT_SOURCE_DIR}/build/test-workspace")
 file(MAKE_DIRECTORY "${GOST_TEST_WORKSPACE_DIR}" "${PROJECT_SOURCE_DIR}/build/tmp")
 
 function(gost_add_offline_test name source)
+  # name задаёт согласованные имена исполняемого файла и CTest, source — существующий сценарий QTest.
+  # Каждый тест запускается отдельным процессом: глобальные прокси и палитра Qt не разделяются между ними.
+  # Таймаут ограничивает зависание сценария, но не является порогом производительности продукта.
   add_executable(gost-restreamer-${name}-test "${source}")
   target_link_libraries(gost-restreamer-${name}-test PRIVATE gost-restreamer-core Qt6::Test)
   target_include_directories(gost-restreamer-${name}-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -42,6 +47,8 @@ gost_add_offline_test(connection integration/connection-controller-test.cpp)
 gost_add_offline_test(stats-baseline unit/stats-baseline-test.cpp)
 
 foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection stats-baseline)
+  # Определения компилятора закрепляют пути фикстур/локализаций и явных временных файлов.
+  # ENVIRONMENT задаётся целиком для каждого теста, включая lifecycle: TEMP/TMP не наследуют AppData.
   target_compile_definitions(
     gost-restreamer-${name}-test
     PRIVATE
@@ -59,6 +66,7 @@ endforeach()
 if(NOT IS_DIRECTORY "${GOST_QT_TEST_ROOT}/bin")
   message(FATAL_ERROR "Не задан проверенный runtime Qt Test 6.11.1.")
 endif()
+# Тестовый Qt используется только процессами CTest; его библиотеки не включаются в поставку плагина.
 set_tests_properties(
   gost-restreamer.lifecycle gost-restreamer.backend-readonly
   gost-restreamer.dto gost-restreamer.sse gost-restreamer.state gost-restreamer.settings

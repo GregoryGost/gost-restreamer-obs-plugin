@@ -1,4 +1,25 @@
 #Requires -Version 7.0
+<#
+.SYNOPSIS
+Проверяет загрузку и базовый интерфейс плагина двумя запусками отдельной OBS 33.0.1.
+.DESCRIPTION
+Требуется свежая копия OBS внутри рабочего каталога проекта без config и уже запущенного экземпляра из этого пути.
+Создаются пустые профиль/сцена и локализованная конфигурация, затем запускаются OBS и отдельный
+помощник UI Automation. Проверяются загрузка и завершение, идентичность DLL, повторное открытие окна
+и сохранение Dock между двумя запусками. Результаты проверок и вывод помощника остаются в test-results
+внутри каталога конфигурации OBS; собственные журналы OBS находятся в соседнем каталоге logs.
+Медиатракт должен оставаться неактивным; этот сценарий не подтверждает эфир или серверные команды.
+.PARAMETER ObsRoot
+Существующий каталог подготовленной копии OBS и плагина внутри рабочего каталога проекта без ссылок.
+.PARAMETER Mode
+Portable использует собственный config/ и plugins/. Normal читает ProgramData и вызывает отдельные
+проверки системной раскладки; при ограничении проверок рабочим каталогом проекта допустим только Portable.
+.PARAMETER Locale
+Локализация ru-RU или en-US для новой конфигурации; каждая требует отдельной свежей копии.
+.PARAMETER StartupTimeoutSeconds
+Бюджет ожидания журнала готовности и единственного главного окна, не задержка, после которой
+готовность предполагается без проверки. ShutdownTimeoutSeconds ограничивает штатное завершение.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $ObsRoot,
@@ -49,6 +70,9 @@ public static class ObsFixtureWindowControl {
 }
 
 function Request-OwnedObsClose {
+    # Использует идентичность последнего собственного запуска и его HWND. Возвращает факт отправки WM_CLOSE,
+    # а завершение/код выхода отдельно ожидает вызывающий блок. Подмена PID считается ошибкой, не основанием принудительно завершать процесс.
+    # PID может быть переиспользован, поэтому путь и время запуска повторно сверяются перед закрытием окна.
     $identity = [Diagnostics.Process]::GetProcessById($process.Id)
     try {
         if ($identity.MainModule.FileName -ne $executable -or $identity.StartTime.ToUniversalTime().Ticks -ne $obsStartTicks) {
@@ -61,6 +85,8 @@ function Request-OwnedObsClose {
 }
 
 function Assert-NormalPluginPath {
+    # Вспомогательная граница только ветви Normal: проверяет конкретное дерево normalPluginRoot
+    # и отсутствие ссылок во всех предках. Эта проверка не делает системный режим изолированным рабочим каталогом проекта.
     param([Parameter(Mandatory)][string] $Path)
     $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     if ($resolved -ne $normalPluginRoot -and
@@ -78,6 +104,8 @@ function Assert-NormalPluginPath {
 }
 
 function Assert-NormalPluginArtifact {
+    # Перед системным запуском сверяет точный хеш и три ожидаемых файла временного размещения.
+    # Не устанавливает артефакт и не разрешает использование Normal при запрете системных путей.
     $null = Assert-NormalPluginPath $normalPluginRoot
     if ((Get-FileHash -LiteralPath $binary).Hash -ne $expectedBinaryHash) {
         throw 'Временная DLL ProgramData отличается от выбранной сборки.'
@@ -96,6 +124,9 @@ function Assert-NormalPluginArtifact {
 }
 
 function Invoke-NativeFolderPreflight {
+    # Запускает ограниченный скрытый дочерний процесс с той же средой, что получит Normal OBS.
+    # Проверяет реальные SHGetFolderPathW, поскольку замена переменных среды сама по себе не доказывает
+    # переназначение системных каталогов через Win32 API. Вывод/ошибки сохраняются; несовпадение прекращает запуск.
     param([Parameter(Mandatory)][Diagnostics.ProcessStartInfo] $ObsStartInfo)
     $command = @'
 $ErrorActionPreference = 'Stop'
@@ -192,6 +223,8 @@ if (Test-Path -LiteralPath $portableConfig) {
 }
 
 function Assert-NormalFixtureLayout {
+    # Ветка Normal должна исключить portable-маркеры и посторонние системные плагины до запуска.
+    # Помощник читает ProgramData и не относится к разрешённой проверке только внутри рабочего каталога проекта.
     foreach ($marker in @('portable_mode', 'obs_portable_mode', 'portable_mode.txt', 'obs_portable_mode.txt', 'plugins', 'obs-plugins')) {
         if (Test-Path -LiteralPath (Join-Path $root $marker)) { throw 'Обычная тестовая копия содержит portable-маркер или локальный каталог плагинов.' }
     }
@@ -267,6 +300,9 @@ $expectedDockLeft = 0
 $expectedDockTop = 0
 $dockPositionKnown = $false
 foreach ($launch in @(1, 2)) {
+    # Оба запуска используют одну созданную конфигурацию. Первый фиксирует видимость и положение
+    # реально перемещённого Dock, второй проверяет их восстановление. Два независимых новых профиля
+    # не доказывали бы сохранение состояния.
     if ($launch -eq 2 -and -not $dockPositionKnown) { throw 'Не сохранено проверенное исходное положение Dock.' }
     if (Get-ChildItem -LiteralPath $root -Recurse -Force | Where-Object {
         ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
@@ -304,6 +340,8 @@ foreach ($launch in @(1, 2)) {
         Assert-NormalPluginArtifact
     }
     $launchStartedUtc = [DateTime]::UtcNow
+    # Ищется журнал именно текущего запуска плюс собственный HWND. Один старый журнал запуска или живой PID
+    # не подтверждает, что проверяемая DLL загрузилась и UI уже доступен.
     $process = [Diagnostics.Process]::Start($startInfo)
     $obsStartTicks = $process.StartTime.ToUniversalTime().Ticks
     $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
@@ -335,6 +373,7 @@ $ErrorActionPreference = 'Stop'
 $source = [IO.File]::ReadAllText($env:GOST_UIA_SCRIPT, [Text.Encoding]::UTF8)
 & ([scriptblock]::Create($source)) -ObsProcessId ([int]$env:GOST_UIA_PID) -ExpectedExecutable $env:GOST_UIA_EXECUTABLE -ExpectedStartTicks ([long]$env:GOST_UIA_START) -MainWindowHandle ([long]$env:GOST_UIA_WINDOW) -WorkspaceRoot $env:GOST_UIA_ROOT -ExpectedPluginPath $env:GOST_UIA_PLUGIN -ExpectedPluginSHA256 $env:GOST_UIA_PLUGIN_SHA -Locale $env:GOST_UIA_LOCALE -Launch ([int]$env:GOST_UIA_LAUNCH) -ExpectedDockLeft ([int]$env:GOST_UIA_DOCK_LEFT) -ExpectedDockTop ([int]$env:GOST_UIA_DOCK_TOP)
 '@
+    # Нативная UI Automation выполняется отдельным процессом с явно переданной идентичностью тестового OBS.
     $uiStart = [Diagnostics.ProcessStartInfo]::new()
     $uiStart.FileName = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($uiCommand))
@@ -366,6 +405,8 @@ $source = [IO.File]::ReadAllText($env:GOST_UIA_SCRIPT, [Text.Encoding]::UTF8)
     $uiProcess = [Diagnostics.Process]::Start($uiStart)
     try {
         $uiOutputTask = $uiProcess.StandardOutput.ReadToEndAsync()
+        # Оба канала читаются асинхронно до WaitForExit, чтобы заполненный stderr/stdout не заблокировал
+        # помощника. После жёсткого бюджета завершается только собственный запущенный процесс помощника.
         $uiErrorTask = $uiProcess.StandardError.ReadToEndAsync()
         $uiTimedOut = -not $uiProcess.WaitForExit(50000)
         if ($uiTimedOut) {
@@ -410,6 +451,7 @@ $source = [IO.File]::ReadAllText($env:GOST_UIA_SCRIPT, [Text.Encoding]::UTF8)
     if ($process.ExitCode -ne 0) { throw 'OBS завершился с ошибкой.' }
     $logText = Get-Content -LiteralPath $log.FullName -Raw -Encoding utf8
     if ($logText -notmatch '==== Shutting down') { throw 'Не найдено подтверждение штатного завершения OBS.' }
+    # Пустая конфигурация проверяет оболочку плагина; незапрошенная активность медиатракта делает результат неверным.
     if ($logText -match '==== (Streaming|Recording|Replay Buffer|Virtual Camera) Start' -or
         $logText -match '\[Loaded global audio device\]' -or $logText -match '\[(?:WASAPISource|DShow|window-capture|game-capture|monitor-capture)') {
         throw 'В пустой тестовой конфигурации обнаружена активность медиатракта.'
@@ -427,6 +469,8 @@ $source = [IO.File]::ReadAllText($env:GOST_UIA_SCRIPT, [Text.Encoding]::UTF8)
     $success = $true
     } finally {
     if ($process) {
+        # Даже при ошибке сначала запрашивается штатное закрытие проверенных PID, пути и времени старта.
+        # Принудительное завершение — очистка отказавшей тестовой среды, оно не превращает проверку в успешную.
         if (-not $process.HasExited) {
             $null = Request-OwnedObsClose
             if (-not $process.WaitForExit(3000)) {

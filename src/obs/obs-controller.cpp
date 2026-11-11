@@ -34,6 +34,7 @@ void OBSController::handleEvent(FrontendEvent event, bool reliableProfile)
 		return;
 	}
 	if (event == FrontendEvent::FinishedLoading && lifecycle_ == Lifecycle::AwaitingFrontend) {
+		// До готовности интерфейса OBS допустима регистрация плагина, но чтение профиля и выхода отложено.
 		lifecycle_ = Lifecycle::Ready;
 		statsTimer_.start();
 	}
@@ -49,6 +50,7 @@ void OBSController::handleEvent(FrontendEvent event, bool reliableProfile)
 	    event == FrontendEvent::ProfileListChanged) {
 		ProfileDescriptor descriptor;
 		descriptor.name = profile;
+		// При перенесённом событии путь и перечень профилей уже могут относиться к другому переходу.
 		if (reliableProfile) {
 			descriptor.path = frontend_.currentProfilePath();
 			descriptor.inventory = frontend_.profiles();
@@ -61,7 +63,10 @@ void OBSController::handleEvent(FrontendEvent event, bool reliableProfile)
 
 void OBSController::shutdown() noexcept
 {
+	// До releaseStatistics переводим lifecycle_ в Stopped. Повторный shutdown, в том числе из
+	// деструктора после EXIT, завершится без вызова адаптера: Frontend API к этому моменту уже может быть недоступен.
 	Q_ASSERT(QThread::currentThread() == thread());
+	// Состояние Stopped устанавливается и до первого FinishedLoading, исключая поздний запуск таймера.
 	if (std::exchange(lifecycle_, Lifecycle::Stopped) != Lifecycle::Ready)
 		return;
 	statsTimer_.stop();

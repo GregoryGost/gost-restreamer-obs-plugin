@@ -27,6 +27,8 @@ bool write(const QString &path, const QByteArray &bytes)
 }
 } // namespace
 
+// Все файлы создаются через WorkspaceTemp внутри проекта. Тесты читают фактический JSON после
+// уничтожения/повторного создания SettingsStore: состояние RAM не выдаётся за успешную персистентность.
 class SettingsStoreTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -82,6 +84,8 @@ void SettingsStoreTest::invalidOrigins()
 
 void SettingsStoreTest::persistsOnlyPreferencesAndPairBindings()
 {
+	// Один UUID имеет разные Stream на двух origin; DNS-имя и IP намеренно не объединяются.
+	// Содержимое файла отдельно проверяет границу хранения: секреты/runtime/baseline туда не входят.
 	WorkspaceTemp temp(QStringLiteral("settings"));
 	QVERIFY(temp.isValid());
 	const auto file = temp.filePath(QStringLiteral("settings.json"));
@@ -129,6 +133,8 @@ void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding_data()
 
 void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding()
 {
+	// Сначала читается точный старый документ без переписывания. Только изменение предпочтения
+	// переводит файл в формат v2; повторный load должен сохранить и новый лимит, и прежнюю привязку.
 	QFETCH(int, retries);
 	WorkspaceTemp temp(QStringLiteral("retry-preference"));
 	QVERIFY(temp.isValid());
@@ -163,6 +169,8 @@ void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding()
 
 void SettingsStoreTest::normalRenamePreservesEveryServerAcrossRestart()
 {
+	// Проверяется смена и имени, и locator без ProfileChanging, затем отдельный ProfileRenamed.
+	// Сохранность одного UUID и обеих привязок проверяется также после нового экземпляра хранилища.
 	WorkspaceTemp temp(QStringLiteral("rename"));
 	QVERIFY(temp.isValid());
 	const auto file = temp.filePath(QStringLiteral("settings.json"));
@@ -177,6 +185,7 @@ void SettingsStoreTest::normalRenamePreservesEveryServerAcrossRestart()
 		uuid = initial.uuid;
 		QVERIFY(settings.setSelectedStream(QStringLiteral("http://server-a"), uuid, QStringLiteral("a")));
 		QVERIFY(settings.setSelectedStream(QStringLiteral("https://server-b"), uuid, QStringLiteral("b")));
+		// Воспроизводится порядок OBS: ProfileChanged с новым каталогом предшествует ProfileRenamed.
 		const auto renamed = settings.observeProfile(
 			FrontendEvent::ProfileChanged,
 			profile(QStringLiteral("New"), QStringLiteral("profiles/new"), {QStringLiteral("New")}));
@@ -205,6 +214,8 @@ void SettingsStoreTest::normalRenamePreservesEveryServerAcrossRestart()
 
 void SettingsStoreTest::switchesAndDuplicatesHaveIndependentIdentity()
 {
+	// Явное переключение с ProfileChanging и появление копии при ещё существующем оригинале нельзя
+	// принять за переименование. Возврат к известному locator обязан восстановить его собственную привязку.
 	WorkspaceTemp temp(QStringLiteral("profiles"));
 	QVERIFY(temp.isValid());
 	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
@@ -237,6 +248,8 @@ void SettingsStoreTest::switchesAndDuplicatesHaveIndependentIdentity()
 
 void SettingsStoreTest::removedLocatorDoesNotIdentifyRecreatedProfile()
 {
+	// Реестр сначала получает достоверное исчезновение A, пока активен B. Позже то же имя/путь A
+	// появляются заново: прежний UUID уже удалён и не должен вернуть старый Stream новому профилю.
 	WorkspaceTemp temp(QStringLiteral("recreated"));
 	QVERIFY(temp.isValid());
 	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
@@ -258,6 +271,8 @@ void SettingsStoreTest::removedLocatorDoesNotIdentifyRecreatedProfile()
 
 void SettingsStoreTest::uncertainTransitionDoesNotMergeBindings()
 {
+	// Ненадёжный descriptor моделирует потерю снимка в момент перехода. UUID нового профиля
+	// не определяется, а старая привязка сохраняется у прежнего UUID без переноса по похожим атрибутам.
 	WorkspaceTemp temp(QStringLiteral("uncertain"));
 	QVERIFY(temp.isValid());
 	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
@@ -286,6 +301,8 @@ void SettingsStoreTest::corruptAndUnknownSchemaAreNeverOverwritten_data()
 
 void SettingsStoreTest::corruptAndUnknownSchemaAreNeverOverwritten()
 {
+	// После отказа load вызываются обычный метод изменения и явный save. Побайтовое сравнение файла
+	// доказывает блокировку последующих записей, включая неизвестную схему с пользовательскими данными.
 	QFETCH(QByteArray, bytes);
 	WorkspaceTemp temp(QStringLiteral("corrupt"));
 	QVERIFY(temp.isValid());
@@ -301,6 +318,7 @@ void SettingsStoreTest::corruptAndUnknownSchemaAreNeverOverwritten()
 
 void SettingsStoreTest::writeFailureKeepsRamAndOriginalFile()
 {
+	// Запрет записи относится к файлу внутри проекта; проверяются сохранность файла и новые значения в памяти.
 	WorkspaceTemp temp(QStringLiteral("atomic"));
 	QVERIFY(temp.isValid());
 	const auto file = temp.filePath(QStringLiteral("settings.json"));
@@ -325,6 +343,8 @@ void SettingsStoreTest::writeFailureKeepsRamAndOriginalFile()
 
 void SettingsStoreTest::emptyPathHasNoImplicitFallback()
 {
+	// Пустой путь не должен незаметно увести тест или продукт в AppData/рабочий каталог по умолчанию.
+	// Ошибка остаётся видимой, рабочее изменение RAM отмечено unsaved.
 	SettingsStore settings(QString{});
 	settings.setAutoConnect(false);
 	QVERIFY(!settings.save());

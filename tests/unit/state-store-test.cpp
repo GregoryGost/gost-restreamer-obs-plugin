@@ -19,6 +19,8 @@ Observation observed(const QString &id, quint64 revision, const QString &state)
 }
 Anchor anchor()
 {
+	// Намеренно разные и большие ревизии state у Session/Group/Output/FFmpeg. Последующие
+	// metrics с revision=1 обязаны приниматься по независимой шкале, а не отсекаться снимком.
 	RuntimeSession session;
 	session.sessionId = QStringLiteral("session");
 	session.observation = known(observed(QStringLiteral("epoch:1"), 10, QStringLiteral("READY")));
@@ -68,6 +70,8 @@ RuntimeEvent runtimeEvent(QString owner, QString kind, QString instance, quint64
 }
 } // namespace
 
+// Синхронные проверки редуктора: DTO создаются по значению, события подаются в точном порядке.
+// Проверяются состав дерева, сохранённые значения и подтверждённый cursor, а не число вызовов внутренних методов.
 class StateStoreTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -88,6 +92,7 @@ private slots:
 
 void StateStoreTest::anchorDoesNotSeedMetricsRevision()
 {
+	// Ревизия состояния 100 из снимка не должна отклонить первое измерение с независимой ревизией 1.
 	StateStore state;
 	QSignalSpy changed(&state, &StateStore::runtimeStateChanged);
 	QVERIFY(changed.isValid());
@@ -108,6 +113,8 @@ void StateStoreTest::anchorDoesNotSeedMetricsRevision()
 
 void StateStoreTest::stateAndMetricsHaveIndependentWatermarks()
 {
+	// metrics=300 не мешает state=101 после anchor state=100. Затем metrics=299 потребляется
+	// с продвижением cursor, но не откатывает измерение 900 и не меняет независимое состояние.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	auto metrics =
@@ -134,6 +141,8 @@ void StateStoreTest::stateAndMetricsHaveIndependentWatermarks()
 
 void StateStoreTest::firstObservationCreatesOnlyKnownLane()
 {
+	// Первое событие с метриками неизвестного Output создаёт контейнеры Session и Output, но не задаёт
+	// состояние Session или PUBLISHING. Наличие узла ещё не означает, что его состояние наблюдалось.
 	StateStore state;
 	Anchor empty{QStringLiteral("opaque-start"), {}, {FieldState::Null, {}}};
 	QVERIFY(state.installAnchor(empty));
@@ -151,6 +160,8 @@ void StateStoreTest::firstObservationCreatesOnlyKnownLane()
 
 void StateStoreTest::inputLifecycleZeroClearsPriorMetrics()
 {
+	// Событие жизненного цикла с revision=0 является границей входа, даже после metrics=40. Новый metrics=1
+	// должен приниматься, а до него старые 100 кадров не должны оставаться доступным измерением.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	auto metrics =
@@ -181,6 +192,8 @@ void StateStoreTest::inputLifecycleZeroClearsPriorMetrics()
 
 void StateStoreTest::attemptClearsObservationAndMetricsRegardlessOfRevision()
 {
+	// Попытка FFmpeg сбрасывает и текст состояния, и метрики. Следующее измерение с малой ревизией
+	// доказывает очистку границы ревизий, а не только визуальное скрытие старых полей.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	auto attempt = runtimeEvent(QStringLiteral("ffmpeg"), QStringLiteral("attempt"), QStringLiteral("epoch:4"), 80);
@@ -200,6 +213,8 @@ void StateStoreTest::attemptClearsObservationAndMetricsRegardlessOfRevision()
 
 void StateStoreTest::removalMatchesIdentityAndRemovesDescendants()
 {
+	// Удаление неизвестного точного исполнения не меняет данные. Удаление группы каскадно убирает
+	// её FFmpeg, но сохраняет независимый Output; удаление Session завершает всё поддерево.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	auto wrong = runtimeEvent(QStringLiteral("output"), QStringLiteral("removed"), QStringLiteral("epoch:999"), 0);
@@ -218,6 +233,7 @@ void StateStoreTest::removalMatchesIdentityAndRemovesDescendants()
 
 void StateStoreTest::newExecutionClearsPreviousLanes()
 {
+	// Позднее удаление прежнего экземпляра Output не должно затронуть уже установленное новое исполнение.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	auto replacement =
@@ -236,6 +252,8 @@ void StateStoreTest::newExecutionClearsPreviousLanes()
 
 void StateStoreTest::incompatibleHierarchyDoesNotAdvanceCursor()
 {
+	// Известный FFmpeg нельзя переместить к другому родителю тем же instanceId. После отказа
+	// проверяются и cursor, и прежнее состояние, чтобы обнаружить частичную установку события.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	auto invalid = runtimeEvent(QStringLiteral("ffmpeg"), QStringLiteral("state"), QStringLiteral("epoch:4"), 81);
@@ -249,6 +267,8 @@ void StateStoreTest::incompatibleHierarchyDoesNotAdvanceCursor()
 
 void StateStoreTest::historyAndRestDetailsCannotRollbackAuthority()
 {
+	// После anchor намеренно поступают новая конфигурация и старые REST-детали STOPPED.
+	// Ни одно чтение не должно откатить оперативное состояние PUBLISHING или заменить сохранённый снимок истории.
 	StateStore state;
 	QVERIFY(state.installAnchor(anchor()));
 	HistoryState history;
@@ -277,6 +297,8 @@ void StateStoreTest::historyAndRestDetailsCannotRollbackAuthority()
 
 void StateStoreTest::unavailableSelectionAndStalenessPreserveKnowledge()
 {
+	// Отсутствие сохранённого выбора в полученном списке не стирает ID. Stale сохраняет наблюдение;
+	// clearServerState удаляет серверное знание, но не локальные OBS profile/streamingActive.
 	StateStore state;
 	state.setObsState(QStringLiteral("OBS"), true);
 	state.setSelection(QStringLiteral("saved-missing"), true);
@@ -307,6 +329,7 @@ void StateStoreTest::concurrentGroupAndFfmpegInstancesRemainIndependent_data()
 void StateStoreTest::concurrentGroupAndFfmpegInstancesRemainIndependent()
 {
 	QFETCH(QString, role);
+	// Совпадающие конфигурационные ID и роли допустимы; разделение и удаление определяются instanceId.
 	auto initial = anchor();
 	auto &session = initial.sessions.front();
 	session.ffmpeg.front().role = role;
@@ -347,6 +370,9 @@ void StateStoreTest::concurrentGroupAndFfmpegInstancesRemainIndependent()
 
 void StateStoreTest::systemRemovalClearsOnlyMatchingGpuObservation()
 {
+	// Снимок ещё не сообщает идентичность GPU, поэтому первое removed очищает его. Затем новый экземпляр
+	// с меньшей revision вытесняет старый, а позднее removed старого уже не действует. Ошибочная
+	// форма system state отвергается с сохранением cursor и независимого дерева Session.
 	StateStore state;
 	auto initial = anchor();
 	GPU anchored;

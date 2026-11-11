@@ -48,6 +48,9 @@ endfunction()
 
 # _setup_obs_studio: Create obs-studio build project, then build libobs and obs-frontend-api
 function(_setup_obs_studio)
+  # Windows-адаптация собирает Development SDK в .deps из закреплённых исходников OBS.
+  # Функция использует _obs_destination/_obs_version и шаблоны архивов из вызывающего bootstrap;
+  # это внутренний шаг configure, а не установка OBS приложения или плагина на компьютер.
   if(NOT libobs_DIR)
     set(_is_fresh --fresh)
   endif()
@@ -83,6 +86,8 @@ function(_setup_obs_studio)
       )
     endforeach()
     set(_cmake_generator "${CMAKE_GENERATOR}")
+    # Дочерний configure повторяет генератор VS, архитектуру и Windows SDK родительского preset.
+    # Этот путь использует -A и не является взаимозаменяемой конфигурацией Ninja.
     set(_cmake_arch -A "${arch},version=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
     set(_cmake_extra "-DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION}")
   elseif(OS_MACOS)
@@ -147,6 +152,9 @@ endfunction()
 
 # _check_dependencies: Fetch and extract pre-built OBS build dependencies
 function(_check_dependencies)
+  # buildspec задаёт версии/хеши, платформенная обёртка — имена архивов и каталоги .deps.
+  # При смене хеша извлечённый каталог заменяется; перед распаковкой проверяется сам архив,
+  # включая уже существующий. Метка .sha256 помогает выбрать кеш, но не заменяет эту проверку.
   file(READ "${CMAKE_CURRENT_SOURCE_DIR}/buildspec.json" buildspec)
 
   string(JSON dependency_data GET ${buildspec} dependencies)

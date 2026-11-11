@@ -5,6 +5,7 @@
 # задачи
 TASKS.md
 TASKS_ARCHIVE.md
+tasks_data/
 
 # Локальные зависимости, сборка и изолированные проверки OBS.
 /.deps/

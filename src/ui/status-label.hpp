@@ -12,6 +12,10 @@
 
 namespace gost {
 
+// Представление статуса в GUI-потоке при существующем QApplication. Текст всегда сообщает смысл
+// независимо от цвета. Tone хранит семантику между сменами палитры; Unknown/Stopped используют
+// нейтральный цвет темы, промежуточное состояние не выдаётся за подтверждённую активность.
+// Виджет не наблюдает StateStore сам: владелец явно передаёт нужную ось состояния.
 class StatusLabel final : public QLabel {
 public:
 	explicit StatusLabel(QWidget *parent) : QLabel(parent)
@@ -50,6 +54,7 @@ public:
 
 	void setStreamingStatus(const TextLookup &text, std::optional<bool> active)
 	{
+		// nullopt — отсутствие наблюдения, false — подтверждённая неактивность; подписи различаются.
 		if (active.value_or(false)) {
 			setStatus(text("OBS.StreamingActive"), Tone::Active);
 		} else {
@@ -100,6 +105,8 @@ private:
 
 	void updateStyle()
 	{
+		// Используется палитра приложения OBS. Меняем stylesheet только при отличии, чтобы повторное
+		// поступление того же статуса не запускало лишние перерасчёты оформления/геометрии.
 		const auto palette = QApplication::palette();
 		const bool dark = palette.color(QPalette::Window).lightness() < 128;
 		QString color;

@@ -26,6 +26,8 @@ ProfileDescriptor profile(const QString &name = QStringLiteral("A"))
 }
 void respond(const HttpServer::Request &request, const QString &streamName = QStringLiteral("Поток"))
 {
+	// Базовый сценарий даёт пустой runtime и открытый SSE с heartbeat. Специализированный handler
+	// перехватывает нужный маршрут раньше этого помощника; он не моделирует все реальные REST-детали.
 	if (request.target.startsWith("/api/v1/health/ready"))
 		HttpServer::reply(request, R"({"status":"ready","reason":""})");
 	else if (request.target.startsWith("/api/v1/system/capabilities"))
@@ -95,6 +97,8 @@ QJsonObject dockRuntimeSession(const QString &id, const QString &sessionInstance
 
 QByteArray dockAnchor()
 {
+	// Две Session имеют одинаковый outputId, но разные instanceId. Это позволяет выявить чтение
+	// чужой телеметрии по одному конфигурационному ID без проверки выбранной Session.
 	auto anchor = fixture::object(R"({"cursor":"dock-anchor","sessions":[],"gpu":null})");
 	anchor.insert(QStringLiteral("sessions"),
 		      QJsonArray{dockRuntimeSession(QStringLiteral("session"), QStringLiteral("epoch:1"),
@@ -118,6 +122,8 @@ QByteArray dockMetricsFrame(const QString &cursor, const QString &sessionId, con
 
 void respondWithDockMetadata(const HttpServer::Request &request, bool validExactSession)
 {
+	// Активный список всегда даёт кандидата, а детальный GET может вернуть другой Stream.
+	// current и pending одновременно существуют: запрос pending вместо точного current обнаруживается тестом.
 	const QUrl url = QUrl::fromEncoded("http://local" + request.target);
 	const auto path = url.path();
 	if (path == QStringLiteral("/api/v1/streams")) {
@@ -161,6 +167,9 @@ void respondWithDockMetadata(const HttpServer::Request &request, bool validExact
 }
 } // namespace
 
+// Проверяет всю последовательность чтения через настоящие APIClient/EventClient и управляемый HTTP-сервер.
+// Настройки изолированы в WorkspaceTemp. Барьерами служат фактические запросы/переходы StateStore;
+// отрицательные проверки повторов ждут дольше минимальной паузы повтора с обработкой цикла событий.
 class ConnectionControllerTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -187,6 +196,8 @@ private slots:
 
 void ConnectionControllerTest::connectsWithoutImplicitStreamOrMedia()
 {
+	// Ответ SSE удерживается после удачного ready, capabilities, списка и снимка. Только выпуск заголовков
+	// разрешает Connected. Наличие единственного Stream не даёт права выбрать его или начать эфир.
 	WorkspaceTemp temp(QStringLiteral("connection"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -204,6 +215,7 @@ void ConnectionControllerTest::connectsWithoutImplicitStreamOrMedia()
 	controller.observeProfile(FrontendEvent::FinishedLoading, profile());
 	controller.connectToServer(server.origin().toString());
 	QTRY_COMPARE_WITH_TIMEOUT(requestCount(server, "/api/v1/events?"), 1, 3000);
+	// Наличие запроса ещё не означает подключение: до заголовков SSE состояние остаётся Connecting.
 	QCOMPARE(state.connectionStatus(), ConnectionStatus::Connecting);
 	QVERIFY(subscription(server).socket);
 	HttpServer::stream(subscription(server));
@@ -227,6 +239,8 @@ void ConnectionControllerTest::connectsWithoutImplicitStreamOrMedia()
 
 void ConnectionControllerTest::serverSwitchDiscardsOldResponses()
 {
+	// Старый ready возвращается уже после начала подключения нового сервера. Проверяется отсутствие
+	// продолжения старой цепочки и сохранение данных нового origin, а не просто отмена одного reply.
 	WorkspaceTemp temp(QStringLiteral("server-switch"));
 	QVERIFY(temp.isValid());
 	HttpServer oldServer;
@@ -259,6 +273,8 @@ void ConnectionControllerTest::serverSwitchDiscardsOldResponses()
 
 void ConnectionControllerTest::profileSwitchRestoresOnlyItsBinding()
 {
+	// Профили A/B различаются UUID. После явного Changing/Changed у B нет выбора A; возврат к A
+	// восстанавливает его Stream без медиаопераций, несмотря на тот же origin и серверный список.
 	WorkspaceTemp temp(QStringLiteral("profile-switch"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -297,6 +313,9 @@ void ConnectionControllerTest::dockMetadataRequiresExactSessionForSelectedStream
 
 void ConnectionControllerTest::dockMetadataRequiresExactSessionForSelectedStream()
 {
+	// Заголовки SSE сначала удерживаются, затем отдельно задерживается current Generation.
+	// Session/Outputs обязаны публиковаться раньше медленного fallback, но только при подтверждении
+	// принадлежности детального GET. Anchor другого Stream не является кандидатом Dock.
 	QFETCH(bool, validExactSession);
 	WorkspaceTemp temp(QStringLiteral("dock-context"));
 	QVERIFY(temp.isValid());
@@ -375,6 +394,9 @@ void ConnectionControllerTest::dockMetadataRequiresExactSessionForSelectedStream
 
 void ConnectionControllerTest::resumedSubscriptionRefreshesOnlyAcceptedMetricLane()
 {
+	// После обрыва последовательно приходят заголовки, метрика чужой Session, старая и новая
+	// ревизия выбранного Output. Только последнее событие освежает его metrics; state остаётся stale.
+	// Проверки cursor отличают потреблённое старое событие от нового принятого измерения.
 	WorkspaceTemp temp(QStringLiteral("dock-resume"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -413,6 +435,7 @@ void ConnectionControllerTest::resumedSubscriptionRefreshesOnlyAcceptedMetricLan
 	const auto afterBreak = subscription(server);
 	QVERIFY(afterBreak.socket);
 	QCOMPARE(subscriptionCursor(afterBreak), currentCursor);
+	// Принятая подписка восстанавливает транспорт; прежнее измерение остаётся устаревшим до новой ревизии.
 	QCOMPARE(state.runtimeEvidence(instance).metrics, RuntimeAvailability::Stale);
 
 	const QString otherCursor = QStringLiteral("another-session-metric");
@@ -440,6 +463,8 @@ void ConnectionControllerTest::resumedSubscriptionRefreshesOnlyAcceptedMetricLan
 
 void ConnectionControllerTest::reconnectUsesConfirmedCursor()
 {
+	// После полного применённого кадра записывается незавершённый UTF-8 хвост с другим id и EOF.
+	// Возобновление должно использовать только первый cursor, сохранив единственный исходный snapshot.
 	WorkspaceTemp temp(QStringLiteral("reconnect"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -477,6 +502,8 @@ void ConnectionControllerTest::reconnectUsesConfirmedCursor()
 
 void ConnectionControllerTest::handshakeTimeoutRetriesWithoutPrematureConnection()
 {
+	// Сервер получает subscribe, но не отдаёт заголовки. Таймаут касается только ожидания заголовков;
+	// повтор использует прежний anchor и не успевает объявить Connected до реального второго 200 SSE.
 	WorkspaceTemp temp(QStringLiteral("handshake-timeout"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -523,6 +550,8 @@ void ConnectionControllerTest::terminalSubscriptionDoesNotRetry_data()
 
 void ConnectionControllerTest::terminalSubscriptionDoesNotRetry()
 {
+	// Разные терминальные причины должны сохранить свой безопасный UI-ключ. Окно 1400 мс
+	// превышает минимальную паузу повтора и обнаруживает ошибочно оставленный retry-таймер.
 	QFETCH(int, httpStatus);
 	QFETCH(QByteArray, contentType);
 	QFETCH(QString, reasonKey);
@@ -582,6 +611,9 @@ void ConnectionControllerTest::rejectedSubscriptionUsesFreshSnapshots_data()
 
 void ConnectionControllerTest::rejectedSubscriptionUsesFreshSnapshots()
 {
+	// Каждый 400/409 обязан сменить anchor. Таблица различает начальную попытку и число новых
+	// циклов: стандартный лимит 3 даёт 4 снимка/подписки; неудачный повторный snapshot тоже расходует цикл.
+	// Неограниченный режим останавливается самим тестом после заданного числа попыток, сохраняя паузы и ограничение частоты.
 	QFETCH(int, retryLimit);
 	QFETCH(bool, reconnect);
 	QFETCH(bool, failedRetrySnapshot);
@@ -643,6 +675,7 @@ void ConnectionControllerTest::rejectedSubscriptionUsesFreshSnapshots()
 		QVERIFY(snapshotTimes[index] - rejectionTimes[index - 1] >= 850);
 	if (snapshotTimes.size() >= 3)
 		QVERIFY(snapshotTimes[2] - rejectionTimes[1] >= 1650);
+	// Нижние границы допускают неточность таймеров, но должны обнаруживать отсутствие пауз и ограничения частоты.
 	if (snapshotTimes.size() >= 4)
 		QVERIFY(snapshotTimes[3] - snapshotTimes[0] >= 8500);
 	QVERIFY(readOnly(server));
@@ -658,6 +691,9 @@ void ConnectionControllerTest::disablingReconnectCancelsRecoverySnapshot_data()
 
 void ConnectionControllerTest::disablingReconnectCancelsRecoverySnapshot()
 {
+	// Восстановительный GET намеренно держится активным во время выключения reconnect.
+	// Позднее тело не должно заменить anchor; исчезновение сокета и полное окно следующего retry
+	// проверяют отмену как текущей сети, так и будущих шагов подключения.
 	QFETCH(int, httpStatus);
 	WorkspaceTemp temp(QStringLiteral("cancel-recovery-snapshot"));
 	QVERIFY(temp.isValid());
@@ -719,6 +755,9 @@ void ConnectionControllerTest::transientSubscriptionFailureResumesRecoveryAnchor
 
 void ConnectionControllerTest::transientSubscriptionFailureResumesRecoveryAnchor()
 {
+	// Цепочка 409 -> anchor-2 -> 503 должна повторить SSE от anchor-2 без третьего snapshot.
+	// Если это возобновление снова даёт 409, прежний конечный бюджет всё ещё исчерпан: успех снимка
+	// и временный транспортный отказ не являются подтверждением подписки и не обнуляют счётчик.
 	QFETCH(int, resumedStatus);
 	WorkspaceTemp temp(QStringLiteral("transient-subscription-failure"));
 	QVERIFY(temp.isValid());
@@ -772,6 +811,8 @@ void ConnectionControllerTest::transientSubscriptionFailureResumesRecoveryAnchor
 
 void ConnectionControllerTest::confirmedSubscriptionResetsRejectionBudget()
 {
+	// Подтверждённая подписка между двумя 409 восстанавливает право на один новый цикл snapshot.
+	// Ожидаемая последовательность cursor фиксирует и возобновление от старого снимка, и переход к anchor-3.
 	WorkspaceTemp temp(QStringLiteral("rejection-budget-reset"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -817,6 +858,8 @@ void ConnectionControllerTest::confirmedSubscriptionResetsRejectionBudget()
 
 void ConnectionControllerTest::resyncObtainsNewAnchor()
 {
+	// Управляющий кадр должен запустить закреплённый /events/snapshot и новую подписку с его cursor.
+	// Произвольный snapshot_url в данных события не является разрешением следовать другому маршруту.
 	WorkspaceTemp temp(QStringLiteral("resync"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -874,6 +917,7 @@ void ConnectionControllerTest::shutdownStopsPendingRetry()
 	const auto requests = server.requests.size();
 	QTimer retryWindow;
 	retryWindow.setSingleShot(true);
+	// Окно наблюдения длиннее минимальной паузы повтора; одного оборота Qt для отрицательной проверки недостаточно.
 	retryWindow.start(1300);
 	QTRY_VERIFY_WITH_TIMEOUT(!retryWindow.isActive(), 2500);
 	QCOMPARE(server.requests.size(), requests);

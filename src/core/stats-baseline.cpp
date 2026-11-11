@@ -6,6 +6,8 @@ namespace gost {
 
 void StatsBaseline::observe(Identity identity, std::optional<Counters> counters, bool fresh, bool limited)
 {
+	// Сначала проверяем identity: при новом исполнении старое показание должно исчезнуть, даже
+	// если свежих данных ещё нет. Несвежая выборка прежнего исполнения сохраняет последнее число и признак предела.
 	if (identity_ != identity) {
 		*this = {};
 		identity_ = std::move(identity);
@@ -13,6 +15,7 @@ void StatsBaseline::observe(Identity identity, std::optional<Counters> counters,
 	current_ = fresh;
 	if (!fresh)
 		return;
+	// После насыщения следующая достоверная выборка станет новой точкой отсчёта, а не продолжением старого периода.
 	if (limited) {
 		previous_.reset();
 		baseline_.reset();
@@ -22,6 +25,7 @@ void StatsBaseline::observe(Identity identity, std::optional<Counters> counters,
 	available_ = counters.has_value() && !limited;
 	if (!available_)
 		return;
+	// Регресс любого счётчика или изменение наличия знаменателя разрывает общий период пары.
 	if (previous_ && (counters->count < previous_->count || counters->total < previous_->total ||
 			  counters->total.has_value() != previous_->total.has_value())) {
 		baseline_ = counters;
@@ -53,6 +57,7 @@ StatsBaseline::Reading StatsBaseline::reading() const
 	result.counters = previous_;
 	auto &counters = *result.counters;
 	if (baseline_) {
+		// Числитель и знаменатель вычитаются за один интервал; процент от полного total здесь был бы неверным.
 		counters.count -= baseline_->count;
 		if (counters.total)
 			*counters.total -= *baseline_->total;

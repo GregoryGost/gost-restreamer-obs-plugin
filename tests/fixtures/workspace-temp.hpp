@@ -3,6 +3,9 @@
 #include <QDir>
 #include <QTemporaryDir>
 
+// RAII-каталог под закреплённым CMake GOST_TEST_WORKSPACE_DIR. Суффикс XXXXXX даёт каждому экземпляру
+// отдельный путь; уничтожение QTemporaryDir удаляет его содержимое. Системный TEMP не используется.
+// Вызывающий тест обязан проверить isValid до файловых действий; методы возвращают пути без создания файлов.
 class WorkspaceTemp final {
 public:
 	explicit WorkspaceTemp(const QString &name) : directory_(makeTemplate(name)) {}

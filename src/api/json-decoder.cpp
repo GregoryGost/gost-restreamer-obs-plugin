@@ -34,6 +34,7 @@ Error makeError(ErrorKind kind, int status)
 }
 bool parseDecimal(const QString &text, quint64 &value)
 {
+	// uint64 приходит десятичной строкой: преобразование через число типа double потеряло бы старшие разряды.
 	if (text.isEmpty() || (text.size() > 1 && text.front() == QLatin1Char('0')))
 		return false;
 	quint64 result = 0;
@@ -50,6 +51,7 @@ bool parseDecimal(const QString &text, quint64 &value)
 }
 bool validTimestamp(const QString &text)
 {
+	// Проверяем UTC-формат со знаком Z, сохраняя исходную строку и до девяти знаков долей секунды без округления.
 	static const QRegularExpression pattern(
 		QStringLiteral("^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d{1,9})?Z$"));
 	const auto match = pattern.match(text);
@@ -59,6 +61,8 @@ bool validTimestamp(const QString &text)
 }
 bool fromJson(const QJsonValue &json, QString &value, Error &error)
 {
+	// Проверка UTF-8 тела не исключает изолированных суррогатов внутри экранированных последовательностей JSON.
+	// QString должен содержать целые пары UTF-16, иначе последующее toUtf8 потеряло бы исходные данные.
 	if (!json.isString()) {
 		error = makeError(ErrorKind::Decode);
 		return false;
@@ -125,6 +129,7 @@ bool fromJson(const QJsonValue &json, ProfileText &value, Error &error)
 	}
 	const auto ascii = encoded.toLatin1();
 	const auto decoded = QByteArray::fromBase64Encoding(ascii, QByteArray::AbortOnBase64DecodingErrors);
+	// Обратное кодирование отклоняет неканоническую оболочку и сохраняет точные байты профиля.
 	if (!decoded || decoded.decoded.toBase64() != ascii) {
 		error = makeError(ErrorKind::Decode);
 		return false;
@@ -161,6 +166,10 @@ bool timestampField(const JsonField<QString> &v)
 {
 	return !v.hasValue() || validTimestamp(v.value);
 }
+// Общий последовательный читатель объекта: field требует тип конкретной перегрузки, time дополнительно
+// проверяет календарное UTC-время. JsonField допускает Undefined/Null, обычное поле требует значение.
+// После первого отказа valid_ запрещает дальнейшее заполнение и сохраняет причину ошибки чтения.
+// Неизвестные ключи не перечисляются и допускают добавление сервером совместимых полей.
 class Reader {
 public:
 	Reader(const QJsonValue &json, Error &error) : error_(error)
@@ -199,6 +208,8 @@ private:
 } // namespace
 bool fromJson(const QJsonValue &json, Record &value, Error &error)
 {
+	// Последующие перегрузки читают поля DTO в порядке объявления. Record/Observation разбираются
+	// первыми для производных типов; их отказ прекращает чтение оставшейся части объекта.
 	Reader r(json, error);
 	r.field("id", value.id);
 	r.field("revision", value.revision);
@@ -237,6 +248,7 @@ bool fromJson(const QJsonValue &json, Stream &value, Error &error)
 	r.field("name", value.name);
 	r.field("publication_key", value.publicationKey);
 	r.field("fallback", value.fallback);
+	// Отсутствующий ключ старого ответа остаётся явно недоступным; null нарушает контракт строкового значения.
 	if (value.publicationKey.isNull()) {
 		error = makeError(ErrorKind::Contract);
 		return false;
@@ -659,6 +671,8 @@ bool fromJson(const QJsonValue &json, Encoding &value, Error &error)
 }
 bool fromJson(const QJsonValue &json, GroupProfile &value, Error &error)
 {
+	// Здесь проверяются режимы и их совместимость, а не весь набор серверных ограничений кодировщика.
+	// Важно сохранить Missing при чтении прежнего формата: подстановка copy изменила бы последующую полную замену.
 	Reader r(json, error);
 	r.field("mode", value.mode);
 	r.field("live_audio_mode", value.liveAudioMode);
@@ -666,6 +680,7 @@ bool fromJson(const QJsonValue &json, GroupProfile &value, Error &error)
 	r.field("video_encoding", value.videoEncoding);
 	r.field("audio_encoding", value.audioEncoding);
 	r.field("encoding", value.encoding);
+	// Отсутствующий режим аудио не заменяется значением по умолчанию: это отдельная наследуемая семантика.
 	if (value.liveAudioMode.isNull()) {
 		error = makeError(ErrorKind::Contract);
 		return false;
@@ -811,6 +826,8 @@ bool fromJson(const QJsonValue &json, Preparation &value, Error &error)
 }
 bool validateRuntimeEvent(const RuntimeEvent &e)
 {
+	// Проверка формы связывает тип события, владельца и единственный допустимый набор данных.
+	// Проверка принадлежности исполнения существующему дереву выполняется отдельно в StateStore.
 	const auto kind = e.kind, owner = e.owner;
 	const int payloads = int(e.input.hasValue()) + int(e.group.hasValue()) + int(e.output.hasValue()) +
 			     int(e.ffmpeg.hasValue()) + int(e.gpu.hasValue());

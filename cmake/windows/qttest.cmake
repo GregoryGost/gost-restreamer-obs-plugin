@@ -1,5 +1,9 @@
 # Официальный комплект OBS не содержит Qt Test. Отдельный комплект той же версии
 # используется только процессами тестов; DLL плагина получает Qt из OBS SDK.
+# Подключение модуля имеет эффекты configure: возможны HTTPS-загрузка и распаковка в .deps проекта.
+# EXPECTED_HASH проверяет загрузку, явный SHA256 ниже — также ранее сохранённый архив.
+# Готовый Qt6TestConfig служит признаком уже распакованного комплекта, а не повторной проверкой
+# каждого распакованного файла. PATH этого комплекта Qt задаётся отдельно только CTest-процессам.
 include_guard(GLOBAL)
 
 set(GOST_QT_TEST_ROOT "${PROJECT_SOURCE_DIR}/.deps/qt-test-kit-6.11.1")
@@ -20,6 +24,7 @@ if(NOT EXISTS "${_qt_test_archive}")
     SHOW_PROGRESS
   )
 endif()
+# Проверяется и уже существующий архив: наличие файла в кеше не подтверждает закреплённое содержимое.
 file(SHA256 "${_qt_test_archive}" _qt_test_actual_sha256)
 if(NOT _qt_test_actual_sha256 STREQUAL _qt_test_sha256)
   message(FATAL_ERROR "SHA256 архива Qt Test не совпадает с закреплённым значением.")

@@ -16,6 +16,7 @@ namespace {
 
 std::optional<FrontendEvent> translateEvent(obs_frontend_event event)
 {
+	// Неподдерживаемые события не превращаются в профильные/стриминговые по умолчанию.
 	switch (event) {
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 		return FrontendEvent::FinishedLoading;
@@ -49,6 +50,8 @@ struct FrameCounterReading {
 
 template<typename Counter> FrameCounterReading frameCounters(Counter skipped, Counter total)
 {
+	// Предел проверяется в исходном типе API до расширения до quint64. Иначе максимум signed/int
+	// выглядел бы обычным небольшим числом и ошибочно разрешал вычислять следующий прирост.
 	if constexpr (std::is_signed_v<Counter>) {
 		if (skipped < 0 || total < 0)
 			return {};
@@ -87,6 +90,7 @@ void OBSFrontend::removeDock(const char *id)
 
 void OBSFrontend::addEventCallback(EventCallback callback, void *cookie)
 {
+	// Адаптер обслуживает единственного владельца; пара хранится до соответствующего removeEventCallback().
 	callback_ = callback;
 	cookie_ = cookie;
 	obs_frontend_add_event_callback(&OBSFrontend::onEvent, this);
@@ -116,6 +120,7 @@ QString OBSFrontend::currentProfilePath() const
 
 QStringList OBSFrontend::profiles() const
 {
+	// OBS выделяет единый массив строк; копируем имена и освобождаем исходный блок через bfree.
 	const std::unique_ptr<char *, decltype(&bfree)> names(obs_frontend_get_profiles(), &bfree);
 	QStringList result;
 	if (names) {
@@ -133,6 +138,7 @@ bool OBSFrontend::streamingActive() const
 
 ObsStatisticsSample OBSFrontend::readStatistics() noexcept
 {
+	// Подписка создаётся при первой разрешённой выборке, когда OBSController уже получил FinishedLoading.
 	if (!videoSignals_) {
 		videoSignals_ = obs_get_signal_handler();
 		signal_handler_connect(videoSignals_, "video_reset", &OBSFrontend::onVideoReset, this);
@@ -157,6 +163,7 @@ ObsStatisticsSample OBSFrontend::readStatistics() noexcept
 		}
 	}
 
+	// Frontend API возвращает сильную ссылку: выход остаётся жив на время чтения и освобождается через OBS API.
 	const std::unique_ptr<obs_output_t, decltype(&obs_output_release)> output(obs_frontend_get_streaming_output(),
 										  &obs_output_release);
 	if (!output || !obs_output_active(output.get())) {
@@ -168,6 +175,8 @@ ObsStatisticsSample OBSFrontend::readStatistics() noexcept
 	const bool rtmp = outputId && std::string_view(outputId) == "rtmp_output";
 	// Слабая ссылка удерживает прежний блок управления даже после уничтожения выхода.
 	decltype(output_) identity(obs_output_get_weak_output(output.get()), &obs_weak_output_release);
+	// Удержание слабого блока между выборками отличает новый output даже при повторном использовании
+	// адреса прежнего объекта. Сам output при этом не удерживается работающим сильной ссылкой.
 	if (identity.get() != output_.get()) {
 		releaseOutputStatistics();
 		output_ = std::move(identity);
@@ -190,6 +199,7 @@ ObsStatisticsSample OBSFrontend::readStatistics() noexcept
 	const bool active = obs_output_active(output.get()) && !obs_output_reconnecting(output.get());
 	const auto observedGeneration = outputIdentity_.load(std::memory_order_relaxed);
 	sample.outputIdentity = observedGeneration;
+	// Переподключение во время чтения делает набор сетевых счётчиков несогласованным; такую выборку не выдаём.
 	if (active && observedGeneration == generation) {
 		sample.network = network.counters;
 		sample.networkLimited = network.limited;
@@ -209,6 +219,7 @@ void OBSFrontend::releaseStatistics() noexcept
 
 void OBSFrontend::releaseOutputStatistics() noexcept
 {
+	// Подписку с удержанием обработчика снимаем до освобождения слабой ссылки; сам выход уже мог исчезнуть.
 	if (outputSignals_) {
 		signal_handler_disconnect(outputSignals_, "reconnect_success", &OBSFrontend::onOutputReconnect, this);
 		outputSignals_ = nullptr;
@@ -218,6 +229,8 @@ void OBSFrontend::releaseOutputStatistics() noexcept
 
 void OBSFrontend::onVideoReset(void *cookie, calldata_t *) noexcept
 {
+	// Поколение служит маркером разрыва, не публикацией других данных; relaxed не задаёт порядок
+	// чтения внутренних полей OBS. Полную согласованность нескольких API-чтений оно не обещает.
 	auto *self = static_cast<OBSFrontend *>(cookie);
 	self->videoIdentity_.fetch_add(1, std::memory_order_relaxed);
 }

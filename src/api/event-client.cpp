@@ -11,6 +11,10 @@
 #include <QUrlQuery>
 #include <algorithm>
 namespace gost::api {
+// Вся работа подписки выполняется в одном цикле Qt. Обработчик события или ошибки может сразу
+// открыть новую подписку с тем же контекстом; serial не даёт оставшимся обработчикам старой подписки
+// изменить новую. validated отмечает проверенные заголовки, finished — конец транспорта, scheduled —
+// запланированный вызов drain. Курсор подтверждается отдельно, только после успешного EventHandler.
 class EventClient::Impl {
 public:
 	EventClient *owner;
@@ -34,6 +38,8 @@ public:
 	QString confirmed;
 	Impl(EventClient *owner, Limits limits) : owner(owner), limits(limits), network(owner), parser(limits)
 	{
+		// Как и в APIClient, исключаем системное определение прокси до запуска таймера заголовков.
+		// Это настройка только нашего менеджера для соединения с выбранным локальным сервером.
 		network.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
 		handshake.setSingleShot(true);
 		idle.setSingleShot(true);
@@ -42,8 +48,12 @@ public:
 		QObject::connect(&idle, &QTimer::timeout, owner,
 				 [this] { fail(makeError(ErrorKind::Timeout), false); });
 	}
+	// Сначала меняет поколение и убирает reply, затем вызывает abort. Это исключает продолжение
+	// старого чтения при сигналах прерывания. confirmed намеренно не очищается: вызывающая сторона может
+	// прочитать его после отказа, когда обработчики и недоставленные кадры уничтожены.
 	void close()
 	{
+		// Отложенная обработка прежнего ответа не должна продолжиться после закрытия или новой подписки.
 		++serial;
 		handshake.stop();
 		idle.stop();
@@ -64,6 +74,8 @@ public:
 		finished = false;
 		scheduled = false;
 	}
+	// Захватывает обработчик и получателя до close, но вызывает его уже после полной очистки.
+	// Так новый subscribe из errorHandler не будет стёрт последующим завершением старого отказа.
 	void fail(Error error, bool resync)
 	{
 		auto callback = errorHandler;
@@ -73,6 +85,9 @@ public:
 		if (!stopped && target && callback)
 			callback(ctx, std::move(error), resync);
 	}
+	// false означает либо «заголовков ещё нет», либо уже закрытый отказом/обработчиком поток.
+	// После OpenHandler повторно проверяются owner, serial и receiver: подтверждение транспорта
+	// не даёт права продолжить чтение подписки, заменённой из пользовательского обработчика.
 	bool headers()
 	{
 		if (!reply)
@@ -95,6 +110,7 @@ public:
 			return false;
 		}
 		validated = true;
+		// Подключение подтверждают заголовки: ждать первого события с данными не требуется.
 		handshake.stop();
 		idle.start(std::max(1, limits.sseIdleMs));
 		const auto expected = serial;
@@ -104,6 +120,8 @@ public:
 			callback(context);
 		return guard && expected == serial && receiver;
 	}
+	// Объединяет readyRead/finished и собственное продолжение в один следующий оборот Qt.
+	// Лямбда проверяет поколение до обращения к состоянию новой подписки.
 	void schedule()
 	{
 		if (scheduled)
@@ -117,6 +135,10 @@ public:
 			drain();
 		});
 	}
+	// Сопоставляет транспортный тип и id с JSON kind/cursor, затем передаёт событие потребителю.
+	// resync_required не является RuntimeEvent и не имеет id; содержащиеся в нём данные не задают URL.
+	// Курсор продвигается после true от потребителя и повторной проверки поколения. Отказ применения,
+	// неверный JSON или противоречие оболочки требуют нового снимка, а не пропуска «плохого» события.
 	bool frame(SSEFrame frame)
 	{
 		if (frame.event == QStringLiteral("resync_required")) {
@@ -149,9 +171,15 @@ public:
 			fail(makeError(ErrorKind::Contract), true);
 			return false;
 		}
+		// Полученный, но отвергнутый потребителем кадр не продвигает точку восстановления.
 		confirmed = result.value->cursor;
 		return true;
 	}
+	// Сначала доставляет готовые кадры, затем читает ограниченную порцию новых байтов. Бюджеты
+	// считаются по доставленным кадрам; один допустимый крупный кадр разрешён даже сверх bytesPerTurn,
+	// но перед следующим управление возвращается Qt. Так размер кадра и отзывчивость GUI не смешиваются.
+	// При EOF сначала выдаются полные кадры и отбрасывается незаконченный хвост, затем сообщается
+	// Transport. Нет ни «успешного конца» бесконечной подписки, ни подтверждения частичного события.
 	void drain()
 	{
 		if (scheduled)
@@ -175,6 +203,7 @@ public:
 		int processedEvents = 0;
 		auto deliverFrames = [&] {
 			while (parser.hasFrame()) {
+				// Один крупный допустимый кадр обрабатывается целиком; перед следующим возвращаем управление Qt.
 				if (processedEvents >= limits.eventsPerTurn ||
 				    (processedEvents > 0 &&
 				     parser.nextFrameBytes() > limits.bytesPerTurn - processedBytes)) {
@@ -214,6 +243,7 @@ public:
 			return;
 		}
 		if (finished) {
+			// Остаток незавершённого кадра отбрасывается; переподключение использует только подтверждённый курсор.
 			if (!parser.finish()) {
 				fail(parser.error(), true);
 				return;
@@ -221,6 +251,8 @@ public:
 			fail(makeError(ErrorKind::Transport), false);
 		}
 	}
+	// Каждая новая попытка начинает чистый парсер и собственное ожидание заголовков, но использует переданный
+	// подтверждённый cursor. Сигналы захватывают serial; уничтожение target закрывает только эту попытку.
 	void subscribe(QUrl origin, QString cursor, RequestContext ctx, QObject *target, EventHandler events,
 		       ErrorHandler errors, OpenHandler opened)
 	{
@@ -241,6 +273,7 @@ public:
 			return;
 		}
 		origin.setPath(QStringLiteral("/api/v1/events"));
+		// Серверный контракт использует параметр cursor в URL; второй курсор в заголовке не добавляется.
 		QUrlQuery query;
 		query.addQueryItem(QStringLiteral("cursor"), QString::fromLatin1(QUrl::toPercentEncoding(cursor)));
 		origin.setQuery(query);

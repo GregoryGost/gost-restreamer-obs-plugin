@@ -3,6 +3,8 @@
 include_guard(GLOBAL)
 
 # Задаём C17 для импортированного кода поддержки и C++20 для плагина.
+# Раздельные стандарты сохраняют сборку plugin-support.c, не понижая стандарт собственных C++ целей.
+# CMAKE_CXX_STANDARD_REQUIRED запрещает откат стандарта; CMAKE_CXX_EXTENSIONS=OFF исключает расширения языка.
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_STANDARD 20)

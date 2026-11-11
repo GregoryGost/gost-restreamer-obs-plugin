@@ -14,6 +14,7 @@ bool SSEParser::feed(const QByteArray &bytes)
 		return false;
 	for (const char c : bytes) {
 		if (initial_) {
+			// Начальная метка UTF-8 может быть разделена между несколькими чтениями.
 			bom_.append(c);
 			const QByteArray marker("\xEF\xBB\xBF", 3);
 			if (marker.startsWith(bom_)) {
@@ -30,6 +31,7 @@ bool SSEParser::feed(const QByteArray &bytes)
 			continue;
 		}
 		if (afterCR_) {
+			// LF после уже обработанного CR не создаёт дополнительную пустую строку.
 			afterCR_ = false;
 			if (c == '\n')
 				continue;
@@ -61,6 +63,7 @@ bool SSEParser::line()
 		}
 		data_.clear();
 		event_.clear();
+		// ID относится к этому кадру; подтверждённый курсор RuntimeEvent хранит EventClient.
 		id_.clear();
 		dataSeen_ = false;
 		frameBytes_ = 0;
@@ -71,6 +74,7 @@ bool SSEParser::line()
 	const auto colon = raw.indexOf(':');
 	const auto key = colon < 0 ? raw : raw.first(colon);
 	auto value = colon < 0 ? QByteArray{} : raw.sliced(colon + 1);
+	// SSE удаляет ровно один пробел после двоеточия, сохраняя пробелы самих данных.
 	if (value.startsWith(' '))
 		value.remove(0, 1);
 	if (key == "data") {
@@ -124,6 +128,7 @@ void SSEParser::reset()
 }
 bool SSEParser::finish()
 {
+	// EOF не завершает кадр: событие выдаётся только после пустой строки.
 	bom_.clear();
 	line_.clear();
 	data_.clear();

@@ -28,6 +28,8 @@ bool validText(const QString &value, bool allowEmpty = false)
 
 bool exactKeys(const QJsonObject &object, const QStringList &keys)
 {
+	// Для собственного формата неизвестные ключи означают неподдерживаемую редакцию, а не поля,
+	// которые можно молча потерять при следующем save. Это строже чтения внешних REST DTO.
 	if (object.size() != keys.size())
 		return false;
 	for (const auto &key : keys)
@@ -63,6 +65,9 @@ std::optional<QString> SettingsStore::canonicalOrigin(const QString &text)
 
 bool SettingsStore::load()
 {
+	// Реестр и привязки сначала разбираются во временные переменные: ошибка в конце документа
+	// не должна заменить часть рабочих настроек. Размер проверяется до JSON-разбора, число записей —
+	// до замены данных в памяти. Повтор UUID, пути профиля или привязки одной пары считается ошибкой.
 	Q_ASSERT(QThread::currentThread() == thread());
 	if (filePath_.isEmpty()) {
 		writeAllowed_ = false;
@@ -75,6 +80,7 @@ bool SettingsStore::load()
 	if (!file.exists())
 		return true;
 	auto reject = [this](QString key = QStringLiteral("Settings.UnsupportedFormat")) {
+		// Повреждённый или неизвестный формат блокирует последующие записи, сохраняя исходный файл владельца.
 		writeAllowed_ = false;
 		error_ = QStringLiteral("Формат настроек повреждён или не поддерживается; файл сохранён.");
 		errorKey_ = std::move(key);
@@ -158,6 +164,7 @@ bool SettingsStore::load()
 		if (bindings.size() > MaxServers)
 			return reject();
 	}
+	// Рабочие значения заменяются только после проверки всего документа, включая реестр и привязки.
 	origin_ = origin;
 	autoConnect_ = root.value(QStringLiteral("auto_connect")).toBool();
 	reconnect_ = root.value(QStringLiteral("reconnect")).toBool();
@@ -177,6 +184,8 @@ bool SettingsStore::load()
 
 bool SettingsStore::save()
 {
+	// unsaved устанавливается до любой операции: даже заблокированная запись должна быть видна UI.
+	// Сериализуется одна версия RAM целиком; QSaveFile commit является единственной точкой успеха.
 	Q_ASSERT(QThread::currentThread() == thread());
 	unsaved_ = true;
 	if (!writeAllowed_) {
@@ -209,6 +218,7 @@ bool SettingsStore::save()
 		return false;
 	}
 	QSaveFile file(filePath_);
+	// Запрет прямой записи сохраняет прежний файл, если атомарная замена невозможна.
 	file.setDirectWriteFallback(false);
 	if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
 		error_ = QStringLiteral("Не удалось сохранить настройки; изменения доступны в памяти.");
@@ -268,6 +278,8 @@ QString SettingsStore::selectedStream(const QString &origin, const QString &uuid
 
 void SettingsStore::persist()
 {
+	// Методы изменения намеренно сохраняют рабочие изменения при отказе диска. Результат сообщается через
+	// changed/unsaved/error, поэтому вызывающий метод не откатывает пользовательский выбор.
 	save();
 }
 
@@ -352,6 +364,9 @@ void SettingsStore::retireAbsent(const QStringList &inventory)
 
 ProfileResolution SettingsStore::observeProfile(FrontendEvent event, const ProfileDescriptor &descriptor)
 {
+	// Событие ProfileChanging означает явное переключение, поэтому последующую смену пути нельзя
+	// принять за переименование прежнего профиля. Если descriptor недостоверен, запоминаем это:
+	// следующий неизвестный каталог не должен случайно получить UUID и все привязки прежнего профиля.
 	Q_ASSERT(QThread::currentThread() == thread());
 	if (event == FrontendEvent::ProfileChanging) {
 		changing_ = true;
@@ -369,6 +384,8 @@ ProfileResolution SettingsStore::observeProfile(FrontendEvent event, const Profi
 		if (profile.locator == descriptor.path)
 			located = profile.uuid;
 	bool renamed = false;
+	// OBS при переименовании меняет каталог и посылает ProfileChanged раньше ProfileRenamed без ProfileChanging.
+	// Перенос UUID разрешён только при исчезновении старого имени и отсутствии неоднозначного перехода.
 	if (!previous.isEmpty() && !changing_ && !transitionUncertain_ && previousRecord.locator != descriptor.path &&
 	    !descriptor.inventory.contains(previousRecord.name) && located.isEmpty() &&
 	    (event == FrontendEvent::ProfileChanged || event == FrontendEvent::ProfileRenamed)) {
@@ -376,6 +393,7 @@ ProfileResolution SettingsStore::observeProfile(FrontendEvent event, const Profi
 		renamed = true;
 	}
 	if (located.isEmpty()) {
+		// Неизвестный каталог при неопределённом переходе не должен получить привязки существующего профиля.
 		if (transitionUncertain_ || event == FrontendEvent::ProfileListChanged ||
 		    profiles_.size() >= MaxProfiles)
 			return {{}, false, true, false};

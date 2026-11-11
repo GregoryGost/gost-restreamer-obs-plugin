@@ -33,6 +33,7 @@ bool fresh(RuntimeAvailability evidence)
 
 QLabel *valueLabel(QWidget *parent, const char *name)
 {
+	// Серверные имена/значения показываются обычным текстом, чтобы '<...>' не интерпретировалось как HTML.
 	auto *label = new QLabel(parent);
 	label->setObjectName(QString::fromLatin1(name));
 	label->setTextFormat(Qt::PlainText);
@@ -42,6 +43,7 @@ QLabel *valueLabel(QWidget *parent, const char *name)
 
 const char *sessionKey(const QString &state)
 {
+	// Пустое наблюдение и неизвестный полученный код различаются; ни одно не означает STOPPED.
 	if (state == QStringLiteral("STARTING"))
 		return "Dock.SessionStarting";
 	if (state == QStringLiteral("RUNNING"))
@@ -87,11 +89,14 @@ const char *periodKey(StatsBaseline::Period period)
 
 QString bitrate(const QLocale &locale, const TextLookup &text, double bitsPerSecond)
 {
+	// Мбит/с — десятичная единица; ниже байты выводятся в двоичных MiB. Переводы содержат сами подписи единиц.
 	return text("Dock.Megabits").arg(locale.toString(bitsPerSecond / 1000000.0, 'f', 2));
 }
 
 QString counterText(const QLocale &locale, const TextLookup &text, const StatsBaseline &baseline)
 {
+	// Предел имеет собственное представление. Процент берётся из той же пары дельт baseline,
+	// не вычисляется от полного total; каждый счётчик сохраняет свой период после разрыва.
 	const auto reading = baseline.reading();
 	if (reading.limited)
 		return text("Dock.ChangeUnavailable");
@@ -144,6 +149,9 @@ struct DropTotal {
 
 DropTotal dropTotal(const QMap<QString, quint64> &counts)
 {
+	// Для отображения пустая карта считается недоступным измерением и не превращается в ноль.
+	// Значения категорий одного вида потерь суммируются с проверкой переполнения.
+	// queueDrops и deliveryDrops считаются отдельно.
 	if (counts.isEmpty())
 		return {};
 	quint64 total = 0;
@@ -156,6 +164,9 @@ DropTotal dropTotal(const QMap<QString, quint64> &counts)
 }
 
 struct DisplayRate {
+	// Хранит последнюю доступную скорость одного источника. available обновляет last, warming_up
+	// показывает, что замер ещё идёт. При stale прежнее значение выводится только с явной подписью
+	// и только пока не сменился контекст источника; новая Session или исполнение не наследуют его.
 	std::optional<double> last;
 	bool stale = false;
 
@@ -181,6 +192,8 @@ struct DisplayRate {
 };
 
 struct OutputStatistics {
+	// Один конфигурационный Output может иметь новые исполнения. instance сменяется вместе со всем
+	// кешем строки, чтобы дельты переподключений и потерь и последняя скорость не пересекли границу запуска.
 	QString instance;
 	QString name;
 	DisplayRate bitrate;
@@ -200,6 +213,7 @@ struct OutputStatistics {
 
 void updateRows(QStringListModel &model, const QStringList &rows)
 {
+	// Изменяем только различающиеся строки, сохраняя существующую модель и положение списка при телеметрии.
 	const int count = static_cast<int>(rows.size());
 	const int previous = model.rowCount();
 	if (previous > count)
@@ -216,6 +230,12 @@ void updateRows(QStringListModel &model, const QStringList &rows)
 } // namespace
 
 struct RestreamDock::Statistics {
+	// Четыре локальные точки отсчёта OBS не зависят от выбранного сервера. Смена DockContext, Session ID
+	// или известного исполнения Session очищает весь серверный кеш; подтверждённое отсутствие Session — тоже.
+	// Внутри той же Session смена подтверждённого sourceEpoch очищает только входные FPS/bitrate.
+	// Смена или исчезновение исполнения Output очищает только его строку, включая точки отсчёта
+	// переподключений и потерь.
+	// clearServer оставляет context/sessionId для следующих сравнений и не трогает локальную статистику OBS.
 	StatsBaseline render;
 	StatsBaseline encode;
 	StatsBaseline network;
@@ -244,6 +264,8 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	  text_(std::move(text)),
 	  statistics_(std::make_unique<Statistics>())
 {
+	// Сигналы подключаются с контекстом виджета: его удаление OBS отменяет отложенные обновления.
+	// runtimeAboutToBecomeStale обрабатывается отдельно и сразу, до отложенного общего refresh().
 	setObjectName(QStringLiteral("restreamDock"));
 	auto *layout = new QVBoxLayout(this);
 	auto *header = new QHBoxLayout;
@@ -339,6 +361,7 @@ RestreamDock::~RestreamDock() = default;
 
 void RestreamDock::scheduleRefresh()
 {
+	// Несколько сигналов одного изменения StateStore объединяются в одно обновление следующего оборота Qt.
 	if (refreshScheduled_)
 		return;
 	refreshScheduled_ = true;
@@ -422,10 +445,15 @@ void RestreamDock::refreshObservations()
 
 void RestreamDock::refreshServer()
 {
+	// Сначала очищаем кеш прежнего выбора или Session, чтобы их статистика не появилась у нового выбора.
+	// При Connected можно читать runtime, но состояние, подключение входа и измерения подтверждаются
+	// независимо через RuntimeEvidence. Полноту и свежесть состава выходов задаёт REST ReadStatus;
+	// одно восстановленное соединение не делает все сохранённые значения снова актуальными.
 	auto &stats = *statistics_;
 	const auto &context = stateStore_.dockContext();
 	const auto &server = stateStore_.dockServer();
 	if (stats.context != context) {
+		// Данные и точки отсчёта прежнего сервера, профиля или Stream не переносятся в новый выбор.
 		stats.context = context;
 		stats.sessionId.clear();
 		stats.clearServer();
@@ -499,10 +527,12 @@ void RestreamDock::refreshServer()
 
 	const auto *input = session && session->input ? &*session->input : nullptr;
 	const auto *inputMetrics = input && input->metrics ? &*input->metrics : nullptr;
+	// Состояние подключения входа и его измерения могут подтверждаться разными событиями.
 	const bool inputCurrent = session && fresh(sessionEvidence.input);
 	const bool inputMetricsCurrent = session && fresh(sessionEvidence.metrics);
 	if ((inputMetricsCurrent && inputMetrics && stats.inputEpoch != inputMetrics->sourceEpoch) ||
 	    (inputCurrent && !inputMetrics)) {
+		// Новый источник входа начинает собственные измерения. Счётчики того же исполнения Output продолжаются.
 		stats.inputEpoch = inputMetrics ? inputMetrics->sourceEpoch : 0;
 		stats.inputFps = {};
 		stats.inputBitrate = {};
@@ -535,6 +565,8 @@ void RestreamDock::refreshServer()
 			outputObservations.insert(output.outputId, &output);
 	}
 	QSet<QString> rows;
+	// Показываем прикреплённые по REST выходы и наблюдаемые исполнения, для которых REST ещё не сообщил
+	// об отсоединении. Отсутствие ID в неполном списке или отсутствие метрик само по себе не удаляет строку.
 	for (auto it = server.outputs.cbegin(); it != server.outputs.cend(); ++it) {
 		if (it->attached)
 			rows.insert(it.key());
@@ -545,6 +577,7 @@ void RestreamDock::refreshServer()
 			rows.insert(it.key());
 	}
 	if (!runtimeCurrent) {
+		// При потере связи сохраняем последние строки; прежние измерения будут подписаны как устаревшие.
 		for (auto it = stats.outputs.cbegin(); it != stats.outputs.cend(); ++it)
 			rows.insert(it.key());
 	}
@@ -557,6 +590,8 @@ void RestreamDock::refreshServer()
 	QStringList outputRows;
 	int streaming = 0;
 	bool complete = sessionCurrent && fresh(server.outputsStatus.availability) && server.outputsStatus.complete;
+	// Сводка «N из M» допустима только при полном составе и известном состоянии каждой строки.
+	// Наличие bitrate, единичного PUBLISHING или пустой карты не подтверждает общий итог.
 	for (const auto &id : std::as_const(rows))
 		stats.outputs[id];
 	for (auto it = stats.outputs.begin(); it != stats.outputs.end(); ++it) {
@@ -580,6 +615,7 @@ void RestreamDock::refreshServer()
 		complete = complete && knownState && metadata != server.outputs.cend();
 		streaming += statusCurrent && output->state == QStringLiteral("PUBLISHING");
 		const StatsBaseline::Identity identity{cache.instance};
+		// Потери очереди и доставки суммируются по своим категориям, независимо от сетевых пропусков OBS.
 		const auto queueDrops = metrics ? dropTotal(metrics->queueDrops) : DropTotal{};
 		const auto deliveryDrops = metrics ? dropTotal(metrics->deliveryDrops) : DropTotal{};
 		const bool saturated = metrics && metrics->media.saturated;
@@ -634,6 +670,9 @@ void RestreamDock::refreshServer()
 
 void RestreamDock::resetStatistics()
 {
+	// Любой недоступный/stale baseline сам отвергает reset. Никаких REST/OBS-команд не требуется;
+	// FPS, bitrate, очередь и статусы не вычитаются и продолжают показывать свои текущие значения.
+	// Сначала забираем последнее состояние, затем сдвигаем только локальные точки отсчёта накоплений.
 	refresh();
 	auto &stats = *statistics_;
 	stats.render.reset();

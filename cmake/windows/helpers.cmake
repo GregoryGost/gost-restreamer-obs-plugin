@@ -5,6 +5,10 @@ include_guard(GLOBAL)
 include(helpers_common)
 
 # set_target_properties_plugin: Set target properties for use in obs-studio
+# Настраивает уже созданную цель MODULE: применяет пары PROPERTIES, добавляет plugin-support,
+# ресурс Windows и правила размещения. install пишет относительно CMAKE_INSTALL_PREFIX;
+# POST_BUILD пишет только в binaryDir/rundir/<config>, не в установленный пользовательский OBS.
+# $<CONFIG> обязателен для Visual Studio: разные конфигурации не должны делить один каталог DLL/PDB.
 function(set_target_properties_plugin target)
   set(options "")
   set(oneValueArgs "")
@@ -22,6 +26,7 @@ function(set_target_properties_plugin target)
 
   set_target_properties(${target} PROPERTIES VERSION 0 SOVERSION ${PLUGIN_VERSION})
 
+  # Формат OBS 33 размещает DLL в корне каталога плагина, а ресурсы — в соседнем data/.
   install(TARGETS ${target} RUNTIME DESTINATION "${target}" LIBRARY DESTINATION "${target}")
 
   install(
@@ -35,6 +40,7 @@ function(set_target_properties_plugin target)
     target_link_libraries(${target} PRIVATE plugin-support)
   endif()
 
+  # rundir воспроизводит ту же структуру для выбранной конфигурации, не устанавливая плагин в систему.
   add_custom_command(
     TARGET ${target}
     POST_BUILD
@@ -59,6 +65,9 @@ function(set_target_properties_plugin target)
 endfunction()
 
 # Helper function to add resources into bundle
+# Добавляет текущие data-файлы в представление IDE и копирует всё дерево в соседний data/.
+# GLOB выполняется при configure; новые файлы для списка SOURCES требуют повторной конфигурации.
+# Содержимое/локализации копируются без преобразования, сохраняя структуру путей поставки OBS 33.
 function(target_install_resources target)
   message(DEBUG "Installing resources for target ${target}...")
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data")
@@ -91,6 +100,8 @@ function(target_install_resources target)
 endfunction()
 
 # Helper function to add a specific resource to a bundle
+# Вариант для одного файла: устанавливает его в data/ и копирует после сборки с исходным именем.
+# resource должен существовать к шагу копирования; функция не генерирует и не проверяет его содержимое.
 function(target_add_resource target resource)
   message(DEBUG "Add resource '${resource}' to target ${target} at destination '${target_destination}'...")
 

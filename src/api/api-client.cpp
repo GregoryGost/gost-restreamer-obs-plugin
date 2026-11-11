@@ -18,10 +18,13 @@ namespace gost::api {
 namespace {
 QString segment(const QString &id)
 {
+	// Непрозрачный ID целиком кодируется как один сегмент, включая возможные разделители пути.
 	return QString::fromLatin1(QUrl::toPercentEncoding(id));
 }
 QUrlQuery queryParameters(const ListQuery &query)
 {
+	// Все фильтры кодируются как значения query, включая '+', '&' и '%' в непрозрачном курсоре.
+	// Пустая строка означает отсутствие фильтра; limit передаётся всегда, его валидность решает сервер.
 	QUrlQuery result;
 	result.addQueryItem(QStringLiteral("limit"), QString::number(query.limit));
 	for (auto pair :
@@ -35,9 +38,18 @@ QUrlQuery queryParameters(const ListQuery &query)
 	return result;
 }
 } // namespace
+// Управляет очередью и активными REST-запросами в потоке owner. Задание сначала ожидает в queue,
+// затем занимает слот в active и завершается через complete. Отмена или удаление receiver подавляет
+// выдачу результата. Несколько сетевых сигналов могут ссылаться на один Job; завершить его и
+// освободить слот можно только пока он находится в active. Все переходы выполняются в одном цикле Qt.
 class APIClient::Impl {
 public:
 	using RawCallback = Callback<QByteArray>;
+	// Состояние одного GET разделяется между очередью и захватами обработчиков через shared_ptr.
+	// Job не владеет receiver и reply. reply принадлежит network; оба таймера являются его детьми.
+	// finished отмечает конец транспорта, а не готовность результата: в reply ещё могут оставаться байты.
+	// scheduled означает единственное уже поставленное продолжение drain и предотвращает двойное чтение.
+	// context защищает смену выбора, serial дополнительно защищает явную отмену при том же выборе.
 	struct Job {
 		QPointer<QObject> receiver;
 		RequestContext context;
@@ -66,17 +78,28 @@ public:
 	QHash<QNetworkReply *, std::shared_ptr<Job>> active;
 	Impl(APIClient *owner, Limits limits) : owner(owner), limits(limits), network(owner)
 	{
+		// Для явно выбранного локального сервера обходим системное определение прокси: WinHTTP может
+		// заблокировать GUI ещё внутри get(), до запуска таймеров запроса. Настройки прокси OBS не меняем.
 		network.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
 	}
+	// Проверяет право выдавать результат, а не только наличие сетевого ответа. Проверка нужна также
+	// для ошибок допуска, у которых reply вообще не создавался, и для продолжений обхода списка.
 	bool current(const std::shared_ptr<Job> &job) const
 	{
+		// serial запрещает доставку и отложенных заданий того же RequestContext после явной отмены.
 		return !stopped && job->serial == serial && job->context == context && job->receiver;
 	}
+	// Вызывает обработчик получателя прямо в текущем стеке. Тот может удалить owner, поэтому после
+	// возврата из deliver обращаться к Impl можно лишь после проверки, что клиент ещё существует.
 	void deliver(const std::shared_ptr<Job> &job, Result<QByteArray> result)
 	{
 		if (current(job))
 			job->callback(job->context, std::move(result));
 	}
+	// Завершает активный GET не более одного раза. До callback удаляет запись из active и отключает
+	// сигналы, чтобы abort, timeout и finished не завершили его повторно. abort нужен при досрочном
+	// отказе; нормальный EOF уже завершил транспорт. Освободившийся слот заполняется после callback,
+	// с учётом возможной отмены, перенастройки или уничтожения клиента внутри него.
 	void complete(const std::shared_ptr<Job> &job, Result<QByteArray> result, bool abort = false)
 	{
 		auto *reply = job->reply.data();
@@ -88,13 +111,18 @@ public:
 		if (abort)
 			reply->abort();
 		reply->deleteLater();
+		// Пользовательский обработчик может удалить клиент; очередь продолжается только при живом владельце.
 		const QPointer<APIClient> guard = owner;
 		deliver(job, std::move(result));
 		if (guard)
 			pump();
 	}
+	// Отменяет активные и ожидающие задания. Новое значение serial запрещает выдачу результатов
+	// также из уже запланированных singleShot. Очередь очищается без уведомлений; active очищается
+	// до abort, поскольку прерывание может породить сетевые сигналы. Новые задания допустимы до shutdown().
 	void cancel()
 	{
+		// Сначала запрещаем доставку, затем прерываем ответы: их завершение не должно вызвать старые обработчики.
 		++serial;
 		queue.clear();
 		const auto jobs = active;
@@ -107,6 +135,10 @@ public:
 				reply->deleteLater();
 			}
 	}
+	// Принимает относительный путь внутри /api/v1 и предел полного тела. Ошибки origin/лимитов/очереди
+	// выдаются отложенно с теми же проверками актуальности, что и сетевой результат. При остановленном
+	// клиенте или null receiver операция не создаётся. Исчезновение активного receiver сразу освобождает
+	// слот; исчезнувшее задание в очереди будет пропущено pump. Слабый захват не удерживает Job сам собой.
 	void raw(QString path, QUrlQuery query, QObject *receiver, RawCallback callback, qsizetype cap)
 	{
 		if (stopped || !receiver)
@@ -146,6 +178,9 @@ public:
 		queue.enqueue(std::move(job));
 		pump();
 	}
+	// Запускает ожидающие актуальные задания до maxActiveRequests. Порядок очереди сохраняется,
+	// устаревшие записи пропускаются. Каждый ответ получает собственные idle/deadline таймеры:
+	// получение очередных байтов продлевает только idle, абсолютный срок отправленного GET неизменен.
 	void pump()
 	{
 		while (!stopped && active.size() < limits.maxActiveRequests && !queue.isEmpty()) {
@@ -172,6 +207,7 @@ public:
 			};
 			QObject::connect(job->deadline, &QTimer::timeout, owner, timeout);
 			QObject::connect(job->idle, &QTimer::timeout, owner, timeout);
+			// Оба бюджета начинаются при отправке, а не во время ожидания места в очереди.
 			job->deadline->start(std::max(1, limits.httpDeadlineMs));
 			job->idle->start(std::max(1, limits.httpIdleMs));
 			QObject::connect(reply, &QIODevice::readyRead, owner, [this, job] { drain(job); });
@@ -181,6 +217,10 @@ public:
 			});
 		}
 	}
+	// За один вызов считывает ограниченную порцию. Сначала проверяет актуальность и размер, затем
+	// дожидается и EOF транспорта, и опустошения буфера. Только после этого классифицирует ответ.
+	// Это сохраняет последние байты после finished и не позволяет принять усечённый JSON как полный.
+	// Продолжение привязано к owner; отмена делает его безвредным через reply/active/serial.
 	void drain(const std::shared_ptr<Job> &job)
 	{
 		if (job->scheduled)
@@ -193,6 +233,7 @@ public:
 			return;
 		}
 		const auto room = job->cap - job->body.size();
+		// Дополнительный байт позволяет обнаружить превышение, не выдавая усечённый ответ как полный.
 		const auto bytes = reply->read(std::min(limits.readBytes, room + 1));
 		if (!bytes.isEmpty()) {
 			job->body.append(bytes);
@@ -203,6 +244,7 @@ public:
 			return;
 		}
 		if (reply->bytesAvailable() > 0) {
+			// Большое тело читается несколькими оборотами цикла событий, сохраняя доступность интерфейса.
 			if (!job->scheduled) {
 				job->scheduled = true;
 				QTimer::singleShot(0, owner, [this, job] {
@@ -221,6 +263,7 @@ public:
 					   .trimmed()
 					   .toLower();
 		if (status >= 400) {
+			// HTTP-ошибка обрабатывается до общей ошибки транспорта, которую Qt также выставляет для таких ответов.
 			complete(job, Result<QByteArray>::failure(
 					      decodeProblem(status, media == QStringLiteral("application/problem+json")
 									    ? job->body
@@ -237,6 +280,8 @@ public:
 		}
 		complete(job, Result<QByteArray>::success(std::move(job->body)));
 	}
+	// Преобразование DTO выполняется только для полного успешного тела. decode создаёт новый объект,
+	// поэтому ошибка в середине документа не публикует частично заполненную сущность.
 	template<class T>
 	void get(QString path, QObject *receiver, Callback<T> callback, QUrlQuery query = {}, qsizetype cap = 0)
 	{
@@ -255,6 +300,11 @@ public:
 	{
 		get(std::move(path), receiver, std::move(callback), queryParameters(query));
 	}
+	// Состояние одного последовательного обхода, живущее между GET и отложенными walkNext.
+	// Фильтры query сохраняются; меняется только cursor. result хранит лишь принятые страницы,
+	// bytes считает их исходные JSON-байты, pages — принятые документы, cursors обнаруживает циклы.
+	// complete остаётся false до явного конца списка. receiver заимствован, serial/context фиксируются
+	// на весь обход, поэтому его нельзя незаметно продолжить после смены подключения или выбора.
 	template<class T> struct Walk {
 		QString path;
 		ListQuery query;
@@ -266,12 +316,17 @@ public:
 		quint64 serial = 0;
 		RequestContext context;
 	};
+	// Выполняет ровно один шаг обхода. Общий бюджет проверяется до GET и перед принятием страницы;
+	// размер отдельного ответа независимо ограничивает raw. Предел элементов может принять часть
+	// страницы, но это заведомо неполный результат. Следующая страница ставится через singleShot,
+	// чтобы не наращивать стек и дать обработать GUI/отмену между страницами.
 	template<class T> void walkNext(std::shared_ptr<Walk<T>> walk)
 	{
 		if (walk->serial != serial || walk->context != context || !walk->receiver || stopped)
 			return;
 		if (walk->pages >= limits.maxPages || walk->result.items.size() >= limits.maxItems ||
 		    walk->result.bytes >= limits.pageWalkBytes) {
+			// Общий бюджет возвращает известную часть с complete=false; ошибка отдельного ответа остаётся ошибкой.
 			walk->callback(walk->context, Result<Collection<T>>::success(std::move(walk->result)));
 			return;
 		}
@@ -284,6 +339,7 @@ public:
 				}
 				const auto remaining = limits.pageWalkBytes - walk->result.bytes;
 				if (rawResult.value->size() > remaining) {
+					// Страница либо принимается целиком по объёму, либо сохраняются только предыдущие страницы.
 					walk->callback(ctx, Result<Collection<T>>::success(std::move(walk->result)));
 					return;
 				}
@@ -320,6 +376,8 @@ public:
 			},
 			limits.restBodyBytes);
 	}
+	// Начальный cursor тоже участвует в обнаружении циклов. walkNext вызывается непосредственно:
+	// если бюджет уже исчерпан, callback выполнится в этом стеке, как описано у публичного getAll<Name>.
 	template<class T> void all(QString path, QObject *receiver, Callback<Collection<T>> callback, ListQuery query)
 	{
 		auto walk = std::make_shared<Walk<T>>();

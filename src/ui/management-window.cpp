@@ -34,6 +34,9 @@
 namespace gost {
 namespace {
 
+// Иконки хранят исходное имя ресурса и запасной QStyle ID: смена палитры OBS требует повторного
+// выбора Light/Dark, а не перекрашивания уже загруженного изображения. Список живёт в GUI-потоке;
+// фильтр qApp удаляется Qt вместе с объектом, элементы списка принадлежат QListWidget.
 class NavigationList final : public QListWidget {
 public:
 	explicit NavigationList(QWidget *parent) : QListWidget(parent)
@@ -45,6 +48,8 @@ public:
 
 	void addSection(const QString &title, const char *asset, QStyle::StandardPixmap fallback)
 	{
+		// asset заимствован до удаления списка; вызывающий код передаёт строковые литералы.
+		// Порядок icons_ совпадает с порядком элементов и QStackedWidget.
 		auto *section = new QListWidgetItem(title, this);
 		icons_.append({asset, fallback});
 		setSectionIcon(*section, icons_.back());
@@ -68,6 +73,7 @@ private:
 
 	void setSectionIcon(QListWidgetItem &item, const SectionIcon &spec)
 	{
+		// Ресурс берётся из текущей темы OBS; при его отсутствии остаётся штатная иконка стиля Qt.
 		const bool dark = QApplication::palette().color(QPalette::Window).lightness() < 128;
 		const auto path = QStringLiteral("theme:%1/%2")
 					  .arg(dark ? QStringLiteral("Dark") : QStringLiteral("Light"),
@@ -91,6 +97,8 @@ void addPageHeading(QVBoxLayout &layout, const QString &title)
 
 QWidget *makePage(const QString &title, const QString &message, QWidget *parent)
 {
+	// Информационная страница обозначает ещё недоступное действие; её создание не подключает API
+	// и не выдаёт каркас редактора за реализованную серверную операцию.
 	auto *page = new QWidget(parent);
 	auto *layout = new QVBoxLayout(page);
 	addPageHeading(*layout, title);
@@ -110,6 +118,8 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	  text_(std::move(text)),
 	  connection_(connection)
 {
+	// Qt::Window сохраняет самостоятельное окно при родителе OBS. WA_DeleteOnClose=false обеспечивает
+	// повторное открытие того же экземпляра; WA_QuitOnClose=false не позволяет ему завершить приложение.
 	setObjectName(QStringLiteral("managementWindow"));
 	setWindowTitle(text_("Management.Title"));
 	setAttribute(Qt::WA_DeleteOnClose, false);
@@ -230,6 +240,8 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	addPage("Page.Advanced", advancedPage, "settings/advanced.svg", QStyle::SP_FileDialogContentsView);
 
 	connect(connectButton_, &QPushButton::clicked, this, [this] {
+		// Подтверждение требуется при смене уже выбранного origin. Неверный ввод передаётся контроллеру
+		// для сообщения в существующем UI, а не заменяет адрес догадкой или исправлением по умолчанию.
 		if (!connection_) {
 			return;
 		}
@@ -280,6 +292,9 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 
 void ManagementWindow::refreshStreams()
 {
+	// Синтетический пункт старого ID хранит точное itemData. Он сохраняет принадлежность выбора,
+	// но не подтверждает наличие Stream на сервере; контроллер разрешает новый выбор только из полученных.
+	// Пересоздание пунктов не является пользовательским выбором и не должно менять сохранённую привязку.
 	const QSignalBlocker blockStreams(streams_);
 	streams_->clear();
 	streams_->addItem(text_("Stream.Choose"), QString{});
@@ -289,6 +304,7 @@ void ManagementWindow::refreshStreams()
 	displayedSelectionId_ = stateStore_.selectedStreamId();
 	int selected = streams_->findData(displayedSelectionId_);
 	if (selected < 0 && !displayedSelectionId_.isEmpty()) {
+		// Неполный список не доказывает удаления сохранённого Stream; привязка остаётся до явного выбора.
 		streams_->addItem(text_(stateStore_.streamsComplete() ? "Stream.Unavailable" : "Stream.Unconfirmed")
 					  .arg(displayedSelectionId_),
 				  displayedSelectionId_);
@@ -299,6 +315,8 @@ void ManagementWindow::refreshStreams()
 
 void ManagementWindow::refresh()
 {
+	// Отражение состояния не должно вызвать методы изменения или сохранение обратно через toggled/valueChanged.
+	// Список потоков обновляется отдельно: частая SSE-телеметрия иначе сбрасывала бы раскрытый список.
 	const auto &profile = stateStore_.profileName();
 	profile_->setText(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData"));
 	streaming_->setStreamingStatus(text_, stateStore_.streamingActive());
@@ -316,6 +334,7 @@ void ManagementWindow::refresh()
 	connectButton_->setEnabled(connection_ != nullptr);
 	disconnectButton_->setEnabled(connection_ && stateStore_.connectionStatus() != ConnectionStatus::Disconnected);
 	connectionStatus_->setConnectionStatus(text_, stateStore_.connectionStatus());
+	// Обычная телеметрия не пересоздаёт список и не закрывает открытый пользователем выбор потока.
 	if (displayedSelectionId_ != stateStore_.selectedStreamId()) {
 		refreshStreams();
 	}

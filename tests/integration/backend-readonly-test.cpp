@@ -6,6 +6,9 @@
 
 using namespace gost::api;
 
+// Ограниченная внешняя проверка трёх GET: live, ready и capabilities через продуктовый клиент.
+// Адрес задаётся только GOST_TEST_BACKEND_URL; отсутствие адреса даёт код пропуска CTest 77.
+// Успех не подтверждает сборку backend по commit, RTMP/FFmpeg, SSE или готовность реального эфира.
 class BackendReadOnlyTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -63,6 +66,8 @@ void BackendReadOnlyTest::health()
 
 void BackendReadOnlyTest::capabilities()
 {
+	// Проверяется доступность формы наблюдения, а не обязательная готовность каждого инструмента:
+	// unverified/недоступная проверка допустимы, если сервер явно сообщает их состояние.
 	Limits limits;
 	limits.httpDeadlineMs = 3000;
 	limits.httpIdleMs = 3000;
@@ -83,6 +88,7 @@ void BackendReadOnlyTest::capabilities()
 int main(int argc, char **argv)
 {
 	QCoreApplication application(argc, argv);
+	// Код 77 согласован с CTest: отсутствие явно заданного сервера означает пропуск внешней проверки.
 	if (qEnvironmentVariableIsEmpty("GOST_TEST_BACKEND_URL")) {
 		qInfo("Проверка backend пропущена: GOST_TEST_BACKEND_URL не задан.");
 		return 77;

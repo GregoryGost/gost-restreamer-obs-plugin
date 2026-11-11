@@ -10,6 +10,10 @@
 #include <memory>
 #include <stdexcept>
 
+// Управляемая граница Frontend с настоящими QWidget/QDockWidget и владением Qt, а не заглушкой UI.
+// Поля statistics/profile/streaming задают наблюдения, флаги отказов — точки отката. Счётчики
+// доказывают отсутствие ранних/поздних вызовов API и порядок очистки. Нужен QApplication GUI-потока.
+// host принадлежит фикстуре; Dock и его содержимое — host/Qt. Заимствованные cookie не удерживаются живыми.
 class FakeFrontend final : public gost::Frontend {
 public:
 	QWidget *mainWindow() const override
@@ -20,6 +24,8 @@ public:
 
 	bool addDock(const char *id, const QString &title, QWidget *widget) override
 	{
+		// Передача владения происходит лишь после всех искусственных отказов. content — QPointer,
+		// поэтому отказ addDock не делает фикстуру вторым владельцем ещё локального unique_ptr виджета.
 		recordCall();
 		++dockAdds;
 		dockId = QString::fromUtf8(id);
@@ -114,6 +120,9 @@ public:
 
 	void emitEvent(gost::FrontendEvent event)
 	{
+		// Frontend становится недоступным сразу после завершения рассылки Exit. Поэтому очистка
+		// через отложенный вызов или deleteLater была бы обнаружена callsAfterExit, даже без аварии настоящего OBS.
+		// Обработчик Exit может снять собственную подписку прямо во время вызова.
 		const auto callback = activeCallback;
 		const auto cookie = activeCookie;
 		if (callback)
@@ -159,6 +168,9 @@ public:
 	mutable int callsAfterExit = 0;
 	EventCallback activeCallback = nullptr;
 	void *activeCookie = nullptr;
+	// Сохранённая пара позволяет имитировать поздний вызов, пока оболочка PluginLifecycle ещё жива.
+	// lastCookie допустимо вызывать лишь пока внешняя оболочка lifecycle ещё существует;
+	// это моделирует задержанную доставку, а не разрешает разыменование после её деструктора.
 	EventCallback lastCallback = nullptr;
 	void *lastCookie = nullptr;
 };

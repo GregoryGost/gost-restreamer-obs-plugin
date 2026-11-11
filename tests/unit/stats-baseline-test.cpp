@@ -14,6 +14,8 @@ const StatsBaseline::Identity firstRun{QStringLiteral("output-a"), 1};
 
 } // namespace
 
+// Проверки чистой арифметики без цикла событий Qt, OBS и сети. Числа выбраны так, чтобы полный счётчик,
+// дельта после reset и дельта после разрыва давали разные проценты. Каждый сценарий создаёт новый baseline.
 class StatsBaselineTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -40,6 +42,7 @@ void StatsBaselineTest::usesTheSamePeriodForBothCounters()
 	QCOMPARE(reading.period, Period::SinceReset);
 
 	baseline.observe(firstRun, Counters{10, 110}, true);
+	// После сброса прирост равен 2/10, поэтому ожидается 20%, а не отношение полных накоплений 10/110.
 	reading = baseline.reading();
 	QVERIFY(reading.counters);
 	QCOMPARE(reading.counters->count, quint64{2});
@@ -57,6 +60,8 @@ void StatsBaselineTest::usesTheSamePeriodForBothCounters()
 
 void StatsBaselineTest::staleReadingsCannotReplaceOrResetTheBaseline()
 {
+	// Большие устаревшие числа намеренно отличаются от последнего свежего чтения. Они не должны ни
+	// попасть на экран, ни стать скрытой точкой следующего reset; восстановление продолжает прежний период.
 	StatsBaseline baseline;
 	baseline.observe(firstRun, Counters{4, 40}, true);
 	baseline.reset();
@@ -79,6 +84,8 @@ void StatsBaselineTest::staleReadingsCannotReplaceOrResetTheBaseline()
 
 void StatsBaselineTest::regressionStartsANewPeriod()
 {
+	// Сначала уменьшается лишь total, затем лишь count. Любой регресс разрывает сразу всю пару,
+	// иначе unsigned-вычитание либо смешанные периоды дали бы правдоподобный неверный процент.
 	StatsBaseline baseline;
 	baseline.observe(firstRun, Counters{10, 100}, true);
 	baseline.reset();
@@ -103,6 +110,8 @@ void StatsBaselineTest::regressionStartsANewPeriod()
 
 void StatsBaselineTest::changesOfInstanceAndEpochStartNewRuns()
 {
+	// Проверяются обе координаты identity. Новое исполнение приходит без свежих счётчиков:
+	// уже в этот момент старое показание должно исчезнуть, а не ждать первого нового измерения.
 	StatsBaseline baseline;
 	baseline.observe(firstRun, Counters{5, 60}, true);
 	baseline.reset();
@@ -135,6 +144,7 @@ void StatsBaselineTest::saturationDoesNotBecomeAZeroIncrement()
 	QCOMPARE(baseline.reading().percent, std::optional{50.0});
 
 	baseline.observe(firstRun, Counters{maximum, maximum}, true, true);
+	// Насыщение делает прирост неизвестным; после него первая достоверная выборка задаёт новый период.
 	auto reading = baseline.reading();
 	QVERIFY(reading.limited);
 	QVERIFY(!reading.counters);
@@ -152,6 +162,8 @@ void StatsBaselineTest::saturationDoesNotBecomeAZeroIncrement()
 
 void StatsBaselineTest::missingDenominatorDoesNotBecomeZeroPercent()
 {
+	// count без total остаётся полезен. Появление total создаёт новую границу; только следующая
+	// выборка с положительным приростом знаменателя может достоверно показать нулевой процент.
 	StatsBaseline baseline;
 	baseline.observe(firstRun, Counters{17, std::nullopt}, true);
 	QVERIFY(baseline.canReset());

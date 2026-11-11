@@ -4,6 +4,8 @@
 
 using namespace gost::api;
 
+// Проверяется именно байтовое обрамление серверного SSE: произвольные разрезы чтения, UTF-8,
+// разделители и память. Эти тесты не создают HTTP-подписку и не доказывают политику переподключения.
 class SSEParserTest final : public QObject {
 	Q_OBJECT
 private slots:
@@ -34,6 +36,7 @@ void SSEParserTest::fragmentedUnicodeAndLineEndings()
 	const auto wire = QByteArray::fromHex("efbbbf") + "event: metrics" + ending + "id: opaque/%2B=" + ending +
 			  "data: " + QStringLiteral("{\"name\":\"Поток 😀\",").toUtf8() + ending +
 			  "data: \"value\":1}" + ending + ending;
+	// Перебор всех разрезов включает середину UTF-8, начальную метку и границу CR/LF между чтениями.
 	for (qsizetype cut = 0; cut <= wire.size(); ++cut) {
 		SSEParser parser;
 		QVERIFY(parser.feed(wire.first(cut)));
@@ -55,6 +58,8 @@ void SSEParserTest::fragmentedUnicodeAndLineEndings()
 
 void SSEParserTest::commentsAndUnknownFieldsDoNotCreateEvents()
 {
+	// retry/unknown и heartbeat не содержат прикладных data. Следующий кадр включает пустую data
+	// и два пробела: один удаляется синтаксисом, второй обязан сохраниться как часть значения.
 	SSEParser parser;
 	QVERIFY(parser.feed(": heartbeat\n\nretry: 1000\nunknown: ignored\n\n"));
 	QVERIFY(!parser.hasFrame());
@@ -76,6 +81,7 @@ void SSEParserTest::unfinishedFrameIsNotPublished()
 {
 	QFETCH(QByteArray, unfinishedData);
 	SSEParser parser;
+	// Без завершающей пустой строки даже оборванная кодовая точка отбрасывается вместе с недоставленным кадром.
 	QVERIFY(parser.feed("event: state\nid: unfinished\ndata: " + unfinishedData));
 	QVERIFY(!parser.hasFrame());
 	QVERIFY(parser.finish());
@@ -95,6 +101,8 @@ void SSEParserTest::invalidUtf8IsRejected_data()
 
 void SSEParserTest::invalidUtf8IsRejected()
 {
+	// Добавляется завершитель строки, чтобы ошибочная последовательность уже не считалась
+	// допустимым недополученным хвостом. Нужна Decode, а не выдача строки с заменяющим символом.
 	QFETCH(QByteArray, invalid);
 	SSEParser parser;
 	const auto wire = "data: " + invalid + "\n\n";
@@ -106,6 +114,8 @@ void SSEParserTest::invalidUtf8IsRejected()
 
 void SSEParserTest::frameAndQueueLimitsAreBounded()
 {
+	// Три независимых ограничения: текущий кадр, число готовых кадров и их байтовый бюджет.
+	// Малые тестовые пределы заставляют пересечь каждую границу без больших выделений памяти.
 	Limits limits;
 	limits.frameBytes = 64;
 	SSEParser oversized(limits);
@@ -127,6 +137,8 @@ void SSEParserTest::frameAndQueueLimitsAreBounded()
 
 void SSEParserTest::drainingQueueReleasesBudget()
 {
+	// При вместимости в один кадр многократное feed/take должно работать неограниченно по времени,
+	// освобождая оба бюджета. Это отличает ограничение одновременно ожидающих данных от общего трафика.
 	Limits limits;
 	limits.pendingEvents = 1;
 	SSEParser parser(limits);
@@ -141,6 +153,8 @@ void SSEParserTest::drainingQueueReleasesBudget()
 
 void SSEParserTest::resetDiscardsPartialAndFailedInput()
 {
+	// reset проверяется и после незавершённого кадра, и после зафиксированной Decode: новый поток
+	// не наследует ни старое data, ни ошибку, ни состояние разделителей.
 	SSEParser parser;
 	QVERIFY(parser.feed("data: old"));
 	parser.reset();

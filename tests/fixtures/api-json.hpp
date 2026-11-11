@@ -5,6 +5,10 @@
 #include <QJsonObject>
 
 namespace fixture {
+// Синтетические документы собираются независимо от декодера. Функции возвращают новые JSON-значения,
+// которые сценарий может менять для отрицательной проверки. object предназначен для литералов фикстуры,
+// а не для проверки разбора: он не сообщает ошибку JSON; валидность входа обеспечивает автор сценария.
+// Числовые uint64 намеренно записаны строками, поля с допустимым null и прежние формы сохраняются явно.
 inline QJsonObject object(const QByteArray &json)
 {
 	return QJsonDocument::fromJson(json).object();
@@ -30,6 +34,7 @@ inline QJsonObject stream(const QString &id = QStringLiteral("stream"))
 }
 inline QString endpoint()
 {
+	// Разный регистр, учётные данные и вложенное кодирование выявляют незаметную нормализацию при чтении адреса.
 	return QStringLiteral("rtmps://user:p%40ss@EXAMPLE.com:443/live/%2f?q=a%2Bb&token=%252F");
 }
 inline QJsonObject destination()
@@ -54,6 +59,8 @@ inline QJsonObject format()
 }
 inline QJsonObject groupProfile()
 {
+	// Наследуемый профиль: нет live_audio_mode и encoding=null. Современный сценарий должен добавить явные
+	// поля сам, иначе фикстура незаметно перестала бы проверять обратную совместимость.
 	auto result = object(R"({"mode":"transcode","encoding":null,
 "video_encoding":{"target_bitrate_bps":"6000000","max_bitrate_bps":"8000000","buffer_bits":"12000000",
 "gop_frames":120,"max_b_frames":2,"closed_gop":true},"audio_encoding":{"bitrate_bps":"192000"}})");
@@ -84,6 +91,7 @@ inline QJsonObject group()
 }
 inline QJsonObject session()
 {
+	// Исторические вложенные Stream/Group/Profile собраны по значению, не ссылками на изменяемый реестр.
 	auto result = record(QStringLiteral("session"));
 	result.insert(QStringLiteral("stream_id"), QStringLiteral("stream"));
 	result.insert(QStringLiteral("state"), QStringLiteral("RUNNING"));
@@ -138,6 +146,8 @@ inline QJsonObject observation(const QString &instance = QStringLiteral("epoch:1
 }
 inline QJsonObject media()
 {
+	// Нулевые накопления доступны отдельно от warming_up rates с null. Это различие не даёт UI
+	// подменять отсутствие окна измерения фиктивной скоростью 0.
 	const auto rate = object(R"({"status":"warming_up","reason":"","value":null,"window_start":null,
 "window_end":null,"duration_ns":"0"})");
 	auto result = object(R"({"sampled_at":null,"video_frames":"0","payload_bytes":"0","written_bytes":"0",
@@ -150,6 +160,8 @@ inline QJsonObject media()
 }
 inline QJsonObject outputMetrics()
 {
+	// ACK включает предел uint64 и число выше 2^53, чтобы промежуточный double ломал ожидания.
+	// Карты потерь здесь пусты; для проверки отображения известного нуля нужна явная категория с нулевым значением.
 	auto result = object(R"({"counters":{"reconnects":"2"},"queue_drops":{},"delivery_drops":{},"resync":false,
 "last_write":null,"last_media":null,"ack_ahead_events_total":"18446744073709551615",
 "ack_ahead_bytes_last":"9007199254740993","ack_ahead_bytes_max":"18446744073709551614","ack_last_anomaly_at":null})");
@@ -159,6 +171,8 @@ inline QJsonObject outputMetrics()
 inline QJsonObject event(const QString &kind = QStringLiteral("state"),
 			 const QString &cursor = QStringLiteral("opaque/next"))
 {
+	// Базовое Session-событие без содержательного блока данных. Для metrics/input/gpu сценарий обязан
+	// установить согласованные owner, идентификаторы и блок данных; одна смена kind не создаёт валидное событие.
 	return {{QStringLiteral("cursor"), cursor},
 		{QStringLiteral("kind"), kind},
 		{QStringLiteral("owner"), QStringLiteral("session")},
@@ -181,6 +195,8 @@ inline QJsonObject event(const QString &kind = QStringLiteral("state"),
 }
 inline QByteArray frame(const QJsonObject &event, const QByteArray &eventName = {}, const QByteArray &id = {})
 {
+	// Непустые переопределения намеренно могут противоречить JSON для проверки EventClient. Пустое переопределение
+	// означает взять поле JSON; для теста отсутствующего/пустого id нужно собрать сетевой кадр вручную.
 	return "event: " + (eventName.isEmpty() ? event.value(QStringLiteral("kind")).toString().toUtf8() : eventName) +
 	       "\nid: " + (id.isEmpty() ? event.value(QStringLiteral("cursor")).toString().toUtf8() : id) +
 	       "\ndata: " + bytes(event) + "\n\n";

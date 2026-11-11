@@ -1,3 +1,24 @@
+<#
+.SYNOPSIS
+Проверяет UI одного явно указанного тестового OBS через UI Automation и Win32 API.
+.DESCRIPTION
+Запускается вспомогательным процессом в интерактивном Windows-сеансе. До действий проверяет PID, путь,
+время старта и принадлежность HWND/AutomationElement. Выполняет действия только над этим экземпляром:
+показывает/перемещает Dock, открывает окно, проверяет навигацию, повторное открытие и минимизацию.
+Идентичность загруженной DLL и Qt проверяется по модулям процесса, не по наличию файлов рядом.
+Выдаёт JSON результата, а при отказе — ограниченную диагностику собственных окон и throw.
+.PARAMETER ObsProcessId
+PID собственного запущенного экземпляра; ExpectedExecutable и ExpectedStartTicks защищают от его переиспользования.
+.PARAMETER MainWindowHandle
+Дескриптор главного OBSBasic того же процесса, полученный запускающим скриптом после подтверждения загрузки.
+.PARAMETER WorkspaceRoot
+Корень, внутри которого должен находиться реальный исполняемый файл без ссылок.
+.PARAMETER ExpectedPluginPath
+Точный путь загруженного модуля; ExpectedPluginSHA256 связывает его с выбранной сборкой.
+.PARAMETER Launch
+Первый запуск показывает и перемещает Dock, второй проверяет уже сохранённые видимость и
+ExpectedDockLeft/ExpectedDockTop в физических координатах с допуском два пикселя.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][int] $ObsProcessId,
@@ -56,6 +77,7 @@ while ($ancestor.FullName -ne $workspace) {
 }
 
 function Assert-OwnedProcess {
+    # Проверка PID, исполняемого файла и времени запуска отделяет тестовый OBS от посторонних процессов.
     $owned = [Diagnostics.Process]::GetProcessById($ObsProcessId)
     try {
         if ($owned.HasExited -or $owned.MainModule.FileName -ne $executable -or
@@ -68,6 +90,8 @@ function Assert-OwnedProcess {
 }
 
 function Wait-Condition {
+    # Ожидает наблюдаемый факт не более пяти секунд, перепроверяя идентичность процесса на каждой итерации.
+    # Пауза лишь ограничивает частоту опроса; успех не выводится из истечения времени.
     param([Parameter(Mandatory)][scriptblock] $Condition, [Parameter(Mandatory)][string] $Failure)
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
@@ -85,6 +109,8 @@ function Wait-Condition {
 }
 
 function Assert-OwnedElement {
+    # Проверяет PID элемента непосредственно перед его использованием. Поиск по локализованному
+    # имени сам по себе не доказывает, что элемент относится к собственной тестовой среде.
     param([Parameter(Mandatory)] $Element)
     Assert-OwnedProcess
     $elementProcessId = $Element.Current.ProcessId
@@ -119,6 +145,7 @@ Assert-OwnedElement $main
 if ($main.Current.ClassName -cne 'OBSBasic') { throw 'Переданный дескриптор не относится к главному окну OBS.' }
 
 function Get-Gears {
+    # Плавающий Dock может стать отдельным корнем UI Automation; GetRuntimeId() исключает двойной учёт элемента.
     $roots = @($main) + @([System.Windows.Automation.AutomationElement]::RootElement.FindAll(
         [System.Windows.Automation.TreeScope]::Children, $processCondition) | Where-Object { $_.Current.Name -ceq 'GOST Restreamer' })
     $seen = @{}
@@ -135,6 +162,8 @@ function Get-Gears {
 }
 
 function Get-ManagementWindows {
+    # Окно Qt может быть отдельным корнем или потомком окна-владельца. Объединение поиска с RuntimeId
+    # позволяет обнаружить несколько экземпляров без двойного подсчёта одного элемента UIA.
     $roots = @($main) + @([System.Windows.Automation.AutomationElement]::RootElement.FindAll(
         [System.Windows.Automation.TreeScope]::Children, $processCondition))
     $seen = @{}
@@ -159,6 +188,8 @@ function Get-VisibleManagementWindows {
 }
 
 function Write-UiDiagnostics {
+    # Диагностика ограничена тем же PID и небольшим набором дочерних элементов. Ошибка диагностики
+    # не подменяет исходный отказ Wait-Condition; основной сценарий всё равно считается неуспешным.
     param([string] $Failure)
     Assert-OwnedProcess
     $nativeWindows = [Collections.Generic.List[object]]::new()
@@ -209,6 +240,7 @@ function Write-UiDiagnostics {
 }
 
 function Invoke-Gear {
+    # Использует InvokePattern единственной видимой кнопки, а не координатный клик в активном окне.
     $gears = @(Get-Gears)
     if ($gears.Count -ne 1) { throw 'Не найдена единственная локализованная шестерёнка Dock.' }
     Assert-OwnedElement $gears[0]
@@ -234,6 +266,9 @@ function Assert-OwnedDock {
 }
 
 function Get-OwnedDock {
+    # Требует один видимый плавающий Dock с владельцем MainWindowHandle и точным названием.
+    # После перечисления ещё раз проверяем принадлежность и состояние окна через Win32.
+    # Вызывающий код также проверяет окно перед действием; один сохранённый HWND не подтверждает его пригодность.
     Assert-OwnedProcess
     $handles = [Collections.Generic.List[long]]::new()
     $visitor = [ObsWindowInspection+WindowVisitor] {
@@ -260,6 +295,7 @@ function Get-OwnedDock {
 function Read-DockPosition {
     param([Parameter(Mandatory)][IntPtr] $Window)
     Assert-OwnedDock $Window
+    # Геометрия сравнивается в физических координатах; прежний контекст DPI восстанавливается в finally.
     $previousDpi = [ObsWindowInspection]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
     if ($previousDpi -eq [IntPtr]::Zero) { throw 'Не удалось установить контекст физических координат тестового потока.' }
     try {
@@ -273,6 +309,8 @@ function Read-DockPosition {
 }
 
 function Move-OwnedDock {
+    # Выбирает отличимое положение внутри рабочей области текущего монитора с запасом 64 пикселя.
+    # Размер/порядок окон не меняются; недостаточная область — отказ тестовой среды, а не перемещение вслепую.
     param([Parameter(Mandatory)][IntPtr] $Window)
     Assert-OwnedDock $Window
     $previousDpi = [ObsWindowInspection]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
@@ -316,6 +354,8 @@ function Move-OwnedDock {
 }
 
 function Assert-DockObservations {
+    # Для пустого Isolated профиля проверяет реальные доступные подписи профиля и остановленного OBS.
+    # Это наблюдение локального жизненного цикла, не готовность backend/ingest.
     Assert-OwnedDock $dockWindow
     $dockElement = [System.Windows.Automation.AutomationElement]::FromHandle($dockWindow)
     Assert-OwnedElement $dockElement
@@ -331,6 +371,8 @@ function Assert-DockObservations {
 }
 
 function Observe-ManagementActivation {
+    # Только наблюдает активное окно после действия плагина. Принудительный SetForegroundWindow здесь
+    # сделал бы проверку активации самоподтверждающейся; подготовка исходного окна выполняется отдельно.
     $deadline = [DateTime]::UtcNow.AddSeconds(1)
     do {
         Assert-OwnedElement $management
@@ -342,6 +384,7 @@ function Observe-ManagementActivation {
 
 function Prepare-OwnedMainForeground {
     param([ValidateRange(1, 20)][int] $ObservationSeconds = 1)
+    # Подготовка исходного активного окна проверяется отдельно от результата активации окна управления.
     Assert-OwnedElement $main
     $window = [IntPtr]::new($MainWindowHandle)
     $ownerProcess = [uint32]0
@@ -418,6 +461,8 @@ $runtimeId = $management.GetRuntimeId() -join ':'
 if ($managementHandle -eq 0) { throw 'Не подтверждён собственный дескриптор расширенного окна.' }
 
 function Assert-SameManagementWindow {
+    # При повторной шестерёнке или восстановлении сравниваются HWND и UIA RuntimeId. После скрытия и показа Qt
+    # вправе пересоздать нативный дескриптор: тот сценарий ниже проверяет единственность и сохранение раздела.
     param([Parameter(Mandatory)][string] $Stage)
     $windows = @(Get-VisibleManagementWindows)
     if ($windows.Count -ne 1 -or $windows[0].Current.NativeWindowHandle -ne $managementHandle -or
@@ -437,6 +482,8 @@ function Assert-SameManagementWindow {
 }
 
 function Close-OwnedManagementWindow {
+    # WM_CLOSE адресуется только повторно подтверждённому собственному окну. Это пользовательское
+    # закрытие, которое должно скрыть ManagementWindow, а не остановить OBS или общий Runtime.
     Assert-OwnedElement $management
     $window = [IntPtr]::new($management.Current.NativeWindowHandle)
     $ownerProcess = [uint32]0
@@ -521,6 +568,7 @@ $reopenedSection = $reopenedNavigation[$reopenedNavigation.Count - 1]
 Assert-OwnedElement $reopenedSection
 $reopenedSelection = $reopenedSection.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
 Wait-Condition { $reopenedSelection.Current.IsSelected } 'Закрытие и повторное открытие сбросили выбранный раздел.'
+# Qt может пересоздать нативный дескриптор скрытого окна; после открытия подтверждается единственность видимого окна.
 $reopenedHandle = $reopened.Current.NativeWindowHandle
 if ($reopenedHandle -eq 0) { throw 'Не подтверждён дескриптор повторно открытого окна.' }
 $nativeManagement = @(Get-VisibleNativeManagementHandles)
@@ -531,6 +579,8 @@ if (@(Get-VisibleManagementWindows).Count -ne 1 -or $nativeManagement.Count -ne 
 Assert-DockObservations
 
 $owned = [Diagnostics.Process]::GetProcessById($ObsProcessId)
+# Файловые версии/пути берутся из реально загруженных модулей. Итоговые Activation* поля отдельно
+# сообщают подготовку и наблюдение фокуса: успешный остальной сценарий не доказывает активацию автоматически.
 try {
     Assert-OwnedProcess
     $runtimeDirectory = (Split-Path -Parent $executable).TrimEnd('\', '/')

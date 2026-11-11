@@ -84,6 +84,7 @@ Qt Quick runtime, модули или третье окно. Материалы 
 - Required routing rule: `.codex/rules/request_routing.md`.
 - Общие: `source_code_hygiene.md`, `git.md`.
 - Документация: `context7_documentation.md`.
+- Качество комментариев: `code_comment_quality.md`.
 - C++: `cpp_core.md`, `cpp_style.md`, `cpp_cmake.md`, `cpp_testing.md`, `cpp_http_client.md`.
 - Qt 6: `qt_core.md`, `qt_http_client.md`, `qt_widgets.md`, `qt_testing.md`, `qt_quick_qml.md`.
 
@@ -94,6 +95,7 @@ bootstrap-правила проверки зависимостей и коорд
 ## Active Skills
 
 - `comment-language-audit`
+- `code-comment-quality`
 - `cpp-core`
 - `cpp-style`
 - `cpp-cmake`
@@ -106,6 +108,13 @@ bootstrap-правила проверки зависимостей и коорд
 - `qt-quick-qml`
 
 Полные пакеты расположены в `.agents/skills/<skill-name>/`.
+
+Пара `code_comment_quality.md` + `code-comment-quality` проверяет техническую
+полноту и достоверность пояснений в затронутом коде: контракты, состояния,
+владение ресурсами, порядок действий и причины неочевидных решений.
+`comment-language-audit` отдельно проверяет русский язык пояснений.
+Взаимная обязательная зависимость пары проверяется через
+`.codex/rules/material_dependencies.md`.
 
 ## Agent Roles And Model Selection
 
@@ -354,6 +363,6 @@ Offscreen-проверки, загрузка DLL, нативное поведе�
 ## Imported Materials
 
 - Upstream: `https://github.com/GregoryGost/agent-projects-tools`.
-- Revision: `be85eb155a7b8fc4ae52259fa49a3c20c9e56929` (`v1.18.0`).
+- Revision: `6a6245a97603c87a7c0f96653fb5bf963fcd5fe7` (`v1.19.0`).
 - Переносимые rules/skills/roles подключены выборочно; `AGENTS.md` и общие правила адаптированы к целевому проекту.
 - Локальный `.codex/config.toml` остаётся вне Git; `.codex/config.example.toml` содержит воспроизводимый пример без секретов.

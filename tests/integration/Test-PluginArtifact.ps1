@@ -1,3 +1,18 @@
+<#
+.SYNOPSIS
+Проверяет подготовленный каталог плагина в формате OBS 33 без установки и запуска OBS.
+.DESCRIPTION
+Входные артефакты читаются внутри рабочего каталога проекта без ссылок. Проверяются единственное положение DLL,
+совпадение с выбранной сборкой, PE x64, девять экспортов и обе локализации. В stdout возвращается
+объект результата с SHA256; нарушение завершает сценарий через throw. Это проверка файлового
+артефакта: загрузку зависимых DLL, загрузку модуля и работу GUI подтверждают отдельные запуски.
+.PARAMETER PluginRoot
+Существующий подготовленный каталог gost-restreamer-obs-plugin с DLL в корне и соседним data/locale.
+.PARAMETER ExpectedBinary
+DLL выбранной сборки внутри рабочего каталога проекта, с которой сравнивается SHA256 поставки.
+.PARAMETER Dumpbin
+Явный путь к установленному dumpbin.exe; инструмент только инспектирует PE и экспортируемые символы.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $PluginRoot,
@@ -44,6 +59,7 @@ foreach ($symbol in $requiredExports) {
     }
 }
 foreach ($locale in @('ru-RU', 'en-US')) {
+    # Наличие имени файла недостаточно: поставка должна содержать точный исходник каждой локализации.
     $stagedLocale = Assert-WorkspacePath (Join-Path $plugin "data/locale/$locale.ini")
     $sourceLocale = Assert-WorkspacePath (Join-Path $PSScriptRoot "../../data/locale/$locale.ini")
     if ((Get-FileHash -LiteralPath $stagedLocale).Hash -ne (Get-FileHash -LiteralPath $sourceLocale).Hash) {

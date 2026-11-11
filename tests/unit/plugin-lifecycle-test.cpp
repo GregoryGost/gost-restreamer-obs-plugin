@@ -44,6 +44,8 @@ namespace {
 
 gost::TextLookup localeLookup(const QString &locale = QStringLiteral("ru-RU"))
 {
+	// Словарь копируется из файлов поставки, поэтому отсутствие реально используемого ключа
+	// проваливает тест сразу. Возвращаемая функция владеет строками и не зависит от QSettings.
 	QSettings settings(QStringLiteral(GOST_TEST_LOCALE_DIR) + QLatin1Char('/') + locale + QStringLiteral(".ini"),
 			   QSettings::IniFormat);
 	QMap<QString, QString> strings;
@@ -71,12 +73,16 @@ QList<gost::ManagementWindow *> managementWindows()
 
 void dispatchQueuedEvents()
 {
+	// Явно выполняем отложенные вызовы и удаления, чтобы проверить очистку без ожидания по таймеру.
 	QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
 	QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 }
 
 } // namespace
 
+// QApplication/offscreen проверяет настоящее владение Qt, сигналы, виджеты и цикл событий при
+// управляемом Frontend. Сценарии API используют одноразовый HttpServer и WorkspaceTemp.
+// Это не загрузка DLL в OBS и не доказательство нативного фокуса, DPI или вида окна; для них нужны отдельные проверки.
 class PluginLifecycleTest final : public QObject {
 	Q_OBJECT
 
@@ -129,6 +135,8 @@ void PluginLifecycleTest::stateStartsUnobserved()
 
 void PluginLifecycleTest::stateChangesAreObservable()
 {
+	// Проверяется не только число сигналов: после каждого уведомления должны быть установлены
+	// соответствующие значения. Неопределённое исходное состояние нельзя заранее считать остановленным.
 	gost::StateStore state;
 	QSignalSpy changes(&state, &gost::StateStore::obsStateChanged);
 	QVERIFY(changes.isValid());
@@ -148,6 +156,7 @@ void PluginLifecycleTest::registersBeforeFrontendReady()
 {
 	FakeFrontend frontend;
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
+	// Регистрация допустима до готовности OBS, а чтение профиля и выхода должно ждать FinishedLoading.
 	QVERIFY(lifecycle.load());
 	QCOMPARE(frontend.dockAdds, 1);
 	QCOMPARE(frontend.callbackAdds, 1);
@@ -182,6 +191,8 @@ void PluginLifecycleTest::observesCurrentProfileAndStreaming_data()
 
 void PluginLifecycleTest::observesCurrentProfileAndStreaming()
 {
+	// Начальный OBS может уже транслировать. FinishedLoading должен прочитать текущие факты,
+	// а последующие события — снова опросить адаптер, не подставить состояние из имени события.
 	QFETCH(bool, initialStreaming);
 	FakeFrontend frontend;
 	frontend.streaming = initialStreaming;
@@ -208,6 +219,9 @@ void PluginLifecycleTest::observesCurrentProfileAndStreaming()
 
 void PluginLifecycleTest::obsStatisticsUseMonotonicIntervalsAndIndependentFramePairs()
 {
+	// Время передаётся явно: 1000 байт за 250 мс дают 32000 бит/с без реального ожидания.
+	// Повтор того же момента не допускает деление на ноль; поздняя неизменная выборка уже даёт 0 бит/с.
+	// Три разные пары кадров обнаруживают случайную подстановку чужого total.
 	using namespace std::chrono_literals;
 	gost::OBSStatsCollector collector;
 	const gost::OBSStatsCollector::Clock::time_point start{};
@@ -245,6 +259,9 @@ void PluginLifecycleTest::obsStatisticsUseMonotonicIntervalsAndIndependentFrameP
 
 void PluginLifecycleTest::obsStatisticsLoseTheRateAtOutputReplacementAndTransitions()
 {
+	// Замена output и регресс байтов независимо разрывают bitrate, сохраняя эпоху видео.
+	// Starting/Stopping показываются до совпадения active, а отсутствие output после StreamingStarted
+	// не превращается в измеренные сетевые нули.
 	using namespace std::chrono_literals;
 	using gost::FrontendEvent;
 	using gost::ObsStreamingPhase;
@@ -292,6 +309,8 @@ void PluginLifecycleTest::obsStatisticsLoseTheRateAtOutputReplacementAndTransiti
 
 void PluginLifecycleTest::obsStatisticsStopBeforeExitReturns()
 {
+	// Проверяется синхронная граница: releaseStatistics ровно один раз до возврата Exit.
+	// Затем имитируются поздний обработчик и отложенные события, пока инертная оболочка ещё жива.
 	FakeFrontend frontend;
 	frontend.statistics.videoAvailable = true;
 	frontend.statistics.fps = 48.0;
@@ -331,6 +350,8 @@ void PluginLifecycleTest::bothViewsFollowObservations_data()
 
 void PluginLifecycleTest::bothViewsFollowObservations()
 {
+	// Оба окна используют один StateStore, даже когда ManagementWindow скрыто. Имя с HTML-подобным
+	// текстом проверяет PlainText, а неизвестные сервер/Stream остаются отдельно от локального OBS.
 	QFETCH(QString, locale);
 	const auto text = localeLookup(locale);
 	FakeFrontend frontend;
@@ -371,6 +392,9 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 
 void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
 {
+	// Палитра приложения заменяется только в тестовом процессе и восстанавливается qScopeGuard.
+	// Проверяется как смена смысла статуса, так и смена темы при прежнем статусе: одного начального
+	// выбора цвета в конструкторе недостаточно. Нейтральный цвет берётся из текущей палитры.
 	const auto savedPalette = QApplication::palette();
 	const auto restorePalette = qScopeGuard([&] { QApplication::setPalette(savedPalette); });
 	QPalette palette = savedPalette;
@@ -426,6 +450,8 @@ void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
 
 void PluginLifecycleTest::managementWindowIsLazyAndReused()
 {
+	// QPointer и сравнение адресов различают показ существующего окна и незаметное пересоздание.
+	// Проверяются повторная шестерёнка, минимизация, закрытие и повторный показ без новых Dock/callback.
 	QFETCH(QString, locale);
 	FakeFrontend frontend;
 	gost::PluginLifecycle lifecycle(frontend, localeLookup(locale));
@@ -455,6 +481,7 @@ void PluginLifecycleTest::managementWindowIsLazyAndReused()
 	QCOMPARE(managementWindows().front(), window.data());
 	window->close();
 	dispatchQueuedEvents();
+	// Закрытие скрывает окно; общее состояние, Dock и подписка продолжают жить до завершения плагина.
 	QVERIFY(window);
 	QVERIFY(!window->isVisible());
 	QVERIFY(state);
@@ -474,6 +501,8 @@ void PluginLifecycleTest::managementWindowIsLazyAndReused()
 
 void PluginLifecycleTest::dockStaysCompact()
 {
+	// Здесь проверяется граница назначения Dock: одна шестерёнка и отсутствие навигации/форм.
+	// Геометрия, тема и читаемость на реальном Windows-дисплее этим набором типов не доказываются.
 	FakeFrontend frontend;
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
 	QVERIFY(lifecycle.load());
@@ -488,6 +517,8 @@ void PluginLifecycleTest::dockStaysCompact()
 
 void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
 {
+	// После клика сравнивается исходный StateStore и неизменность FPS/bitrate/времени рендера.
+	// Следующие разные дельты render/encode/network дают 20/5/0 процентов и обнаруживают смешение периодов.
 	gost::StateStore state;
 	const auto text = localeLookup(QStringLiteral("en-US"));
 	gost::RestreamDock dock(state, text);
@@ -518,6 +549,7 @@ void PluginLifecycleTest::dockResetChangesOnlyDisplayedAccumulators()
 	QVERIFY(statistics->text() != before);
 	for (const auto &rate : rates)
 		QVERIFY(statistics->text().contains(rate));
+	// Сброс меняет представление накоплений, сохраняя исходную выборку и мгновенные скорости.
 	QVERIFY(state.obsStatistics() == sample);
 
 	sample.render = gost::FrameCounters{14, 160};
@@ -539,6 +571,8 @@ void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently_data()
 
 void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently()
 {
+	// В каждой строке ограничен ровно один этап при доступных двух других. Это проверяет передачу
+	// признака ограничения исходного API через сборщик в UI без обнуления всей статистики или скрытия доступного FPS.
 	QFETCH(int, limitedCounter);
 	gost::StateStore state;
 	const auto text = localeLookup(QStringLiteral("en-US"));
@@ -601,6 +635,10 @@ void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext_data()
 
 void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
 {
+	// Один сценарий проходит полный жизненный цикл кеша: свежая метрика непосредственно перед
+	// обрывом -> подписанное последнее значение -> возобновление без освежения -> новая точная метрика ->
+	// неподтверждённый заменяющий снимок -> подтверждение -> другой UUID профиля. Отличающиеся
+	// скорости позволяют заметить показ старого/преждевременно нового источника в обеих локализациях.
 	QFETCH(QString, locale);
 	QFETCH(QString, currentRate);
 	QFETCH(QString, lastRate);
@@ -704,6 +742,7 @@ void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
 	inputBitrate.value = {FieldState::Value, 9370000.0};
 	metric.input = {FieldState::Value, input};
 	QVERIFY(state.applyEvent(metric));
+	// Свежая метрика приходит непосредственно перед обрывом и должна попасть в кеш последних значений Dock.
 	state.markRuntimeStale();
 	state.setConnection(origin, ConnectionStatus::Reconnecting);
 	QTRY_VERIFY_WITH_TIMEOUT(notice->text().contains(noCurrentData), 1000);
@@ -769,6 +808,8 @@ void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons_data()
 
 void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons()
 {
+	// Порядок списка и стека сопоставляется для каждого раздела. Иконка должна иметь реальное изображение,
+	// включая запасной QStyle при отсутствии темы OBS. Предупреждение о несохранённых настройках дополнительно видно в «Расширенных».
 	QFETCH(QString, locale);
 	QFETCH(QStringList, pages);
 	const auto text = localeLookup(locale);
@@ -810,6 +851,7 @@ void PluginLifecycleTest::failedDockRegistrationReleasesResources()
 	frontend.acceptDock = false;
 	{
 		gost::PluginLifecycle lifecycle(frontend, localeLookup());
+		// При отказе OBS не получает владение виджетом, поэтому его удаляет путь отката загрузки.
 		QVERIFY(!lifecycle.load());
 		QVERIFY(!frontend.content);
 		QVERIFY(!lifecycle.stateStore());
@@ -825,6 +867,8 @@ void PluginLifecycleTest::failedDockRegistrationReleasesResources()
 
 void PluginLifecycleTest::exitCleansSynchronouslyAndLeavesInertShell()
 {
+	// До dispatchQueuedEvents все QPointer уже обязаны обнулиться. Порядок callback -> Dock
+	// проверяется отдельно; последующие открытие окна, shutdown и сохранённый обработчик не воскрешают Runtime.
 	FakeFrontend frontend;
 	{
 		gost::PluginLifecycle lifecycle(frontend, localeLookup());
@@ -835,6 +879,7 @@ void PluginLifecycleTest::exitCleansSynchronouslyAndLeavesInertShell()
 		QPointer<gost::StateStore> state = lifecycle.stateStore();
 		QPointer<QWidget> dock = frontend.content;
 		QPointer<gost::ManagementWindow> window = managementWindows().front();
+		// Ресурсы должны исчезнуть внутри Exit: проверяем это до обработки отложенных событий.
 		frontend.emitEvent(gost::FrontendEvent::Exit);
 		QVERIFY(!state);
 		QVERIFY(!dock);
@@ -867,6 +912,8 @@ void PluginLifecycleTest::registrationExceptionReleasesAcquiredResources_data()
 
 void PluginLifecycleTest::registrationExceptionReleasesAcquiredResources()
 {
+	// Отказ до передачи Dock и отказ после его передачи требуют разных путей очистки. Счётчики
+	// проверяют освобождение только реально приобретённых ресурсов, без снятия неустановленного callback.
 	QFETCH(bool, throwOnDock);
 	FakeFrontend frontend;
 	frontend.throwOnDockAdd = throwOnDock;
@@ -888,6 +935,8 @@ void PluginLifecycleTest::registrationExceptionReleasesAcquiredResources()
 
 void PluginLifecycleTest::callbackExceptionDoesNotEscape()
 {
+	// Исключение чтения профиля происходит внутри обработчика C API. Оно должно остановить только текущую
+	// обработку, сохранить жизненный цикл и позволить следующему достоверному событию обновить состояние.
 	FakeFrontend frontend;
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
 	QVERIFY(lifecycle.load());
@@ -910,6 +959,7 @@ void PluginLifecycleTest::queuedOpenCannotResurrectRuntime()
 	FakeFrontend frontend;
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
 	QVERIFY(lifecycle.load());
+	// Вызов адресован живой оболочке, но после Exit он уже не должен создавать рабочие объекты.
 	QVERIFY(QMetaObject::invokeMethod(
 		&lifecycle, [&lifecycle] { lifecycle.openManagementWindow(); }, Qt::QueuedConnection));
 	frontend.emitEvent(gost::FrontendEvent::Exit);
@@ -927,6 +977,7 @@ void PluginLifecycleTest::hostDestructionDoesNotDoubleDelete()
 		lifecycle.openManagementWindow();
 		QPointer<QWidget> dock = frontend.content;
 		QPointer<gost::StateStore> state = lifecycle.stateStore();
+		// Родитель OBS может удалить окна раньше плагина; наблюдатели должны исключить повторное удаление.
 		frontend.host.reset();
 		QVERIFY(!dock);
 		QVERIFY(state);
@@ -950,6 +1001,7 @@ void PluginLifecycleTest::queuedFrontendEventIsDiscardedOnExit()
 	const int profileReads = frontend.profileReads;
 	const int streamingReads = frontend.streamingReads;
 	frontend.profile = QStringLiteral("Профиль после события из рабочего потока");
+	// Поток только ставит событие в очередь и завершается до Exit; проверяется порядок доставки без гонки потоков.
 	std::thread eventThread([&frontend] { frontend.emitEvent(gost::FrontendEvent::ProfileChanged); });
 	eventThread.join();
 	QCOMPARE(frontend.profileReads, profileReads);
@@ -967,6 +1019,8 @@ void PluginLifecycleTest::queuedFrontendEventIsDiscardedOnExit()
 
 void PluginLifecycleTest::localesAreComplete()
 {
+	// Сравнение множеств ключей и непустых значений проверяет файлы обеих локализаций поставки.
+	// Корректность выбранной подписи конкретного состояния проверяют сценарии виджетов выше.
 	QSettings russian(QStringLiteral(GOST_TEST_LOCALE_DIR) + QStringLiteral("/ru-RU.ini"), QSettings::IniFormat);
 	QSettings english(QStringLiteral(GOST_TEST_LOCALE_DIR) + QStringLiteral("/en-US.ini"), QSettings::IniFormat);
 	QCOMPARE(russian.status(), QSettings::NoError);
@@ -981,6 +1035,9 @@ void PluginLifecycleTest::localesAreComplete()
 
 void PluginLifecycleTest::hiddenManagementKeepsOneSubscriptionAndMetadataVersion()
 {
+	// Закрытие окна не должно пересоздать controller/SSE. Событие принимается именно во время
+	// скрытого окна, затем проверяется тот же экземпляр UI и ровно одна подписка. Версия поступает
+	// через PluginOptions и проверяется как текст метаданных, а не захардкоженное число виджета.
 	WorkspaceTemp temp(QStringLiteral("runtime-ui"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
@@ -1042,6 +1099,10 @@ void PluginLifecycleTest::hiddenManagementKeepsOneSubscriptionAndMetadataVersion
 
 void PluginLifecycleTest::largeStreamListAndRuntimeTrafficAllowGuiProgress()
 {
+	// 100 страниц по 100 Stream исчерпывают штатный бюджет элементов и страниц, но последний пустой cursor
+	// подтверждает полноту. Runtime содержит 64 Session с независимыми Group/Output/FFmpeg.
+	// Таймер переключает настоящую навигацию во время чтения и SSE-пачек. Оракул — продвижение GUI,
+	// правильные конечные DTO и выбор Stream; напечатанные длительности не являются порогом приёмки.
 	using namespace gost::api;
 	constexpr int streamCount = 10000;
 	constexpr int sessionCount = 64;
@@ -1194,6 +1255,7 @@ void PluginLifecycleTest::largeStreamListAndRuntimeTrafficAllowGuiProgress()
 		QVERIFY(!failed);
 	}
 	const auto trafficElapsed = clock.nsecsElapsed() - trafficStart;
+	// Проверяется продвижение GUI во время нагрузки; измеренная задержка выводится без универсального порога.
 	maximumGap = qMax(maximumGap, clock.nsecsElapsed() - last);
 	ticker.stop();
 	events.shutdown();
@@ -1221,6 +1283,8 @@ void PluginLifecycleTest::largeStreamListAndRuntimeTrafficAllowGuiProgress()
 
 void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
 {
+	// Выделенный пункт раскрытого списка отличается от сохранённого выбора. После обычного оперативного события
+	// обязаны сохраниться видимость, выделение и прокрутка, а не только currentData комбобокса.
 	WorkspaceTemp temp(QStringLiteral("stream-popup"));
 	QVERIFY(temp.isValid());
 	gost::StateStore state;
@@ -1254,6 +1318,7 @@ void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
 	const int highlighted = view->currentIndex().row();
 	const int scroll = view->verticalScrollBar()->value();
 	QVERIFY(scroll > 0);
+	// Последующее SSE-обновление не должно пересоздать список, потерять выделение или прокрутку открытого меню.
 	gost::api::RuntimeEvent update;
 	update.cursor = QStringLiteral("popup-event");
 	update.kind = QStringLiteral("state");
@@ -1272,6 +1337,8 @@ void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
 
 void PluginLifecycleTest::savedStreamIsUnconfirmedUntilListIsComplete()
 {
+	// Один сохранённый ID проходит Unknown/неполный/полный пустой/полный содержащий список.
+	// «Неподтверждён» и «Недоступен» должны различаться без удаления предпочтения пользователя.
 	gost::StateStore state;
 	const auto text = localeLookup();
 	gost::ManagementWindow window(state, text);
@@ -1299,6 +1366,9 @@ void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection_data()
 
 void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
 {
+	// Вторая страница по размеру не входит в общий бюджет, сохранённый Stream находится именно там.
+	// Пока SSE-заголовки удерживаются, UI предупреждает о неполноте и позволяет выбрать уже полученный
+	// Stream. Новый выбор сохраняется на диске, отменяет старую подписку и начинает собственные снимок и SSE.
 	QFETCH(QString, locale);
 	WorkspaceTemp temp(QStringLiteral("partial-stream-list"));
 	QVERIFY(temp.isValid());

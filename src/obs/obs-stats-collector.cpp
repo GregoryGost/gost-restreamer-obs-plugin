@@ -16,6 +16,8 @@ bool regressed(const std::optional<FrameCounters> &current, const std::optional<
 ObsStatistics OBSStatsCollector::sample(const ObsStatisticsSample &sample, bool streamingActive, Clock::time_point now,
 					std::optional<FrontendEvent> event) noexcept
 {
+	// Новая попытка запуска output отделяется от повторного Starting той же попытки. Эпоха видео
+	// зависит от доступности/идентичности подсистемы, эпоха выхода — также от непрерывности сетевых счётчиков.
 	const bool newRun = event == FrontendEvent::StreamingStarting && (!transition_ || !transition_->targetActive);
 	updatePhase(streamingActive, now, event);
 
@@ -49,6 +51,7 @@ ObsStatistics OBSStatsCollector::sample(const ObsStatisticsSample &sample, bool 
 	const auto maxBytes = std::numeric_limits<quint64>::max();
 	const bool bytesUsable = result.sentBytes && *result.sentBytes != maxBytes;
 	const bool bytesDiscontinuous = previousBytes_ && (!bytesUsable || *result.sentBytes < previousBytes_->bytes);
+	// Замена выхода, новый запуск или разрыв счётчиков запрещают вычислять скорость между разными периодами.
 	if (newRun || outputIdentity != outputIdentity_ || bytesDiscontinuous ||
 	    regressed(result.network, previousNetwork_)) {
 		++outputEpoch_;
@@ -61,6 +64,7 @@ ObsStatistics OBSStatsCollector::sample(const ObsStatisticsSample &sample, bool 
 		return result;
 
 	if (previousBytes_ && now > previousBytes_->time) {
+		// Используется фактический интервал между выборками; перевод байтов в биты выполняется до деления.
 		const auto seconds = std::chrono::duration<double>(now - previousBytes_->time).count();
 		const auto bytes = *result.sentBytes - previousBytes_->bytes;
 		result.bitrate = static_cast<double>(bytes) * 8.0 / seconds;
@@ -88,6 +92,7 @@ void OBSStatsCollector::updatePhase(bool streamingActive, Clock::time_point now,
 	}
 
 	if (transition_ && transition_->targetActive != streamingActive) {
+		// Событие начала перехода ещё не подтверждает целевое состояние; затянувшийся переход становится неизвестным.
 		if (now >= transition_->deadline)
 			phase_ = ObsStreamingPhase::Unknown;
 		else
