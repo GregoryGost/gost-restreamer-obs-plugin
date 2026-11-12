@@ -48,6 +48,10 @@ Load focused references, not every file for a small change. Formatting belongs t
 - Check compiler warnings and IDE diagnostics according to the project's selected gate, not a hypothetical global strict mode.
 - A successful compilation does not imply a clean analyzer or a correct runtime; a sanitizer run is not proof that all resource defects are absent.
 
+## Code documentation when the comment-quality pair is active
+
+When `code_comment_quality.md` and `code-comment-quality` are both independently active, ensure every authored affected function/method (including constructors, destructors, callbacks and short helpers), field, constant, and local/loop variable has the required source documentation. A group block must identify each variable and explain its role; use the project's C++/Qt documentation conventions and preserve accurate lifetime and ownership explanations. No exception arises from brevity or symbol names. This skill does not activate the pair.
+
 ## Review handoff
 
 Classify CORRECTNESS, SECURITY, COMPATIBILITY/ABI, CONCURRENCY, RESOURCE, DESIGN, PERFORMANCE or STYLE. Give source path/line, reproduced or documented failing path, smallest correction, tests/checks performed and explicit uncertainty.
