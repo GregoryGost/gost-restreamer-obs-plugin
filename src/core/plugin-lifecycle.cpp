@@ -5,6 +5,7 @@
 #include "core/connection-controller.hpp"
 #include "core/settings-store.hpp"
 #include "core/state-store.hpp"
+#include "core/restream-controller.hpp"
 #include "obs/frontend.hpp"
 #include "obs/obs-controller.hpp"
 #include "ui/management-window.hpp"
@@ -25,32 +26,52 @@ namespace gost {
 // и только отслеживается через QPointer; ManagementWindow удаляется явно до StateStore и SettingsStore.
 class PluginLifecycle::Runtime final : public QObject {
 public:
+	// Создаёт наблюдение с бюджетом 3/24 и независимый канал команд 1/8; frontend и options заимствованы на вызов.
 	explicit Runtime(Frontend &frontend, const PluginOptions &options)
 	{
 		stateStore = std::make_unique<StateStore>();
 		settings = std::make_unique<SettingsStore>(options.settingsFile);
-		apiClient = std::make_unique<api::APIClient>();
+		// observationLimits ограничивает канал REST наблюдения, сохраняя суммарный бюджет двух клиентов.
+		api::Limits observationLimits;
+		observationLimits.maxActiveRequests = 3;
+		observationLimits.maxQueuedRequests = 24;
+		apiClient = std::make_unique<api::APIClient>(observationLimits);
+		// commandLimits выделяет workflow отдельную последовательную очередь, независимую от recovery SSE.
+		api::Limits commandLimits;
+		commandLimits.maxActiveRequests = 1;
+		commandLimits.maxQueuedRequests = 8;
+		commandApi = std::make_unique<api::APIClient>(commandLimits);
 		eventClient = std::make_unique<api::EventClient>();
 		connection = std::make_unique<ConnectionController>(*stateStore, *settings, *apiClient, *eventClient);
 		controller = std::make_unique<OBSController>(frontend, *stateStore);
+		restream = std::make_unique<RestreamController>(*stateStore, *commandApi, *connection, *controller);
 		connect(controller.get(), &OBSController::profileObserved, connection.get(),
 			&ConnectionController::observeProfile);
 	}
+	// Прекращает workflow раньше OBS и сети; удаление скрытого окна предшествует удалению StateStore.
 	~Runtime() override
 	{
+		restream->shutdown();
 		connection->shutdown();
 		// Окно хранит ссылки на общее состояние, поэтому удаляется до уничтожения сервисов.
 		delete managementWindow.data();
 	}
 
 	// Обратный порядок уничтожения полей освобождает контроллеры раньше их зависимостей.
+	// stateStore хранит общие наблюдения, settings читает и записывает разрешённый файл предпочтений.
 	std::unique_ptr<StateStore> stateStore;
 	std::unique_ptr<SettingsStore> settings;
+	// apiClient владеет очередью наблюдения 3/24; commandApi — отдельной очередью явных команд 1/8.
 	std::unique_ptr<api::APIClient> apiClient;
+	std::unique_ptr<api::APIClient> commandApi;
+	// eventClient обслуживает единственную подписку SSE.
 	std::unique_ptr<api::EventClient> eventClient;
+	// connection управляет наблюдением, controller читает OBS, restream координирует явные намерения.
 	std::unique_ptr<ConnectionController> connection;
 	std::unique_ptr<OBSController> controller;
-	// Окна могут быть удалены родителем OBS; QPointer отслеживает это, не продлевая их жизнь.
+	std::unique_ptr<RestreamController> restream;
+	// dock отслеживает переданный OBS виджет; managementWindow отслеживает скрываемое расширенное окно.
+	// Оба окна могут быть удалены родителем OBS; QPointer не продлевает их жизнь.
 	QPointer<RestreamDock> dock;
 	QPointer<ManagementWindow> managementWindow;
 };
@@ -69,6 +90,7 @@ PluginLifecycle::~PluginLifecycle()
 
 bool PluginLifecycle::load()
 {
+	// application проверяет существование GUI и принадлежность вызова его потоку.
 	// Локальный unique_ptr удерживает Dock до подтверждения передачи OBS. Если addDock вернул false,
 	// shutdown очищает Runtime, а локальный указатель освобождает ещё не переданный виджет.
 	auto *application = qobject_cast<QApplication *>(QCoreApplication::instance());
@@ -80,10 +102,20 @@ bool PluginLifecycle::load()
 	}
 	try {
 		runtime_ = std::make_unique<Runtime>(frontend_, options_);
-		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_, nullptr, options_.version);
+		// dock удерживает виджет до успешной передачи Frontend; отказ регистрации не оставляет утечки.
+		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_, nullptr, options_.version,
+							   runtime_->restream.get());
 		runtime_->dock = dock.get();
+		// Callback шестерёнки показывает только одно окно и прекращается вместе с Runtime.
 		connect(dock.get(), &RestreamDock::managementRequested, runtime_.get(),
 			[this] { openManagementWindow(); });
+		// Меню выхода открывает тот же экземпляр окна и передаёт точные IDs исходного нажатия.
+		connect(dock.get(), &RestreamDock::outputDetailsRequested, runtime_.get(),
+			[this](DockContext context, QString sessionId, QString outputId) {
+				openManagementWindow();
+				if (runtime_ && runtime_->managementWindow)
+					runtime_->managementWindow->selectOutput(context, sessionId, outputId);
+			});
 		if (!frontend_.addDock(DockId, text_("Plugin.Name"), dock.get())) {
 			shutdown();
 			return false;
@@ -111,6 +143,7 @@ void PluginLifecycle::shutdown() noexcept
 	Q_ASSERT(!runtime_ || QThread::currentThread() == thread());
 	if (runtime_) {
 		// Останавливаем чтение OBS и сетевые обновления, пока общее состояние ещё существует.
+		runtime_->restream->shutdown();
 		runtime_->controller->shutdown();
 		runtime_->connection->shutdown();
 	}
@@ -147,9 +180,11 @@ void PluginLifecycle::openManagementWindow()
 	try {
 		// Закрытие ManagementWindow скрывает его; QPointer дополнительно учитывает удаление главным окном OBS.
 		if (!runtime_->managementWindow) {
-			runtime_->managementWindow = new ManagementWindow(
-				*runtime_->stateStore, text_, frontend_.mainWindow(), runtime_->connection.get());
+			runtime_->managementWindow =
+				new ManagementWindow(*runtime_->stateStore, text_, frontend_.mainWindow(),
+						     runtime_->connection.get(), runtime_->restream.get());
 		}
+		// window заимствован у Runtime на время синхронного показа и активации.
 		auto *window = runtime_->managementWindow.data();
 		if (window->isMinimized()) {
 			window->setWindowState(window->windowState() & ~Qt::WindowMinimized);
@@ -175,6 +210,12 @@ SettingsStore *PluginLifecycle::settingsStore() const noexcept
 ConnectionController *PluginLifecycle::connectionController() const noexcept
 {
 	return runtime_ ? runtime_->connection.get() : nullptr;
+}
+
+// Возвращает фасад текущего Runtime без передачи владения; закрытие ManagementWindow его не уничтожает.
+RestreamController *PluginLifecycle::restreamController() const noexcept
+{
+	return runtime_ ? runtime_->restream.get() : nullptr;
 }
 
 void PluginLifecycle::frontendEvent(FrontendEvent event, void *cookie) noexcept

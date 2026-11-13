@@ -2,6 +2,7 @@
 #include "api/event-client.hpp"
 #include "fixtures/api-json.hpp"
 #include "fixtures/http-server.hpp"
+#include "fixtures/operation-json.hpp"
 
 #include <QElapsedTimer>
 #include <QNetworkAccessManager>
@@ -42,30 +43,67 @@ private:
 class ApiNetworkTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Описывает все типизированные команды и точные ожидаемые маршруты независимо от транспорта.
+	void typedCommands_data();
+	// Проверяет POST, MIME и JSON request_id/destination_ids, включая непрозрачные ID пути.
+	void typedCommands();
+	// Задаёт допустимый 202 и отрицательные HTTP/MIME/Location ответы команды.
+	void commandResponseContract_data();
+	// Проверяет строгий контракт команды без перехода по Location.
+	void commandResponseContract();
+	// Пустой набор назначений или ID отклоняется до сетевой отправки.
+	void invalidCommandsNeverReachServer();
+	// Отмена/удаление receiver подавляют результат уже отправленного POST без повтора.
+	void commandCancellationAndReceiverLifetime();
+	// Перечисляет все семейства списков и их контрактные маршруты.
 	void everyListPreservesOpaqueCursorAndFilters_data();
+	// Проверяет сохранение непрозрачного курсора и фильтров при обходе страниц каждого списка.
 	void everyListPreservesOpaqueCursorAndFilters();
+	// Задаёт цикл курсора, пределы обхода и ошибку последующей страницы.
 	void incompleteWalkCannotReportSuccess_data();
+	// Неполный или ошибочный обход не выдаёт полученную часть за полный список.
 	void incompleteWalkCannotReportSuccess();
+	// Разделяет превышение общего бюджета страниц и лимита отдельного ответа.
 	void listBodyLimitsPreserveOnlyWholePages_data();
+	// Сохраняет только целые допустимые страницы и различает частичный результат с ошибкой размера.
 	void listBodyLimitsPreserveOnlyWholePages();
+	// Задаёт HTTP Problem, неверный JSON и неверную форму успешного ответа.
 	void httpProblemsAndDecodeFailures_data();
+	// Различает HTTP и ошибки разбора, не раскрывая серверные секреты в общем сообщении.
 	void httpProblemsAndDecodeFailures();
+	// Перенастройка и отмена запрещают доставку прежнего контекста и закрывают активные ответы.
 	void cancellationAndOldContextAreObservable();
+	// Удаление получателя подавляет его callback, сохраняя работу последующего живого запроса.
 	void receiverDestructionSuppressesCallback();
+	// Задаёт независимые абсолютный срок, простой и ограничение размера REST-ответа.
 	void deadlinesAndBodyBudgets_data();
+	// Отсутствие ответа даёт Timeout, а превышение размера тела даёт Limit.
 	void deadlinesAndBodyBudgets();
+	// Проверяет отказ допуска при заполненных активном слоте и очереди без лишней сетевой отправки.
 	void activeAndQueuedRequestsAreBounded();
+	// Перечисляет ошибки HTTP, MIME, идентичности события, курсора и JSON.
 	void sseValidatesStatusMediaAndIdentity_data();
+	// Невалидная подписка или кадр не доставляет событие и не подтверждает курсор.
 	void sseValidatesStatusMediaAndIdentity();
+	// Продвигает курсор только после принятия события потребителем.
 	void sseAcknowledgesOnlyAppliedEvents();
+	// Управляющий кадр требует новый снимок без перехода по произвольному snapshot_url.
 	void sseControlForcesSnapshotWithoutFollowingUrl();
+	// Срок REST не завершает живую SSE-подписку, а shutdown подавляет последующие доставки.
 	void sseHasIndependentLifetimeAndShutdown();
+	// Проверяет допустимые предельные документы и измеряет разрыв цикла Qt без универсального порога задержки.
 	void maximumDocumentsMeasureEventLoopGap();
+	// Перечисляет детальные маршруты с одиночными и вложенными идентификаторами.
 	void detailRoutesKeepValuesAndEscapeOpaqueIdentifiers_data();
+	// Проверяет точное кодирование непрозрачных ID и сохранение значений детальных DTO.
 	void detailRoutesKeepValuesAndEscapeOpaqueIdentifiers();
+	// Обработка ограниченной пачки SSE возвращает управление Qt до доставки следующей пачки.
 	void sseYieldsBetweenBoundedBatches();
+	// Heartbeat сохраняет подписку живой, не создавая прикладных событий и продвижения курсора.
 	void heartbeatKeepsTransportAliveWithoutInventingEvents();
+	// Смена подписки внутри callback отбрасывает остаток старой пачки и её подтверждение.
 	void replacingSubscriptionDuringDeliveryDiscardsOldContext();
+	// Собственный сетевой менеджер обходит глобальную фабрику прокси при явном подключении к серверу.
 	void explicitServerConnectionBypassesApplicationProxyFactory();
 };
 
@@ -1030,3 +1068,204 @@ void ApiNetworkTest::explicitServerConnectionBypassesApplicationProxyFactory()
 
 QTEST_GUILESS_MAIN(ApiNetworkTest)
 #include "api-network-test.moc"
+
+void ApiNetworkTest::typedCommands_data()
+{
+	QTest::addColumn<int>("action");
+	QTest::addColumn<QByteArray>("path");
+	QTest::newRow("session-start") << 0 << QByteArray("/api/v1/streams/stream%2F%252F%2B/start");
+	QTest::newRow("session-pause") << 1 << QByteArray("/api/v1/sessions/session%2F%252F%2B/pause");
+	QTest::newRow("session-resume") << 2 << QByteArray("/api/v1/sessions/session%2F%252F%2B/resume");
+	QTest::newRow("session-stop") << 3 << QByteArray("/api/v1/sessions/session%2F%252F%2B/stop");
+	QTest::newRow("output-start")
+		<< 4 << QByteArray("/api/v1/sessions/session%2F%252F%2B/outputs/output%2F%252F%2B/start");
+	QTest::newRow("output-stop")
+		<< 5 << QByteArray("/api/v1/sessions/session%2F%252F%2B/outputs/output%2F%252F%2B/stop");
+	QTest::newRow("output-detach")
+		<< 6 << QByteArray("/api/v1/sessions/session%2F%252F%2B/outputs/output%2F%252F%2B/detach");
+}
+
+void ApiNetworkTest::typedCommands()
+{
+	// action задаёт выбранное явное действие из строки данных.
+	QFETCH(int, action);
+	// path содержит ожидаемый закодированный маршрут команды.
+	QFETCH(QByteArray, path);
+	// server сохраняет реальные байты POST; api выполняет штатный транспорт Qt.
+	HttpServer server;
+	QVERIFY(server.listen());
+	// api выполняет настоящие асинхронные запросы через собственный менеджер Qt.
+	APIClient api;
+	api.configure(server.origin(), {});
+	// requestId и destinations содержат разделители, которые должны сохраняться в JSON без изменений.
+	const QString requestId = QStringLiteral("request/+%2F=ключ");
+	const QStringList destinations{QStringLiteral("dest/one"), QStringLiteral("dest+%2F")};
+	// Обработчик возвращает валидную квитанцию без необязательного Location.
+	server.handler = [&](const auto &request) {
+		HttpServer::reply(request,
+				  fixture::bytes(fixture::receipt(requestId, QStringLiteral("start_session"),
+								  QStringLiteral("stream/%2F+"))),
+				  202);
+	};
+	// done отмечает доставку, success — успех транспорта; receive сохраняет эти результаты.
+	bool done = false;
+	bool success = false;
+	auto receive = [&](RequestContext, Result<Receipt> result) {
+		success = bool(result);
+		done = true;
+	};
+	switch (action) {
+	case 0:
+		api.startSession(QStringLiteral("stream/%2F+"), requestId, destinations, this, receive);
+		break;
+	case 1:
+		api.pauseSession(QStringLiteral("session/%2F+"), requestId, this, receive);
+		break;
+	case 2:
+		api.resumeSession(QStringLiteral("session/%2F+"), requestId, this, receive);
+		break;
+	case 3:
+		api.stopSession(QStringLiteral("session/%2F+"), requestId, this, receive);
+		break;
+	case 4:
+		api.startOutput(QStringLiteral("session/%2F+"), QStringLiteral("output/%2F+"), requestId, this,
+				receive);
+		break;
+	case 5:
+		api.stopOutput(QStringLiteral("session/%2F+"), QStringLiteral("output/%2F+"), requestId, this, receive);
+		break;
+	case 6:
+		api.detachOutput(QStringLiteral("session/%2F+"), QStringLiteral("output/%2F+"), requestId, this,
+				 receive);
+		break;
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(done, 2000);
+	QVERIFY(success);
+	QCOMPARE(server.requests.size(), 1);
+	QCOMPARE(server.requests[0].method, QByteArray("POST"));
+	QCOMPARE(server.requests[0].target, path);
+	QVERIFY(server.requests[0].headers.toLower().contains("content-type: application/json"));
+	// expected задаётся контрактом команды без дополнительных полей и динамического выбора назначений.
+	QJsonObject expected{{QStringLiteral("request_id"), requestId}};
+	if (action == 0)
+		expected.insert(QStringLiteral("destination_ids"), QJsonArray::fromStringList(destinations));
+	QCOMPARE(QJsonDocument::fromJson(server.requests[0].body).object(), expected);
+}
+
+void ApiNetworkTest::commandResponseContract_data()
+{
+	QTest::addColumn<int>("status");
+	QTest::addColumn<QByteArray>("mime");
+	QTest::addColumn<QByteArray>("location");
+	QTest::addColumn<bool>("accepted");
+	QTest::newRow("accepted-no-location") << 202 << QByteArray("application/json") << QByteArray() << true;
+	QTest::newRow("accepted-relative-location") << 202 << QByteArray("application/json")
+						    << QByteArray("Location: /api/v1/commands/command\r\n") << true;
+	QTest::newRow("wrong-status") << 200 << QByteArray("application/json") << QByteArray() << false;
+	QTest::newRow("wrong-mime") << 202 << QByteArray("text/html") << QByteArray() << false;
+	QTest::newRow("foreign-origin")
+		<< 202 << QByteArray("application/json")
+		<< QByteArray("Location: http://127.0.0.1:1/api/v1/commands/command\r\n") << false;
+	QTest::newRow("wrong-command")
+		<< 202 << QByteArray("application/json") << QByteArray("Location: /api/v1/commands/other\r\n") << false;
+}
+
+void ApiNetworkTest::commandResponseContract()
+{
+	// status задаёт HTTP-код ответа сервера.
+	QFETCH(int, status);
+	// mime задаёт Content-Type проверяемого ответа.
+	QFETCH(QByteArray, mime);
+	// location задаёт необязательный заголовок адреса квитанции.
+	QFETCH(QByteArray, location);
+	// accepted определяет допустимость ответа по независимому контракту команды.
+	QFETCH(bool, accepted);
+	// server задаёт status/MIME/Location квитанции независимо от клиентской реализации.
+	HttpServer server;
+	QVERIFY(server.listen());
+	server.handler = [&](const auto &request) {
+		HttpServer::reply(request,
+				  fixture::bytes(fixture::receipt(QStringLiteral("request"),
+								  QStringLiteral("pause_session"),
+								  QStringLiteral("session"))),
+				  status, mime, location);
+	};
+	// api не должен автоматически повторять POST или переходить по Location.
+	// api выполняет настоящие асинхронные запросы через собственный менеджер Qt.
+	APIClient api;
+	api.configure(server.origin(), {});
+	// done отмечает доставку, success — результат проверки ответа.
+	bool done = false;
+	bool success = false;
+	api.pauseSession(QStringLiteral("session"), QStringLiteral("request"), this,
+			 [&](RequestContext, Result<Receipt> result) {
+				 success = bool(result);
+				 done = true;
+			 });
+	QTRY_VERIFY_WITH_TIMEOUT(done, 2000);
+	QCOMPARE(success, accepted);
+	QCOMPARE(server.requests.size(), 1);
+}
+
+void ApiNetworkTest::invalidCommandsNeverReachServer()
+{
+	// server позволяет проверить, что локально недопустимые команды не доходят до сети.
+	HttpServer server;
+	QVERIFY(server.listen());
+	// api выполняет настоящие асинхронные запросы через собственный менеджер Qt.
+	APIClient api;
+	api.configure(server.origin(), {});
+	// count считает отклонённые вызовы; receive проверяет категорию ошибки контракта.
+	int count = 0;
+	auto receive = [&](RequestContext, Result<Receipt> result) {
+		QVERIFY(!result);
+		QVERIFY(result.error);
+		QCOMPARE(result.error->kind, ErrorKind::Contract);
+		++count;
+	};
+	api.startSession(QStringLiteral("stream"), QStringLiteral("request"), {}, this, receive);
+	api.startSession(QStringLiteral("stream"), QStringLiteral("request"), {QString{}}, this, receive);
+	api.pauseSession({}, QStringLiteral("request"), this, receive);
+	api.stopOutput(QStringLiteral("session"), {}, QStringLiteral("request"), this, receive);
+	api.resumeSession(QStringLiteral("session"), {}, this, receive);
+	QTRY_COMPARE_WITH_TIMEOUT(count, 5, 2000);
+	QCOMPARE(server.requests.size(), 0);
+}
+
+void ApiNetworkTest::commandCancellationAndReceiverLifetime()
+{
+	// server удерживает оба ответа до отмены запроса и уничтожения получателя.
+	HttpServer server;
+	QVERIFY(server.listen());
+	// api выполняет настоящие асинхронные запросы через собственный менеджер Qt.
+	APIClient api;
+	api.configure(server.origin(), {});
+	// called считает недопустимые доставки; receiver уничтожается до второго ответа.
+	int called = 0;
+	auto receiver = std::make_unique<QObject>();
+	api.pauseSession(QStringLiteral("session"), QStringLiteral("request-one"), this,
+			 [&](RequestContext, Result<Receipt>) { ++called; });
+	QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 1, 2000);
+	api.cancelAll();
+	api.pauseSession(QStringLiteral("session"), QStringLiteral("request-two"), receiver.get(),
+			 [&](RequestContext, Result<Receipt>) { ++called; });
+	QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 2, 2000);
+	receiver.reset();
+	// request содержит удержанный ответ, чей получатель уже не принимает callback.
+	for (const auto &request : server.requests)
+		HttpServer::reply(request,
+				  fixture::bytes(fixture::receipt(QStringLiteral("request-two"),
+								  QStringLiteral("pause_session"),
+								  QStringLiteral("session"))),
+				  202);
+	// Третий живой GET служит барьером цикла событий после старых завершений.
+	bool barrier = false;
+	server.handler = [&](const auto &request) {
+		HttpServer::reply(request, fixture::bytes(fixture::stream()));
+	};
+	api.getStream(QStringLiteral("stream"), this,
+		      [&](RequestContext, Result<Stream> result) { barrier = bool(result); });
+	QTRY_VERIFY_WITH_TIMEOUT(barrier, 2000);
+	QCOMPARE(called, 0);
+	QCOMPARE(server.requests.size(), 3);
+}

@@ -173,26 +173,55 @@ void respondWithDockMetadata(const HttpServer::Request &request, bool validExact
 class ConnectionControllerTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Различает полный пустой поиск, неполную страницу и ошибку чтения Session.
+	void emptySessionDiscovery_data();
+	// Только полное успешное отсутствие подтверждает Fresh+complete без активной Session.
+	void emptySessionDiscovery();
+	// Новая Session после пустого snapshot подхватывается без команд и без изменения паузы/выходов.
+	void lateSessionPreservesIntentions_data();
+	// Проверяет подхват STARTING/RUNNING с исходными сохранёнными намерениями.
+	void lateSessionPreservesIntentions();
+	// Начальное подключение подтверждается заголовками SSE и не выбирает Stream или медиаоперацию автоматически.
 	void connectsWithoutImplicitStreamOrMedia();
+	// Поздний ответ прежнего сервера не продолжает его цепочку и не заменяет выбранный origin.
 	void serverSwitchDiscardsOldResponses();
+	// Смена UUID профиля восстанавливает только собственную сохранённую привязку Stream.
 	void profileSwitchRestoresOnlyItsBinding();
+	// Задаёт точную Session выбранного Stream и несовместимый детальный ответ другого Stream.
 	void dockMetadataRequiresExactSessionForSelectedStream_data();
+	// Метаданные Dock требуют подтверждённой принадлежности Session и точного current поколения заглушки.
 	void dockMetadataRequiresExactSessionForSelectedStream();
+	// Перечисляет отсоединение, полный список и смены идентичности, влияющие на сохранение состава Output.
 	void partialOutputReadPreservesOnlyTheSameSession_data();
+	// Неполное чтение сохраняет известный состав только в исходной Session и контексте.
 	void partialOutputReadPreservesOnlyTheSameSession();
+	// После восстановления только новая принятая метрика освежает соответствующую ось выбранного Output.
 	void resumedSubscriptionRefreshesOnlyAcceptedMetricLane();
+	// Переподключение продолжает последний применённый курсор, исключая незавершённый хвост кадра.
 	void reconnectUsesConfirmedCursor();
+	// Таймаут заголовков повторяет подписку без преждевременного состояния Connected.
 	void handshakeTimeoutRetriesWithoutPrematureConnection();
+	// Перечисляет терминальные HTTP и MIME причины отказа подписки.
 	void terminalSubscriptionDoesNotRetry_data();
+	// Терминальный отказ сохраняет безопасную причину и не оставляет автоматический повтор.
 	void terminalSubscriptionDoesNotRetry();
+	// Задаёт конечные и неограниченные бюджеты новых снимков после отказа SSE.
 	void rejectedSubscriptionUsesFreshSnapshots_data();
+	// Отказы 400/409 требуют свежие снимки и расходуют общий конечный бюджет циклов восстановления.
 	void rejectedSubscriptionUsesFreshSnapshots();
+	// Задаёт оба отказа подписки, запускающие восстановительное чтение снимка.
 	void disablingReconnectCancelsRecoverySnapshot_data();
+	// Отключение восстановления отменяет текущий снимок и будущие повторы, исключая позднее применение.
 	void disablingReconnectCancelsRecoverySnapshot();
+	// Задаёт успешное и повторно отклонённое возобновление от восстановительного снимка.
 	void transientSubscriptionFailureResumesRecoveryAnchor_data();
+	// Временная ошибка возобновляет SSE от текущего снимка без сброса бюджета отказов.
 	void transientSubscriptionFailureResumesRecoveryAnchor();
+	// Подтверждённая подписка восстанавливает право на новый цикл снимка после следующего отказа.
 	void confirmedSubscriptionResetsRejectionBudget();
+	// resync_required читает закреплённый маршрут снимка и продолжает его курсор без произвольных переходов.
 	void resyncObtainsNewAnchor();
+	// Завершение контроллера отменяет ожидающий повтор и запрещает поздние запросы.
 	void shutdownStopsPendingRetry();
 };
 
@@ -1084,3 +1113,166 @@ void ConnectionControllerTest::shutdownStopsPendingRetry()
 
 QTEST_GUILESS_MAIN(ConnectionControllerTest)
 #include "connection-controller-test.moc"
+
+void ConnectionControllerTest::emptySessionDiscovery_data()
+{
+	QTest::addColumn<int>("boundary");
+	QTest::newRow("complete-empty") << 0;
+	QTest::newRow("incomplete-list") << 1;
+	QTest::newRow("failed-read") << 2;
+}
+
+void ConnectionControllerTest::emptySessionDiscovery()
+{
+	// boundary выбирает проверяемую границу достоверности результата поиска Session.
+	QFETCH(int, boundary);
+	// temp предоставляет отдельный каталог; settings хранит привязку профиля; server управляет полнотой поиска.
+	WorkspaceTemp temp(QStringLiteral("empty-discovery"));
+	QVERIFY(temp.isValid());
+	// server обслуживает изолированное подключение и управляемую подписку событий.
+	HttpServer server;
+	QVERIFY(server.listen());
+	// searches считает три фильтра активных состояний до публикации единого результата.
+	int searches = 0;
+	server.handler = [&](const auto &request) {
+		if (request.target.startsWith("/api/v1/streams/stream/sessions")) {
+			++searches;
+			HttpServer::reply(request,
+					  fixture::page({}, boundary == 1 ? QStringLiteral("more") : QString{}),
+					  boundary == 2 ? 503 : 200);
+		} else if (request.target.startsWith("/api/v1/streams/stream/fallback-policy")) {
+			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+		} else {
+			respond(request);
+		}
+	};
+	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	settings.setAutoConnect(false);
+	// state хранит наблюдения; api читает REST; events принимает SSE; controller согласует порядок чтений.
+	StateStore state;
+	APIClient api;
+	EventClient events;
+	ConnectionController controller(state, settings, api, events);
+	controller.observeProfile(FrontendEvent::FinishedLoading, profile());
+	QVERIFY(settings.setSelectedStream(server.origin().toString(), settings.profileUuid(),
+					   QStringLiteral("stream")));
+	controller.connectToServer(server.origin().toString());
+	QTRY_VERIFY_WITH_TIMEOUT(
+		searches >= 3 && state.dockServer().fallback.availability == RuntimeAvailability::Fresh, 3000);
+	if (boundary == 0) {
+		QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().sessionStatus.availability == RuntimeAvailability::Fresh,
+					 3000);
+		QVERIFY(state.dockServer().sessionStatus.complete);
+		QVERIFY(!state.dockServer().session);
+	} else {
+		QVERIFY(state.dockServer().sessionStatus.availability != RuntimeAvailability::Fresh ||
+			!state.dockServer().sessionStatus.complete);
+	}
+	QVERIFY(readOnly(server));
+}
+
+void ConnectionControllerTest::lateSessionPreservesIntentions_data()
+{
+	QTest::addColumn<QString>("sessionState");
+	QTest::newRow("starting") << QStringLiteral("STARTING");
+	QTest::newRow("running-paused") << QStringLiteral("RUNNING");
+}
+
+void ConnectionControllerTest::lateSessionPreservesIntentions()
+{
+	// sessionState задаёт опубликованное сервером активное состояние новой Session.
+	QFETCH(QString, sessionState);
+	// temp изолирует каталог; settings сохраняет пользовательский выбор, исключая историю операций.
+	WorkspaceTemp temp(QStringLiteral("late-session"));
+	QVERIFY(temp.isValid());
+	// server обслуживает изолированное подключение и управляемую подписку событий.
+	HttpServer server;
+	QVERIFY(server.listen());
+	// appeared переключает сервер с полного отсутствия на точную выбранную Session.
+	bool appeared = false;
+	server.handler = [&](const auto &request) {
+		// url содержит полный адрес запроса; path отделяет адрес ресурса от фильтра state в query.
+		const auto url = QUrl::fromEncoded("http://local" + request.target);
+		const auto path = url.path();
+		if (path == QStringLiteral("/api/v1/streams/stream/sessions")) {
+			// session сохраняет паузу, заданную сервером, независимо от наблюдаемого RUNNING/STARTING.
+			auto session = fixture::session();
+			session.insert(QStringLiteral("state"), sessionState);
+			session.insert(QStringLiteral("desired_paused"), true);
+			HttpServer::reply(request,
+					  fixture::page(appeared && QUrlQuery(url).queryItemValue(
+									    QStringLiteral("state")) == sessionState
+								? QJsonArray{session}
+								: QJsonArray{}));
+		} else if (path == QStringLiteral("/api/v1/sessions/session")) {
+			// session — независимая REST-проверка принадлежности кандидата Stream.
+			auto session = fixture::session();
+			session.insert(QStringLiteral("state"), sessionState);
+			session.insert(QStringLiteral("desired_paused"), true);
+			HttpServer::reply(request, fixture::bytes(session));
+		} else if (path == QStringLiteral("/api/v1/sessions/session/outputs")) {
+			// stopped остаётся attached без desired_running; detached сохраняет отсоединение.
+			auto stopped = fixture::output();
+			stopped.insert(QStringLiteral("id"), QStringLiteral("stopped"));
+			stopped.insert(QStringLiteral("desired_running"), false);
+			auto detached = stopped;
+			detached.insert(QStringLiteral("id"), QStringLiteral("detached"));
+			detached.insert(QStringLiteral("attached"), false);
+			HttpServer::reply(request, fixture::page({stopped, detached}));
+		} else if (path == QStringLiteral("/api/v1/streams/stream/fallback-policy")) {
+			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+		} else {
+			respond(request);
+		}
+	};
+	SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	settings.setAutoConnect(false);
+	// state применяет события; api читает REST; events разбирает SSE; controller согласует наблюдения.
+	StateStore state;
+	APIClient api;
+	EventClient events;
+	ConnectionController controller(state, settings, api, events);
+	controller.observeProfile(FrontendEvent::FinishedLoading, profile());
+	QVERIFY(settings.setSelectedStream(server.origin().toString(), settings.profileUuid(),
+					   QStringLiteral("stream")));
+	controller.connectToServer(server.origin().toString());
+	QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().sessionStatus.complete, 3000);
+	QVERIFY(!state.dockServer().session);
+	QVERIFY(state.runtime().sessions.isEmpty());
+	appeared = true;
+	// event сообщает новую идентичность исполнения; сохранённая пауза и состав читаются отдельным GET.
+	auto event = fixture::event(QStringLiteral("state"), QStringLiteral("new-session-event"));
+	event.insert(QStringLiteral("observation"),
+		     fixture::observation(QStringLiteral("new-session-instance"), 1, sessionState));
+	QVERIFY(subscription(server).socket);
+	subscription(server).socket->write(fixture::frame(event));
+	QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().session && state.dockServer().outputsStatus.complete, 3000);
+	QCOMPARE(state.dockServer().session->id, QStringLiteral("session"));
+	QCOMPARE(state.dockServer().session->state, sessionState);
+	QVERIFY(state.dockServer().session->desiredPaused);
+	QVERIFY(!state.dockServer().outputs.value(QStringLiteral("stopped")).desiredRunning);
+	QVERIFY(state.dockServer().outputs.value(QStringLiteral("stopped")).attached);
+	QVERIFY(!state.dockServer().outputs.value(QStringLiteral("detached")).attached);
+	QVERIFY(!state.dockServer().outputs.value(QStringLiteral("detached")).desiredRunning);
+	controller.shutdown();
+	// restoredSettings читает сохранённый выбор без прежних намерений в RAM.
+	SettingsStore restoredSettings(temp.filePath(QStringLiteral("settings.json")));
+	// restoredState хранит новые наблюдения, не наследуя результаты прежнего процесса.
+	StateStore restoredState;
+	// restoredApi выполняет чтения состояния выбранного сервера.
+	APIClient restoredApi;
+	// restoredEvents принимает новую подписку событий.
+	EventClient restoredEvents;
+	// restoredController согласует новое подключение с восстановленной привязкой профиля.
+	ConnectionController restoredController(restoredState, restoredSettings, restoredApi, restoredEvents);
+	restoredController.observeProfile(FrontendEvent::FinishedLoading, profile());
+	restoredController.connectToServer(server.origin().toString());
+	QTRY_VERIFY_WITH_TIMEOUT(
+		restoredState.dockServer().session && restoredState.dockServer().outputsStatus.complete, 3000);
+	QVERIFY(restoredState.dockServer().session->desiredPaused);
+	QVERIFY(!restoredState.dockServer().outputs.value(QStringLiteral("stopped")).desiredRunning);
+	QVERIFY(!restoredState.dockServer().outputs.value(QStringLiteral("detached")).attached);
+	QVERIFY(!restoredState.operations().current);
+	QVERIFY(!restoredState.operations().lastInterrupted);
+	QVERIFY(readOnly(server));
+}

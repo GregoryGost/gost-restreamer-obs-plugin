@@ -173,6 +173,20 @@ const DockServerState &StateStore::dockServer() const noexcept
 {
 	return dockServer_;
 }
+
+// Возвращает заимствованное значение; потребитель копирует его перед следующим изменением/сигналом.
+const OperationsState &StateStore::operations() const noexcept
+{
+	return operations_;
+}
+
+// Устанавливает полное значение операций перед синхронным уведомлением потребителей GUI.
+void StateStore::setOperations(OperationsState operations)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	operations_ = std::move(operations);
+	emit operationsChanged();
+}
 RuntimeEvidence StateStore::runtimeEvidence(const QString &instanceId) const
 {
 	const auto found = watermarks_.constFind(instanceId);

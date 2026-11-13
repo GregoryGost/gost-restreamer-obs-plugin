@@ -13,7 +13,9 @@ enum class FrontendEvent;
 class StateStore;
 class SettingsStore;
 class ConnectionController;
+class RestreamController;
 
+// Параметры загрузки модуля, не содержащие состояния команд.
 struct PluginOptions {
 	// version выводится в интерфейсе; settingsFile передаёт разрешённый владельцем путь хранилища.
 	// Пустой путь не заменяется автоматически пользовательским/системным каталогом.
@@ -35,8 +37,11 @@ class PluginLifecycle final : public QObject {
 	Q_OBJECT
 
 public:
+	// DockId задаёт стабильное имя зарегистрированного OBS Dock.
 	static constexpr const char *DockId = "gost-restreamer-obs-plugin";
+	// Сохраняет заимствованный Frontend, переводчик text и разрешённые параметры загрузки options.
 	PluginLifecycle(Frontend &frontend, TextLookup text, PluginOptions options = {});
+	// Завершает рабочие сервисы до разрушения оболочки callback.
 	~PluginLifecycle() override;
 	// Регистрирует Dock и callback до FinishedLoading без чтения профиля/статистики. Повтор при рабочем
 	// Runtime возвращает true. Отказ регистрации/исключение очищает частично созданные ресурсы и закрывает
@@ -52,22 +57,30 @@ public:
 	void openManagementWindow();
 	// Возвращаемые указатели заимствованы и действуют до shutdown(); вне рабочего периода они равны nullptr.
 	StateStore *stateStore() const noexcept;
+	// Возвращает заимствованное хранилище предпочтений рабочего Runtime либо nullptr после shutdown.
 	SettingsStore *settingsStore() const noexcept;
+	// Возвращает заимствованный контроллер наблюдения рабочего Runtime либо nullptr после shutdown.
 	ConnectionController *connectionController() const noexcept;
+	// Возвращает заимствованный фасад явных команд; после shutdown результат равен nullptr.
+	RestreamController *restreamController() const noexcept;
 
 private:
+	// Runtime создаёт и завершает общие сервисы независимо от видимости окон.
 	class Runtime;
 	// Граница callback C API: cookie заимствован, исключения перехватываются до выхода в OBS.
 	static void frontendEvent(FrontendEvent event, void *cookie) noexcept;
 	// При EXIT ресурсы освобождаются синхронно. Прочие события из чужого потока ставятся в очередь Runtime;
 	// прочитанный позже профиль уже нельзя считать достоверным снимком исходного перехода.
 	void handleEvent(FrontendEvent event, bool reliableProfile = true);
+	// frontend_ заимствован у OBS; text_ переводит подписи; options_ содержит версию и разрешённый файл настроек.
 	Frontend &frontend_;
 	TextLookup text_;
 	PluginOptions options_;
+	// runtime_ владеет рабочими сервисами, callbackRegistered_ и dockRegistered_ отслеживают регистрацию OBS.
 	std::unique_ptr<Runtime> runtime_;
 	bool callbackRegistered_ = false;
 	bool dockRegistered_ = false;
+	// shuttingDown_ запрещает поздние события и повторную загрузку завершённой оболочки.
 	bool shuttingDown_ = false;
 };
 

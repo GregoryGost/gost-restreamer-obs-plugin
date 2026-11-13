@@ -29,8 +29,10 @@ class ConnectionController final : public QObject {
 	Q_OBJECT
 
 public:
+	// Связывает заимствованные state/settings/api/events и таймер восстановления с родителем parent.
 	ConnectionController(StateStore &state, SettingsStore &settings, api::APIClient &api, api::EventClient &events,
 			     QObject *parent = nullptr);
+	// Завершает наблюдение и отменяет принадлежащие контроллеру запросы до освобождения реализации.
 	~ConnectionController() override;
 	// Принимает событие и снимок профиля из адаптера. Подтверждённое переименование сохраняет UUID и подписку.
 	// Смена профиля или невозможность определить его UUID отменяет работу для прежнего выбора.
@@ -41,6 +43,8 @@ public:
 	void connectToServer(QString origin);
 	// Отменяет подключение и повторы, оставляя последние наблюдения устаревшими. Сервер/OBS не останавливает.
 	void disconnectFromServer();
+	// Объединяет запрос с выполняющимся чтением выбранной Session/Outputs/fallback; POST не выполняет.
+	void refreshState();
 	// Выбирает только полученный Stream, когда UUID профиля определён; пустой ID снимает выбор.
 	// Сохраняет привязку пары сервер/UUID и заново синхронизирует runtime; неизвестный ID игнорирует.
 	void selectStream(QString streamId);
@@ -53,8 +57,14 @@ public:
 	// Идемпотентно запрещает дальнейшие действия, завершает оба сетевых клиента и помечает данные устаревшими.
 	void shutdown();
 
+signals:
+	// Выдаётся только явным отключением пользователя, отдельно от 204 или ошибки SSE.
+	void explicitlyDisconnected();
+
 private:
+	// Реализует последовательность подключения и чтения метаданных в GUI-потоке.
 	class Impl;
+	// Единственная принадлежащая контроллеру реализация; входные сервисы она заимствует.
 	std::unique_ptr<Impl> impl_;
 };
 

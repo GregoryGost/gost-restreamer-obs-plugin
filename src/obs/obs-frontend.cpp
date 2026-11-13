@@ -136,6 +136,24 @@ bool OBSFrontend::streamingActive() const
 	return obs_frontend_streaming_active();
 }
 
+// Читает состояние только в допустимой GUI-фазе, которую обеспечивает OBSController.
+// Отсутствующий выход вместе с false Frontend означает отсутствие активного штатного выхода.
+StreamingState OBSFrontend::streamingState() const
+{
+	// output удерживается ровно до конца этой выборки и освобождается парной функцией libobs.
+	const std::unique_ptr<obs_output_t, decltype(&obs_output_release)> output(obs_frontend_get_streaming_output(),
+										  &obs_output_release);
+	// active объединяет наблюдение Frontend и libobs: последнее включает переподключение.
+	const bool active = obs_frontend_streaming_active() || (output && obs_output_active(output.get()));
+	return {.available = true, .active = active, .reconnecting = output && obs_output_reconnecting(output.get())};
+}
+
+// Штатный void API лишь ставит запрос; его возврат не подтверждает остановку выхода.
+void OBSFrontend::requestStreamingStop()
+{
+	obs_frontend_streaming_stop();
+}
+
 ObsStatisticsSample OBSFrontend::readStatistics() noexcept
 {
 	// Подписка создаётся при первой разрешённой выборке, когда OBSController уже получил FinishedLoading.

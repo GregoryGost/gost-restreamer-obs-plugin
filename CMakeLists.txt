@@ -44,6 +44,11 @@ target_sources(
     src/core/settings-store.hpp
     src/core/connection-controller.cpp
     src/core/connection-controller.hpp
+    src/core/operations-state.hpp
+    src/core/restream-controller.cpp
+    src/core/restream-controller.hpp
+    src/core/output-operations.cpp
+    src/core/output-operations.hpp
     src/api/models.hpp
     src/api/json-decoder.cpp
     src/api/json-decoder.hpp

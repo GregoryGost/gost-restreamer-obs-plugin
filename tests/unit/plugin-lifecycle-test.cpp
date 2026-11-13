@@ -100,48 +100,99 @@ class PluginLifecycleTest final : public QObject {
 	Q_OBJECT
 
 private slots:
+	// Задаёт подтверждённое отсутствие эфира, завершённую Session и независимые наблюдения OBS.
+	void dockWarnsAboutContinuingObs_data();
+	// Предупреждение объясняет риск следующего эфира и штатную остановку OBS без ложной подсказки запуска.
+	void dockWarnsAboutContinuingObs();
+	// Задаёт терминальные отказы в обеих локализациях без раскрытия серверного сообщения.
+	void commandFailureCodeIsPlainText_data();
+	// Код причины виден в обоих окнах как обычный текст; failure.message нигде не выводится.
+	void commandFailureCodeIsPlainText();
+	// До первого события StateStore не выдаёт неизвестные наблюдения OBS за полученные значения.
 	void stateStartsUnobserved();
+	// Сигнал изменения OBS доставляется после установки новых значений состояния.
 	void stateChangesAreObservable();
+	// Загрузка регистрирует Dock и callback без раннего чтения неподготовленного Frontend.
 	void registersBeforeFrontendReady();
+	// Задаёт уже работающий эфир и неактивный OBS при загрузке плагина.
 	void observesCurrentProfileAndStreaming_data();
+	// Готовность и события OBS перечитывают фактические профиль и активность штатного выхода.
 	void observesCurrentProfileAndStreaming();
+	// Расчёт скорости использует монотонный интервал и сохраняет независимые пары счётчиков кадров.
 	void obsStatisticsUseMonotonicIntervalsAndIndependentFramePairs();
+	// Замена выхода, регресс счётчика и переходные фазы разрывают неподтверждённую скорость передачи.
 	void obsStatisticsLoseTheRateAtOutputReplacementAndTransitions();
+	// EXIT синхронно освобождает статистику и запрещает поздние обращения к OBS.
 	void obsStatisticsStopBeforeExitReturns();
+	// Задаёт обе локализации совместного отображения наблюдений.
 	void bothViewsFollowObservations_data();
+	// Dock и расширенное окно отражают общий StateStore, сохраняя буквальный текст профиля.
 	void bothViewsFollowObservations();
+	// Цвет статуса реагирует на изменение смысла и палитры приложения.
 	void statusAppearanceFollowsStateAndPalette();
+	// Задаёт обе локализации повторного открытия единственного окна управления.
 	void managementWindowIsLazyAndReused_data();
+	// Окно создаётся лениво, переживает закрытие и повторно используется без новых общих сервисов.
 	void managementWindowIsLazyAndReused();
+	// Компактный Dock содержит одну шестерёнку и не превращается в окно настроек.
 	void dockStaysCompact();
+	// Задаёт узкие ширины, количества выходов и обе локализации карточек Dock.
 	void dockCardsFitNarrowWidths_data();
+	// Карточки и команды помещаются в узкий Dock без горизонтальной прокрутки или исполнения разметки имён.
 	void dockCardsFitNarrowWidths();
+	// Без выбранного Stream команды недоступны, а клавиатура открывает единственное окно управления; Dock Start отсутствует.
 	void dockActionsRemainLocalAndKeyboardAccessible();
+	// Задаёт несовпадающие состояния Session и Output с ожидаемыми смысловыми цветами.
 	void dockStatusAxesRemainIndependent_data();
+	// OBS, вход, Session и Output сохраняют независимые статусы при смене состояния и темы.
 	void dockStatusAxesRemainIndependent();
+	// Локальный сброс меняет только отображаемые накопления, сохраняя исходные скорости и счётчики.
 	void dockResetChangesOnlyDisplayedAccumulators();
+	// Задаёт обе локализации смены выхода и регресса сетевого счётчика.
 	void dockCounterPeriodsFollowIndependentSources_data();
+	// Независимые источники счётчиков сохраняют собственные периоды отсчёта после сброса и замены выхода.
 	void dockCounterPeriodsFollowIndependentSources();
+	// Задаёт отдельное ограничение каждого штатного счётчика кадров OBS.
 	void dockShowsNativeCounterLimitsIndependently_data();
+	// Ограничение одного счётчика не скрывает доступные измерения остальных этапов.
 	void dockShowsNativeCounterLimitsIndependently();
+	// Задаёт локализованные ожидания свежих и последних известных значений.
 	void dockKeepsLastValuesOnlyInTheSameContext_data();
+	// Кеш последних измерений переживает обрыв только в прежнем контексте и очищается при смене идентичности.
 	void dockKeepsLastValuesOnlyInTheSameContext();
+	// Задаёт локализованный порядок разделов единого окна управления.
 	void managementNavigationHasLocalizedPagesAndIcons_data();
+	// Навигация выбирает соответствующую страницу с изображением и показывает предупреждение несохранённых настроек.
 	void managementNavigationHasLocalizedPagesAndIcons();
+	// Отказ регистрации Dock освобождает частично созданные ресурсы без передачи владения OBS.
 	void failedDockRegistrationReleasesResources();
+	// Задаёт исключение до передачи Dock и после неё при регистрации callback.
 	void registrationExceptionReleasesAcquiredResources_data();
+	// Откат загрузки освобождает только действительно приобретённые ресурсы каждого этапа.
 	void registrationExceptionReleasesAcquiredResources();
+	// Исключение чтения Frontend не выходит через callback C API и не блокирует последующее достоверное событие.
 	void callbackExceptionDoesNotEscape();
+	// EXIT синхронно удаляет сервисы и окна, сохраняя безопасную инертную оболочку для поздних событий.
 	void exitCleansSynchronouslyAndLeavesInertShell();
+	// Поставленное в очередь открытие окна не создаёт сервисы заново после EXIT.
 	void queuedOpenCannotResurrectRuntime();
+	// Событие рабочего потока, ожидающее GUI, не обращается к Frontend после EXIT.
 	void queuedFrontendEventIsDiscardedOnExit();
+	// Предварительное удаление окон родителем OBS не вызывает повторное освобождение при завершении плагина.
 	void hostDestructionDoesNotDoubleDelete();
+	// Поставляемые локализации имеют одинаковые непустые наборы ключей.
 	void localesAreComplete();
+	// Скрытие окна сохраняет один контроллер и подписку, а версия отображается из метаданных загрузки.
 	void hiddenManagementKeepsOneSubscriptionAndMetadataVersion();
+	// Большой список Streams и пачки SSE сохраняют продвижение GUI и корректные конечные данные.
 	void largeStreamListAndRuntimeTrafficAllowGuiProgress();
+	// Оперативное обновление сохраняет раскрытие, выделение и прокрутку списка Streams.
 	void runtimeUpdatePreservesOpenStreamPopup();
+	// Сохранённый Stream различает неподтверждённость и отсутствие без удаления пользовательского выбора.
 	void savedStreamIsUnconfirmedUntilListIsComplete();
+	// Задаёт обе локализации предупреждения о неполном списке Streams.
 	void partialStreamListWarnsAndAllowsSelection_data();
+	// Неполный список предупреждает пользователя и допускает явный выбор уже полученного Stream.
 	void partialStreamListWarnsAndAllowsSelection();
 };
 
@@ -694,12 +745,15 @@ void PluginLifecycleTest::dockCardsFitNarrowWidths()
 	}
 }
 
+// Проверяет отсутствие Dock Start и недоступность команд без Stream, сохраняя клавиатурный доступ к управлению.
 void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 {
-	// На неактивные будущие действия отправляются и мышь, и клавиатура. Проверяется реальная граница
+	// Без выбранного Stream команды недоступны и мышью, и клавиатурой. Проверяется реальная граница
 	// lifecycle с локальным HTTP-сервером; работающая шестерёнка открывает тот же экземпляр управления.
+	// temp изолирует настройки lifecycle внутри workspace.
 	WorkspaceTemp temp(QStringLiteral("dock-local-actions"));
 	QVERIFY(temp.isValid());
+	// server принимает только локальные запросы; handler отвечает на bootstrap и удерживает SSE.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [&](const auto &request) {
@@ -714,7 +768,9 @@ void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 		else
 			HttpServer::stream(request);
 	};
+	// frontend предоставляет настоящее дерево QWidget с управляемыми наблюдениями OBS.
 	FakeFrontend frontend;
+	// lifecycle создаёт общий runtime и UI с явным файлом настроек.
 	gost::PluginLifecycle lifecycle(frontend, localeLookup(),
 					{.settingsFile = temp.filePath(QStringLiteral("settings.json"))});
 	QVERIFY(lifecycle.load());
@@ -722,17 +778,24 @@ void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 	frontend.emitEvent(gost::FrontendEvent::FinishedLoading);
 	lifecycle.connectionController()->connectToServer(server.origin().toString());
 	QTRY_COMPARE_WITH_TIMEOUT(lifecycle.stateStore()->connectionStatus(), gost::ConnectionStatus::Connected, 3000);
+	// dock заимствует зарегистрированное содержимое OBS Dock.
 	auto *dock = frontend.content.data();
 	frontend.host->show();
 	frontend.dock->show();
+	// requests фиксирует завершившийся bootstrap для проверки отсутствия команд.
 	const auto requests = server.requests.size();
+	// sample сохраняет локальную статистику до попыток недоступных действий.
 	const auto sample = lifecycle.stateStore()->obsStatistics();
-	for (const auto *name : {"broadcastStartButton", "broadcastPauseButton", "broadcastResumeButton",
-				 "broadcastStopButton", "outputsStartButton", "outputsRestartButton"}) {
+	QVERIFY(!dock->findChild<QPushButton *>(QStringLiteral("broadcastStartButton")));
+	// name адресует конкретную доступную в Dock команду без выбора текущей строки.
+	for (const auto *name : {"broadcastPauseButton", "broadcastResumeButton", "broadcastStopButton",
+				 "outputsStartButton", "outputsRestartButton"}) {
+		// button адресует точную кнопку; она не должна порождать действие без выбора.
 		auto *button = dock->findChild<QPushButton *>(QString::fromLatin1(name));
 		QVERIFY(button);
 		QVERIFY(!button->isHidden());
 		QVERIFY(!button->isEnabled());
+		// clicked обнаруживает недопустимый сигнал мыши или клавиатуры от отключённой кнопки.
 		QSignalSpy clicked(button, &QPushButton::clicked);
 		QVERIFY(clicked.isValid());
 		QTest::mouseClick(button, Qt::LeftButton);
@@ -743,7 +806,9 @@ void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 	QCOMPARE(server.requests.size(), requests);
 	QVERIFY(lifecycle.stateStore()->obsStatistics() == sample);
 	QVERIFY(!frontend.streaming);
+	// gear открывает единственное расширенное окно; reset остаётся локальным действием.
 	auto *gear = dock->findChild<QToolButton *>(QStringLiteral("managementButton"));
+	// reset адресует кнопку локального baseline, не сетевую команду.
 	auto *reset = dock->findChild<QPushButton *>(QStringLiteral("statsResetButton"));
 	QVERIFY(gear && reset);
 	QVERIFY(gear->focusPolicy() != Qt::NoFocus);
@@ -751,6 +816,7 @@ void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 	gear->setFocus();
 	QTest::keyClick(gear, Qt::Key_Space);
 	QTRY_COMPARE_WITH_TIMEOUT(managementWindows().size(), 1, 1000);
+	// window фиксирует экземпляр ManagementWindow, который должен пережить закрытие.
 	auto *window = managementWindows().front();
 	window->close();
 	gear->setFocus();
@@ -1943,3 +2009,160 @@ void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
 QTEST_MAIN(PluginLifecycleTest)
 
 #include "plugin-lifecycle-test.moc"
+
+void PluginLifecycleTest::dockWarnsAboutContinuingObs_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::addColumn<QString>("sessionState");
+	QTest::addColumn<bool>("obsActive");
+	QTest::addColumn<bool>("obsStarting");
+	QTest::addColumn<bool>("partialStop");
+	QTest::addColumn<bool>("known");
+	QTest::addColumn<QString>("warningKey");
+	QTest::addColumn<bool>("nativeStartVisible");
+	// locale выбирает настоящий поставляемый словарь для каждого независимого сценария.
+	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")}) {
+		QTest::newRow(qPrintable(locale + QStringLiteral("-no-session-active")))
+			<< locale << QString{} << true << false << false << true
+			<< QStringLiteral("Operation.ObsStillActive") << false;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-stopped-active")))
+			<< locale << QStringLiteral("STOPPED") << true << false << false << true
+			<< QStringLiteral("Operation.ObsStillActive") << false;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-failed-active")))
+			<< locale << QStringLiteral("FAILED") << true << false << false << true
+			<< QStringLiteral("Operation.ObsStillActive") << false;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-interrupted-active")))
+			<< locale << QStringLiteral("INTERRUPTED") << true << false << false << true
+			<< QStringLiteral("Operation.ObsStillActive") << false;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-starting-false-flags")))
+			<< locale << QString{} << false << true << false << true
+			<< QStringLiteral("Operation.ObsStillActive") << false;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-stopped-inactive")))
+			<< locale << QStringLiteral("STOPPED") << false << false << false << true << QString{} << true;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-unknown-session")))
+			<< locale << QString{} << true << false << false << false << QString{} << false;
+		QTest::newRow(qPrintable(locale + QStringLiteral("-partial-stop-false-flags")))
+			<< locale << QStringLiteral("STOPPED") << false << false << true << true
+			<< QStringLiteral("Operation.ObsStopUnconfirmed") << true;
+	}
+}
+
+void PluginLifecycleTest::dockWarnsAboutContinuingObs()
+{
+	// locale выбирает словарь поставки; sessionState задаёт точную сохранённую Session либо полное отсутствие.
+	QFETCH(QString, locale);
+	QFETCH(QString, sessionState);
+	// obsActive задаёт булевое наблюдение, obsStarting — независимую фазу запуска с временно ложными флагами.
+	QFETCH(bool, obsActive);
+	QFETCH(bool, obsStarting);
+	// partialStop задаёт прежнее неподтверждённое завершение OBS; known определяет достоверность поиска Session.
+	QFETCH(bool, partialStop);
+	QFETCH(bool, known);
+	// warningKey задаёт требуемое предупреждение, nativeStartVisible — допустимость предложения штатного запуска.
+	QFETCH(QString, warningKey);
+	QFETCH(bool, nativeStartVisible);
+	// text использует настоящий перевод, state хранит раздельные наблюдения Session, OBS и результаты команды.
+	const auto text = localeLookup(locale);
+	gost::StateStore state;
+	// stream подтверждает текущий выбранный Stream без обращения к backend.
+	gost::api::Stream stream;
+	stream.id = QStringLiteral("stream");
+	state.setConnection(QStringLiteral("http://127.0.0.1:8080"), gost::ConnectionStatus::Connected);
+	state.setStreams({stream}, true);
+	state.setSelection(stream.id, true, {}, {}, QStringLiteral("profile"));
+	state.setObsState(QStringLiteral("Профиль"), obsActive);
+	state.setObsStatistics({.phase = obsStarting ? gost::ObsStreamingPhase::Starting
+						     : (obsActive ? gost::ObsStreamingPhase::Streaming
+								  : gost::ObsStreamingPhase::Stopped),
+				.observed = true});
+	// metadata задаёт независимо полное подтверждение отсутствия эфира либо неизвестный результат поиска.
+	gost::DockServerState metadata;
+	metadata.sessionStatus = {known ? gost::RuntimeAvailability::Fresh : gost::RuntimeAvailability::Unknown,
+				  known,
+				  {}};
+	if (!sessionState.isEmpty())
+		metadata.session = gost::DockSession{QStringLiteral("session"), sessionState, false};
+	state.setDockServer(metadata);
+	if (partialStop) {
+		// operations/workflow сохраняют серверный успех отдельно от неизвестного локального stop.
+		gost::OperationsState operations;
+		gost::WorkflowResult workflow;
+		workflow.context = state.dockContext();
+		workflow.action = gost::OperationAction::StopAll;
+		workflow.phase = gost::OperationPhase::Finished;
+		workflow.outcome = gost::OperationOutcome::Unknown;
+		workflow.obsOutcome = gost::OperationOutcome::Unknown;
+		workflow.serverOutcome = gost::OperationOutcome::Completed;
+		operations.current = workflow;
+		state.setOperations(operations);
+	}
+	// dock показывает те же состояния, что и рабочий интерфейс, без сетевого контроллера.
+	gost::RestreamDock dock(state, text);
+	// nativeGuidance адресует предложение запуска; status адресует отдельное сообщение результата и риска.
+	auto *nativeGuidance = dock.findChild<QLabel *>(QStringLiteral("nativeStartGuidance"));
+	auto *status = dock.findChild<QLabel *>(QStringLiteral("operationStatus"));
+	QVERIFY(nativeGuidance && status);
+	if (!partialStop)
+		QTRY_COMPARE_WITH_TIMEOUT(!nativeGuidance->isHidden(), nativeStartVisible, 1000);
+	QCOMPARE(status->textFormat(), Qt::PlainText);
+	if (!warningKey.isEmpty()) {
+		QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(text(warningKey.toUtf8().constData())), 1000);
+		QVERIFY(!status->isHidden());
+	} else {
+		QVERIFY(!status->text().contains(text("Operation.ObsStillActive")));
+		QVERIFY(!status->text().contains(text("Operation.ObsStopUnconfirmed")));
+	}
+	if (obsActive || obsStarting)
+		QVERIFY(!status->text().contains(text("Dock.NativeStart")));
+}
+
+void PluginLifecycleTest::commandFailureCodeIsPlainText_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::addColumn<QString>("receiptStatus");
+	// locale задаёт словарь; status перебирает оба подтверждённых терминальных отказа.
+	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")})
+		for (const auto &status : {QStringLiteral("FAILED"), QStringLiteral("INTERRUPTED")})
+			QTest::newRow(qPrintable(locale + QLatin1Char('-') + status)) << locale << status;
+}
+
+void PluginLifecycleTest::commandFailureCodeIsPlainText()
+{
+	// locale выбирает реальную локализацию; receiptStatus задаёт терминальную квитанцию отказа.
+	QFETCH(QString, locale);
+	QFETCH(QString, receiptStatus);
+	// text задаёт пользовательские подписи; state предоставляет общий результат обоим окнам.
+	const auto text = localeLookup(locale);
+	gost::StateStore state;
+	// code содержит символы разметки для проверки буквального вывода; message моделирует запрещённый текст сервера.
+	const auto code = QStringLiteral("cleanup_<b>failure</b>&");
+	const auto message = QStringLiteral("private-server-message-marker");
+	// receipt хранит подтверждённый код и отдельное сообщение сервера, которое UI не должен раскрывать.
+	gost::api::Receipt receipt;
+	receipt.status = receiptStatus;
+	receipt.failure = {gost::api::FieldState::Value, {code, message}};
+	// operations/workflow содержат подтверждённый отказ, а не предположение по состоянию площадки.
+	gost::OperationsState operations;
+	gost::WorkflowResult workflow;
+	workflow.action = gost::OperationAction::Pause;
+	workflow.phase = gost::OperationPhase::Finished;
+	workflow.outcome = gost::OperationOutcome::Failed;
+	workflow.receipt = receipt;
+	operations.current = workflow;
+	state.setOperations(operations);
+	// dock/window отображают один общий результат без новых собственных серверных чтений.
+	gost::RestreamDock dock(state, text);
+	gost::ManagementWindow window(state, text);
+	// dockStatus адресует результат Dock; streamStatus — страницы потоков; outputStatus — страницы выходов.
+	auto *dockStatus = dock.findChild<QLabel *>(QStringLiteral("operationStatus"));
+	auto *streamStatus = window.findChild<QLabel *>(QStringLiteral("streamOperationStatus"));
+	auto *outputStatus = window.findChild<QLabel *>(QStringLiteral("outputOperationStatus"));
+	QVERIFY(dockStatus && streamStatus && outputStatus);
+	// label проверяется как настоящий QWidget, чтобы случайный переход к AutoText не скрыл риск HTML-интерпретации.
+	for (auto *label : {dockStatus, streamStatus, outputStatus}) {
+		QTRY_VERIFY_WITH_TIMEOUT(label->text().contains(text("Operation.FailureCode").arg(code)), 1000);
+		QCOMPARE(label->textFormat(), Qt::PlainText);
+		QVERIFY(label->text().contains(code));
+		QVERIFY(!label->text().contains(message));
+	}
+}

@@ -425,13 +425,17 @@ function Observe-ManagementActivation {
     return $false
 }
 
+# Подготавливает собственное главное окно к UI-действиям и отдельно подтверждает foreground.
+# ObservationSeconds ограничивает ожидание фактической активации; успех SetFocus/SetForegroundWindow сам по себе недостаточен.
 function Prepare-OwnedMainForeground {
     param([ValidateRange(1, 20)][int] $ObservationSeconds = 1)
     # Подготовка исходного активного окна проверяется отдельно от результата активации окна управления.
     Assert-OwnedElement $main
+    # window — зафиксированный HWND собственного OBS; ownerProcess проверяет его текущий PID.
     $window = [IntPtr]::new($MainWindowHandle)
     $ownerProcess = [uint32]0
     $null = [ObsWindowInspection]::GetWindowThreadProcessId($window, [ref]$ownerProcess)
+    # nativeTitle содержит заголовок именно этого HWND для проверки штатного главного окна.
     $nativeTitle = [Text.StringBuilder]::new(1024)
     if ($ownerProcess -eq $ObsProcessId) { $null = [ObsWindowInspection]::GetWindowText($window, $nativeTitle, $nativeTitle.Capacity) }
     if ($ownerProcess -ne $ObsProcessId -or $main.Current.ClassName -cne 'OBSBasic' -or
@@ -440,7 +444,11 @@ function Prepare-OwnedMainForeground {
         throw 'Не подтверждено собственное главное окно для подготовки проверки активации.'
     }
     Assert-OwnedProcess
+    # UIA сначала запрашивает фокус своего главного окна; затем проверяется реальный foreground Win32.
+    $main.SetFocus()
+    # requested — результат запроса Win32, который сохраняется отдельно от наблюдаемого подтверждения.
     $requested = [ObsWindowInspection]::SetForegroundWindow($window)
+    # deadline — конечное время ожидания фактической активации, без действий над чужими окнами.
     $deadline = [DateTime]::UtcNow.AddSeconds($ObservationSeconds)
     do {
         Assert-OwnedProcess

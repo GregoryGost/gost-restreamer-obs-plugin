@@ -58,6 +58,9 @@ void markReadUnconfirmed(ReadStatus &status)
 // может сразу вызвать код, меняющий выбор, поэтому после уведомлений эти проверки выполняются заново.
 class ConnectionController::Impl {
 public:
+	// Заимствует owner/state/settings/api/events и связывает таймер с временем жизни owner.
+	// Обработчик retry начинает сохранённую фазу только для прежнего контекста;
+	// обработчик changed переносит текущие предпочтения SettingsStore в StateStore.
 	Impl(ConnectionController &owner, StateStore &state, SettingsStore &settings, api::APIClient &api,
 	     api::EventClient &events)
 		: owner(owner),
@@ -80,24 +83,43 @@ public:
 	// Handshake читает ready, capabilities и Streams перед снимком. Snapshot запрашивает новый снимок.
 	// Events возобновляет подписку с установленного cursor; без курсора повторяет начальные чтения Handshake.
 	enum class Phase { Handshake, Snapshot, Events };
+	// Заимствованный QObject владеет реализацией и ограничивает время жизни callbacks.
 	ConnectionController &owner;
+	// Общее GUI-состояние для публикации проверенных наблюдений.
 	StateStore &state;
+	// Хранилище предпочтений и устойчивой идентичности OBS Profile.
 	SettingsStore &settings;
+	// Заимствованный REST-клиент наблюдения; команды используют отдельный клиент.
 	api::APIClient &api;
+	// Заимствованный клиент единственной оперативной SSE-подписки.
 	api::EventClient &events;
+	// Поколения текущего подключения и выбора, проверяемые каждым ответом.
 	api::RequestContext context;
+	// Контекст, которому принадлежит запланированное восстановление.
 	api::RequestContext scheduledContext;
+	// Одноразовый таймер паузы перед следующим циклом подключения.
 	QTimer retry;
+	// Монотонные часы скользящего окна ограничения частоты стартов.
 	QElapsedTimer clock;
+	// Время фактических стартов в миллисекундах clock за последние 10 секунд.
 	std::deque<qint64> starts;
+	// Фаза, которую должен начать следующий timeout таймера retry.
 	Phase nextPhase = Phase::Handshake;
+	// Число последовательных отказов для роста паузы; ограничено значением 5.
 	int failures = 0;
+	// Последний HTTP 400/409 подписки, требующий нового snapshot.
 	int sseRejectionStatus = 0;
+	// Число начатых восстановлений snapshot после отказа подписки.
 	int sseRejectionAttempts = 0;
+	// Необратимый запрет работы после shutdown.
 	bool stopped = false;
+	// Разрешение текущего цикла подключения и его автоматического восстановления.
 	bool active = false;
+	// Подтверждён ли UUID текущего OBS Profile через SettingsStore.
 	bool profileResolved = false;
+	// Автоподключение при FinishedLoading уже было рассмотрено в этом процессе.
 	bool autoStarted = false;
+	// Две независимо завершаемые части чтения метаданных одного выбора и snapshot.
 	struct DockRead {
 		// Один набор запросов читает Session с Outputs и отдельно цепочку fallback. Готовая часть
 		// сразу передаётся в StateStore: медленный Asset не задерживает показ Session. complete показывает,
@@ -105,32 +127,51 @@ public:
 		// изменились состав или состояние исполнений, dirty запрещает передавать состав Session/Outputs
 		// в StateStore; после завершения обеих частей выполняется новое чтение. При смене выбора или
 		// снимка результаты всего набора больше не передаются в StateStore.
+		// Тройка сервер/UUID профиля/Stream, зафиксированная до первого запроса.
 		DockContext selection;
+		// Версия snapshot, на котором началось это чтение.
 		quint64 anchorVersion = 0;
+		// Собираемые метаданные с сохранением прежних неподтверждённых значений.
 		DockServerState next;
+		// Уникальные ID активных Session, найденные по трём фильтрам состояния.
 		QSet<QString> candidates;
+		// Число ещё не завершившихся страниц STARTING/RUNNING/STOPPING.
 		std::size_t remainingPages = ActiveSessionStates.size();
+		// Все страницы поиска полны и согласованы с фильтром.
 		bool complete = true;
+		// Цепочка Session/Outputs завершилась независимо от результата.
 		bool sessionDone = false;
+		// Цепочка policy/Asset/Generation завершилась независимо от результата.
 		bool fallbackDone = false;
+		// Готовая часть Session/Outputs уже передана в StateStore.
 		bool sessionPublished = false;
+		// Готовая часть fallback уже передана в StateStore.
 		bool fallbackPublished = false;
+		// Топология изменилась во время чтения: после завершения требуется новое чтение.
 		bool dirty = false;
 	};
+	// Общая ссылка удерживает пакет до завершения всех его асинхронных ответов.
 	using DockBatch = std::shared_ptr<DockRead>;
+	// Единственный текущий пакет; несовпадение ссылки запрещает публикацию старого ответа.
 	DockBatch dockRead;
+	// Увеличивается после каждой установки нового оперативного snapshot.
 	quint64 anchorVersion = 0;
+	// Выбор, которому принадлежит подсказка последней прочитанной Session.
 	DockContext dockSessionHintContext;
+	// ID последней подтверждённой Session; очищается при смене контекста выбора.
 	QString dockSessionHint;
 
+	// Проверяет полученный контекст received и разрешение текущего подключения.
 	bool current(api::RequestContext received) const { return !stopped && active && received == context; }
 
+	// Публикует предпочтения и безопасную ошибку сохранения из SettingsStore.
 	void syncPreferences()
 	{
 		state.setPreferences(settings.autoConnect(), settings.reconnect(), settings.sseRejectionRetries(),
 				     settings.unsaved(), settings.error(), settings.errorKey());
 	}
 
+	// Сбрасывает бюджет отказов подписки после явного сброса или успешного открытия SSE.
 	void clearSseRejection()
 	{
 		sseRejectionStatus = 0;
@@ -155,6 +196,7 @@ public:
 			state.setConnection(state.serverOrigin(), ConnectionStatus::Connecting);
 	}
 
+	// Отменяет прежние REST-чтения и задаёт клиенту текущий origin/context.
 	void configure()
 	{
 		dockRead.reset();
@@ -166,9 +208,11 @@ public:
 	// тройке «сервер + UUID профиля + Stream», чтобы завершённая Session не перешла в другой выбор.
 	void resolveSelection(QString notice = {}, QString noticeKey = {})
 	{
+		// profileUuid — подтверждённая идентичность профиля; streamId — сохранённый для неё выбор.
 		const auto profileUuid = profileResolved ? settings.profileUuid() : QString{};
 		const auto streamId = profileResolved ? settings.selectedStream(state.serverOrigin(), profileUuid)
 						      : QString{};
+		// selection связывает подсказку Session с точным сервером, профилем и Stream.
 		const DockContext selection{state.serverOrigin(), profileUuid, streamId};
 		if (dockSessionHintContext != selection) {
 			dockSessionHintContext = selection;
@@ -177,6 +221,7 @@ public:
 		state.setSelection(streamId, profileResolved, std::move(notice), std::move(noticeKey), profileUuid);
 	}
 
+	// Проверяет принадлежность batch текущим received, snapshot, выбору и открытой подписке.
 	bool currentDockRead(const DockBatch &batch, api::RequestContext received) const
 	{
 		// Одного совпадения HTTP-контекста недостаточно: новый снимок мог заменить оперативное дерево.
@@ -195,21 +240,25 @@ public:
 			return;
 		// Метаданные Session и Output читаются независимо от заглушки; сомнительный пакет Session не публикуется.
 		if (batch->sessionDone && !batch->sessionPublished && !batch->dirty) {
+			// published заменяет только готовую часть Session/Outputs, сохраняя независимый fallback.
 			auto published = state.dockServer();
 			published.session = batch->next.session;
 			published.sessionStatus = batch->next.sessionStatus;
 			published.outputs = batch->next.outputs;
 			published.outputsStatus = batch->next.outputsStatus;
 			batch->sessionPublished = true;
+			// guard проверяет существование owner после синхронного уведомления StateStore.
 			const QPointer<ConnectionController> guard = &owner;
 			state.setDockServer(std::move(published));
 			if (!guard || !currentDockRead(batch, received))
 				return;
 		}
 		if (batch->fallbackDone && !batch->fallbackPublished) {
+			// published заменяет только fallback, не возвращая старые Session/Outputs.
 			auto published = state.dockServer();
 			published.fallback = batch->next.fallback;
 			batch->fallbackPublished = true;
+			// guard запрещает продолжение после удаления owner обработчиком сигнала.
 			const QPointer<ConnectionController> guard = &owner;
 			state.setDockServer(std::move(published));
 			if (!guard || !currentDockRead(batch, received))
@@ -222,12 +271,14 @@ public:
 		}
 	}
 
+	// Помечает часть Session/Outputs завершённой и передаёт её при действующем received.
 	void finishDockSession(const DockBatch &batch, api::RequestContext received)
 	{
 		batch->sessionDone = true;
 		finishDockRead(batch, received);
 	}
 
+	// Помечает цепочку fallback завершённой и передаёт её при действующем received.
 	void finishDockFallback(const DockBatch &batch, api::RequestContext received)
 	{
 		batch->fallbackDone = true;
@@ -239,17 +290,21 @@ public:
 	// обновляем найденные записи, а остальные сохраняем до полного чтения.
 	void readDockOutputs(const DockBatch &batch, const QString &sessionId)
 	{
+		// Обработчик принимает result только для текущего received и проверяет родителей каждого выхода.
 		api.getAllOutputs(
 			sessionId, &owner,
 			[this, batch, sessionId](auto received, api::Result<api::Collection<api::Output>> result) {
 				if (!currentDockRead(batch, received))
 					return;
 				if (!batch->dirty && result) {
+					// outputs собирает проверенные записи; неполное чтение сохраняет прежние отсутствующие ID.
 					QMap<QString, DockOutput> outputs;
 					if (!result.value->complete)
 						outputs = batch->next.outputs;
+					// receivedIds выявляет дубликаты; valid запрещает публикацию всего противоречивого ответа.
 					QSet<QString> receivedIds;
 					bool valid = true;
+					// output — очередная запись с проверяемыми ID Session и Stream.
 					for (const auto &output : result.value->items) {
 						if (!validDockId(output.id) || receivedIds.contains(output.id) ||
 						    output.sessionId != sessionId ||
@@ -272,45 +327,50 @@ public:
 			});
 	}
 
-	// Списки дают лишь кандидата, затем детальный GET повторно проверяет ID и оба поля Stream.
-	// При отсутствии активных кандидатов разрешено дочитать только известный dockSessionHint и только терминальный
-	// результат. Это удерживает завершённую Session без угадывания последней по чужой истории.
+	// Полный поиск без кандидатов подтверждает отсутствие активной Session. Единственный кандидат
+	// дополнительно проверяется GET по его точному ID; неполный поиск и конфликт не подтверждают отсутствие/выбор.
 	void readExactDockSession(const DockBatch &batch, api::RequestContext received)
 	{
-		// После исчезновения активной Session разрешено дочитать только уже известную для этого выбора Session.
-		const bool terminalOnly = batch->candidates.isEmpty();
-		if (batch->dirty || !batch->complete || batch->candidates.size() > 1 ||
-		    (terminalOnly && dockSessionHint.isEmpty())) {
+		// Полный поиск без кандидатов подтверждает отсутствие активной Session. Историческая
+		// завершённая запись больше не блокирует запуск и не подменяет отсутствие текущей Session.
+		if (!batch->dirty && batch->complete && batch->candidates.isEmpty()) {
+			batch->next.session.reset();
+			batch->next.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+			batch->next.outputs.clear();
+			batch->next.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
 			finishDockSession(batch, received);
 			return;
 		}
-		const auto sessionId = terminalOnly ? dockSessionHint : *batch->candidates.cbegin();
-		api.getSession(sessionId, &owner,
-			       [this, batch, sessionId, terminalOnly](auto ctx, api::Result<api::Session> result) {
-				       if (!currentDockRead(batch, ctx))
-					       return;
-				       if (!result || result.value->id != sessionId ||
-					   result.value->streamId != batch->selection.streamId ||
-					   result.value->stream.id != batch->selection.streamId ||
-					   (!terminalSession(result.value->state) &&
-					    (terminalOnly || !activeSession(result.value->state)))) {
-					       finishDockSession(batch, ctx);
-					       return;
-				       }
-				       dockSessionHint = sessionId;
-				       if (batch->dirty) {
-					       finishDockSession(batch, ctx);
-					       return;
-				       }
-				       if (!batch->next.session || batch->next.session->id != sessionId) {
-					       batch->next.outputs.clear();
-					       batch->next.outputsStatus = {};
-				       }
-				       batch->next.session =
-					       DockSession{sessionId, result.value->state, result.value->desiredPaused};
-				       batch->next.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
-				       readDockOutputs(batch, sessionId);
-			       });
+		if (batch->dirty || !batch->complete || batch->candidates.size() != 1) {
+			finishDockSession(batch, received);
+			return;
+		}
+		// sessionId фиксирует кандидата до асинхронного ответа, callback проверяет обе связи Stream.
+		const auto sessionId = *batch->candidates.cbegin();
+		// callback повторно проверяет ID/Stream и принимает только актуального активного кандидата.
+		api.getSession(sessionId, &owner, [this, batch, sessionId](auto ctx, api::Result<api::Session> result) {
+			if (!currentDockRead(batch, ctx))
+				return;
+			if (!result || result.value->id != sessionId ||
+			    result.value->streamId != batch->selection.streamId ||
+			    result.value->stream.id != batch->selection.streamId ||
+			    !activeSession(result.value->state)) {
+				finishDockSession(batch, ctx);
+				return;
+			}
+			dockSessionHint = sessionId;
+			if (batch->dirty) {
+				finishDockSession(batch, ctx);
+				return;
+			}
+			if (!batch->next.session || batch->next.session->id != sessionId) {
+				batch->next.outputs.clear();
+				batch->next.outputsStatus = {};
+			}
+			batch->next.session = DockSession{sessionId, result.value->state, result.value->desiredPaused};
+			batch->next.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+			readDockOutputs(batch, sessionId);
+		});
 	}
 
 	// Три небольших чтения STARTING/RUNNING/STOPPING не являются атомарным серверным снимком.
@@ -318,9 +378,11 @@ public:
 	// неподтверждённой; порядок прихода страниц не используется как выбор «самой новой».
 	void readDockSessionPage(const DockBatch &batch, const QString &status)
 	{
+		// query ограничивает размер страницы и фиксирует проверяемое активное состояние status.
 		api::ListQuery query;
 		query.limit = SessionPageSize;
 		query.state = status;
+		// Обработчик проверяет result/ctx, уникальность Session и точное соответствие фильтру status.
 		api.getStreamSessions(
 			batch->selection.streamId, &owner,
 			[this, batch, status](auto ctx, api::Result<api::Page<api::Session>> result) {
@@ -330,7 +392,9 @@ public:
 				    result.value->items.size() > SessionPageSize) {
 					batch->complete = false;
 				} else {
+					// ids содержит уникальные ID этой страницы, затем объединяется с кандидатами других состояний.
 					QSet<QString> ids;
+					// session — очередной кандидат, чьи родители и состояние сверяются с запросом.
 					for (const auto &session : result.value->items) {
 						if (!validDockId(session.id) || ids.contains(session.id) ||
 						    session.streamId != batch->selection.streamId ||
@@ -353,6 +417,7 @@ public:
 	// status описывает только метаданные подготовки, не пригодность всех вариантов и не готовность Session.
 	void readDockGeneration(const DockBatch &batch, const QString &assetId, const QString &generationId)
 	{
+		// Обработчик принимает status лишь при совпадении ctx и обоих запрошенных ID.
 		api.getGeneration(assetId, generationId, &owner,
 				  [this, batch, assetId, generationId](auto ctx, api::Result<api::Generation> result) {
 					  if (!currentDockRead(batch, ctx))
@@ -364,11 +429,14 @@ public:
 				  });
 	}
 
+	// Читает точный Asset и продолжает цепочку только по его currentGenerationId.
 	void readDockAsset(const DockBatch &batch, const QString &assetId)
 	{
+		// Обработчик result/ctx отличает найденный Asset от отсутствующего текущего поколения.
 		api.getAsset(assetId, &owner, [this, batch, assetId](auto ctx, api::Result<api::Asset> result) {
 			if (!currentDockRead(batch, ctx))
 				return;
+			// fallback — собираемая часть метаданных заглушки именно этого пакета.
 			auto &fallback = batch->next.fallback;
 			if (result && result.value->id == assetId) {
 				fallback.assetKnown = true;
@@ -387,6 +455,7 @@ public:
 	// наличие назначенного Asset ещё не доказывает, что его current удалось прочитать.
 	void readDockFallback(const DockBatch &batch)
 	{
+		// Обработчик result/ctx различает null-политику и назначенный Asset без подмены неизвестности.
 		api.getFallbackPolicy(batch->selection.streamId, &owner,
 				      [this, batch](auto ctx, api::Result<api::PolicyResult> result) {
 					      if (!currentDockRead(batch, ctx))
@@ -419,6 +488,7 @@ public:
 			dockRead->dirty = true;
 			return;
 		}
+		// batch удерживается ответами, но применять их разрешает только совпадение с dockRead.
 		auto batch = std::make_shared<DockRead>();
 		batch->selection = state.dockContext();
 		batch->anchorVersion = anchorVersion;
@@ -428,16 +498,19 @@ public:
 		if (batch->next.fallback.availability == RuntimeAvailability::Fresh)
 			batch->next.fallback.availability = RuntimeAvailability::Stale;
 		dockRead = batch;
+		// status задаёт один из трёх фильтров поиска активной Session.
 		for (const auto &status : ActiveSessionStates)
 			readDockSessionPage(batch, status);
 		readDockFallback(batch);
 	}
 
+	// Определяет, требует ли изменение топологии event перечитать метаданные выбранного Dock.
 	bool relevantDockEvent(const api::RuntimeEvent &event) const
 	{
 		// Изменение известной Session требует перечитать её состав. Событие другой Session
 		// запускает поиск лишь при отсутствии/завершении/неподтверждённости текущей, чтобы обычная
 		// телеметрия постороннего эфира не порождала постоянные REST-пакеты выбранного Dock.
+		// session — последняя выбранная серверная запись, независимо от доступности её runtime.
 		const auto &session = state.dockServer().session;
 		if (session && session->id == event.sessionId)
 			return true;
@@ -450,6 +523,7 @@ public:
 	// и повторы, сохраняет последние наблюдения. EventClient уже закрыл отказавшую подписку до callback.
 	void stopWithReason(ConnectionStatus status, QString message, QString key)
 	{
+		// expected фиксирует контекст до уведомления; guard проверяет жизнь owner после сигнала.
 		const auto expected = context;
 		const QPointer<ConnectionController> guard = &owner;
 		active = false;
@@ -461,14 +535,18 @@ public:
 			state.setConnection(state.serverOrigin(), status, std::move(message), std::move(key));
 	}
 
+	// Проверяет, израсходован ли конечный бюджет восстановления после SSE 400/409.
 	bool rejectionLimitReached() const
 	{
+		// limit — выбранное число повторных циклов либо специальное значение без ограничения.
 		const int limit = settings.sseRejectionRetries();
 		return limit != SettingsStore::UnlimitedSseRejectionRetries && sseRejectionAttempts >= limit;
 	}
 
+	// Останавливает восстановление с безопасной локализуемой причиной последнего отказа SSE.
 	void stopAfterRejection()
 	{
+		// badRequest выбирает причину HTTP 400 отдельно от конфликта HTTP 409.
 		const bool badRequest = sseRejectionStatus == 400;
 		stopWithReason(
 			ConnectionStatus::Error,
@@ -497,12 +575,14 @@ public:
 		}
 		nextPhase = phase;
 		scheduledContext = context;
+		// exponent — прежнее число отказов для текущего экспоненциального увеличения паузы.
 		const int exponent = failures;
 		failures = std::min(failures + 1, 5);
-		// Пауза растёт до 30 с с небольшим случайным смещением; отдельное окно starts ограничивает частоту стартов.
+		// base — базовая пауза до 30 с; jitter — случайное смещение; delay — итоговые 1000..30000 мс.
 		const int base = std::min(30000, 1000 * (1 << exponent));
 		const int jitter = QRandomGenerator::global()->bounded(std::max(1, base / 5));
 		const int delay = std::clamp(base - base / 10 + jitter, 1000, 30000);
+		// expected фиксирует контекст; guard проверяет жизнь owner после уведомления об устаревших данных.
 		const auto expected = context;
 		const QPointer<ConnectionController> guard = &owner;
 		retry.start(delay);
@@ -526,6 +606,7 @@ public:
 			stopAfterRejection();
 			return;
 		}
+		// now — монотонное время текущего старта в миллисекундах для скользящего окна starts.
 		const auto now = clock.elapsed();
 		while (!starts.empty() && now - starts.front() >= 10000)
 			starts.pop_front();
@@ -548,6 +629,8 @@ public:
 			snapshot();
 			return;
 		}
+		// Обработчики ready/capabilities/Streams последовательно проверяют свои ctx и результаты;
+		// любой отказ повторяет Handshake, а успешный полный цикл переходит к snapshot.
 		api.getReady(&owner, [this](auto ctx, api::Result<api::Health> result) {
 			if (!current(ctx))
 				return;
@@ -576,6 +659,7 @@ public:
 						schedule(Phase::Handshake);
 						return;
 					}
+					// complete сохраняет полноту до переноса элементов ответа в StateStore.
 					const bool complete = streams.value->complete;
 					state.setStreams(std::move(streams.value->items), complete);
 					if (!current(listContext))
@@ -594,9 +678,11 @@ public:
 	// ожидающий подтверждения: UI ещё не получает свежие наблюдения, а Connected не устанавливается по одному JSON.
 	void snapshot()
 	{
+		// Обработчик result/ctx не открывает SSE после отклонённого snapshot или смены контекста.
 		api.getSnapshot(&owner, [this](auto ctx, api::Result<api::Anchor> result) {
 			if (!current(ctx))
 				return;
+			// guard проверяет жизнь owner после уведомлений установки snapshot.
 			const QPointer<ConnectionController> guard = &owner;
 			if (!result || !state.installAnchor(*result.value, true)) {
 				schedule(Phase::Snapshot);
@@ -614,7 +700,7 @@ public:
 	// Для временного отказа Events использует последний принятый StateStore cursor, не хвост парсера.
 	void handleSseFailure(const api::Error &error, bool requiresSnapshot)
 	{
-		// Отказ самого маршрута 400/409 требует нового снимка; обычный обрыв может возобновить подтверждённый курсор.
+		// status — HTTP-код отказа; 400/409 требуют нового snapshot вместо возобновления курсора.
 		const int status = error.httpStatus;
 		if (error.kind == api::ErrorKind::Http) {
 			if (status == 400 || status == 409) {
@@ -664,6 +750,7 @@ public:
 			[this](auto ctx, const api::RuntimeEvent &event) {
 				if (!current(ctx))
 					return false;
+				// guard проверяет жизнь owner после reducer; topologyChanged требует обновить REST-состав.
 				const QPointer<ConnectionController> guard = &owner;
 				bool topologyChanged = false;
 				if (!state.applyEvent(event, &topologyChanged))
@@ -685,6 +772,7 @@ public:
 					return;
 				// Счётчик отказов сбрасывается по заголовкам принятой подписки, а не по получению снимка.
 				clearSseRejection();
+				// guard запрещает чтение Dock после удаления owner при уведомлении Connected.
 				const QPointer<ConnectionController> guard = &owner;
 				state.setConnection(state.serverOrigin(), ConnectionStatus::Connected);
 				if (guard && current(ctx))
@@ -692,10 +780,12 @@ public:
 			});
 	}
 
+	// Проверяет origin, сохраняет адрес и начинает новое согласование без изменения OBS.
 	void connectToServer(const QString &origin)
 	{
 		if (stopped)
 			return;
+		// canonical содержит допустимый канонический HTTP(S) origin либо отсутствие при неверном вводе.
 		const auto canonical = SettingsStore::canonicalOrigin(origin);
 		if (!canonical) {
 			state.setConnection(
@@ -707,6 +797,7 @@ public:
 		active = false;
 		invalidate(true);
 		settings.setServerOrigin(*canonical);
+		// sameOrigin разрешает сохранить прежние метаданные Dock как устаревшие.
 		const bool sameOrigin = state.serverOrigin() == *canonical;
 		if (sameOrigin)
 			state.markRuntimeStale();
@@ -768,15 +859,31 @@ void ConnectionController::connectToServer(QString origin)
 	impl_->connectToServer(origin);
 }
 
+// Отменяет наблюдение по явному запросу и отдельно уведомляет исполнителя команд до смены статуса.
 void ConnectionController::disconnectFromServer()
 {
+	// self заимствует реализацию до первого сигнала; guard запрещает продолжение после удаления owner.
 	auto &self = *impl_;
 	if (self.stopped)
 		return;
 	self.active = false;
 	self.invalidate(true);
+	// guard контролирует удаление ConnectionController синхронным обработчиком сигнала.
+	const QPointer<ConnectionController> guard = this;
+	emit explicitlyDisconnected();
+	if (!guard)
+		return;
 	self.state.markRuntimeStale();
+	if (!guard)
+		return;
 	self.state.setConnection(self.state.serverOrigin(), ConnectionStatus::Disconnected);
+}
+
+// Объединяет обновление с уже запущенным DockRead; состояние соединения проверяется в refreshDock.
+void ConnectionController::refreshState()
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	impl_->refreshDock();
 }
 
 void ConnectionController::selectStream(QString streamId)

@@ -2,11 +2,13 @@
 #include "api/models.hpp"
 #include <QObject>
 #include <QUrl>
+#include <QStringList>
 #include <memory>
 
 namespace gost::api {
 /**
- * Асинхронно читает REST API одного выбранного сервера и проверяет ответы перед выдачей DTO.
+ * Асинхронно читает REST API и отправляет типизированные команды одного выбранного сервера.
+ * Проверяет ответы перед выдачей DTO.
  * Клиент владеет своим QNetworkAccessManager, очередью запросов и активными ответами. Все методы,
  * сетевые сигналы и обработчики результата выполняются в потоке клиента с работающим циклом Qt.
  * Перенос вызовов в поток receiver не выполняется; receiver служит ограничителем времени жизни.
@@ -18,18 +20,20 @@ namespace gost::api {
  * поэтому ожидание вызывающей стороны должно завершаться и по её собственному жизненному циклу.
  *
  * Очередь, число активных операций, размеры тел и обход списков ограничиваются Limits. Ошибки
- * транспорта, HTTP, таймаута, размера и контракта различаются в Result. Отдельные GET не повторяются:
- * восстановлением подключения управляет ConnectionController. Редиректы автоматически не выполняются.
+ * транспорта, HTTP, таймаута, размера и контракта различаются в Result. GET и POST не повторяются:
+ * восстановлением подключения и ручным повтором команд управляет вызывающий код.
+ * Редиректы автоматически не выполняются; Location команды проверяется без перехода по ссылке.
  */
 class APIClient : public QObject {
 public:
 	// Создаёт клиент без выбранного сервера; limits копируются на всё время его жизни.
 	explicit APIClient(Limits limits = {}, QObject *parent = nullptr);
+	// Отменяет собственные запросы до уничтожения менеджера и захваченных обработчиков.
 	~APIClient() override;
 	/**
 	 * Отменяет все прежние задания, затем устанавливает origin и контекст новых запросов.
 	 * Допустим только HTTP(S) origin без учётных данных, параметров запроса, фрагмента и пути кроме корня.
-	 * Недопустимый origin сохраняется как пустой: последующие GET получают ошибку Contract.
+	 * Недопустимый origin сохраняется как пустой: последующие запросы получают ошибку Contract.
 	 * Перенастройка с тем же контекстом также запрещает доставку старых результатов.
 	 * После shutdown() вызов не действует.
 	 */
@@ -42,10 +46,11 @@ public:
 	 * поэтому клиент может принимать новые запросы. Вызывать требуется в потоке клиента.
 	 */
 	void cancelAll();
-	// Необратимо закрывает клиент и отменяет задания. Повторный вызов безопасен; новые GET игнорируются.
+	// Необратимо закрывает клиент и отменяет задания. Повторный вызов безопасен; новые запросы игнорируются.
 	void shutdown();
 	// Проверки live/ready описывают HTTP-сервис; их успех не подтверждает готовность медиатракта.
 	void getReady(QObject *receiver, Callback<Health> callback);
+	// Читает live-проверку процесса сервера; receiver ограничивает доставку результата callback.
 	void getLive(QObject *receiver, Callback<Health> callback);
 	// Читает объявленные сервером возможности без вывода о версии фактически установленного бинарника.
 	void getCapabilities(QObject *receiver, Callback<Capabilities> callback);
@@ -54,11 +59,17 @@ public:
 	// Детальные GET читают ровно указанный непрозрачный ID. Каждый ID кодируется как один сегмент пути.
 	// Конфигурация и исторические снимки в этих DTO не заменяют авторитетные оперативные наблюдения SSE.
 	void getStream(QString id, QObject *receiver, Callback<Stream> callback);
+	// Читает Destination id; возвращаемые секретные поля предназначены карточке, а не журналу.
 	void getDestination(QString id, QObject *receiver, Callback<Destination> callback);
+	// Читает точный Profile id без изменения серверной конфигурации.
 	void getProfile(QString id, QObject *receiver, Callback<Profile> callback);
+	// Читает точную Group id вместе с её параметрами профиля.
 	void getGroup(QString id, QObject *receiver, Callback<Group> callback);
+	// Читает сохранённую Session id; её состояние проверяется отдельно от квитанции команды.
 	void getSession(QString id, QObject *receiver, Callback<Session> callback);
+	// Читает квитанцию по command id; само наличие квитанции не подтверждает желаемое состояние.
 	void getCommand(QString id, QObject *receiver, Callback<Receipt> callback);
+	// Читает Asset id с указателями на текущую и подготавливаемую генерации.
 	void getAsset(QString id, QObject *receiver, Callback<Asset> callback);
 	// Читает точное поколение указанного Asset; новое pending не подменяет выбранное current.
 	void getGeneration(QString assetId, QString generationId, QObject *receiver, Callback<Generation> callback);
@@ -66,7 +77,30 @@ public:
 	void getFallbackPolicy(QString streamId, QObject *receiver, Callback<PolicyResult> callback);
 	// Детальные наблюдения возвращаются отдельно; решение об их свежести и применении принимает вызывающий код.
 	void getSessionMetrics(QString sessionId, QObject *receiver, Callback<SessionMetrics> callback);
+	// Читает outputId внутри точной sessionId; callback получает независимый детальный REST-ответ.
 	void getOutput(QString sessionId, QString outputId, QObject *receiver, Callback<OutputDetail> callback);
+	/**
+	 * Отправляет один start для streamId с неизменяемыми requestId и непустым фиксированным destinationIds.
+	 * Пустые ID отклоняются локально; callback живого receiver получает только проверенную квитанцию 202.
+	 * Это принятие команды, а не подтверждение состояния. Повторы и генерация ID принадлежат вызывающему коду.
+	 */
+	void startSession(QString streamId, QString requestId, QStringList destinationIds, QObject *receiver,
+			  Callback<Receipt> callback);
+	// Отправляет pause точной sessionId с готовым requestId; receiver ограничивает жизнь callback квитанции.
+	void pauseSession(QString sessionId, QString requestId, QObject *receiver, Callback<Receipt> callback);
+	// Отправляет resume точной sessionId с готовым requestId; receiver ограничивает жизнь callback квитанции.
+	void resumeSession(QString sessionId, QString requestId, QObject *receiver, Callback<Receipt> callback);
+	// Отправляет stop точной sessionId с готовым requestId; receiver ограничивает жизнь callback квитанции.
+	void stopSession(QString sessionId, QString requestId, QObject *receiver, Callback<Receipt> callback);
+	// Запускает точный outputId внутри sessionId; requestId сохраняется, receiver ограничивает жизнь callback.
+	void startOutput(QString sessionId, QString outputId, QString requestId, QObject *receiver,
+			 Callback<Receipt> callback);
+	// Останавливает точный outputId внутри sessionId; requestId сохраняется, receiver ограничивает жизнь callback.
+	void stopOutput(QString sessionId, QString outputId, QString requestId, QObject *receiver,
+			Callback<Receipt> callback);
+	// Отсоединяет точный outputId внутри sessionId; requestId сохраняется, receiver ограничивает жизнь callback.
+	void detachOutput(QString sessionId, QString outputId, QString requestId, QObject *receiver,
+			  Callback<Receipt> callback);
 	/**
 	 * Семейства get<Name> читают одну страницу, getAll<Name> последовательно обходят страницы
 	 * с исходными фильтрами query. У вложенных списков действуют те же правила; ID задаёт родительскую сущность.
@@ -82,32 +116,56 @@ public:
 	 * при этом успешный, но неполный. Вызывающая сторона должна подготовить состояние обработчика
 	 * до вызова метода; всегда отложенная доставка для этого семейства не гарантируется.
 	 */
-#define GOST_DECLARE_LIST(Name, Type) \
- void get##Name(QObject *receiver, Callback<Page<Type>> callback, ListQuery query = {}); \
- void getAll##Name(QObject *receiver, Callback<Collection<Type>> callback, ListQuery query = {});
-	GOST_DECLARE_LIST(Streams, Stream)
-	GOST_DECLARE_LIST(Destinations, Destination)
-	GOST_DECLARE_LIST(Profiles, Profile)
-	GOST_DECLARE_LIST(Groups, Group)
-	GOST_DECLARE_LIST(Sessions, Session)
-	GOST_DECLARE_LIST(Assets, Asset)
-#undef GOST_DECLARE_LIST
+	// Читает страницу Streams с query; receiver ограничивает время жизни callback.
+	void getStreams(QObject *receiver, Callback<Page<Stream>> callback, ListQuery query = {});
+	// Обходит Streams с query до конца или лимита; callback получает явную полноту.
+	void getAllStreams(QObject *receiver, Callback<Collection<Stream>> callback, ListQuery query = {});
+	// Читает страницу Destinations с query, сохраняя точные значения серверных полей.
+	void getDestinations(QObject *receiver, Callback<Page<Destination>> callback, ListQuery query = {});
+	// Обходит Destinations с query; callback получает полноту, receiver ограничивает его жизнь.
+	void getAllDestinations(QObject *receiver, Callback<Collection<Destination>> callback, ListQuery query = {});
+	// Читает страницу Profiles с query без изменения конфигурации.
+	void getProfiles(QObject *receiver, Callback<Page<Profile>> callback, ListQuery query = {});
+	// Обходит Profiles с query до конца или лимита, возвращая явную полноту.
+	void getAllProfiles(QObject *receiver, Callback<Collection<Profile>> callback, ListQuery query = {});
+	// Читает страницу Groups с query вместе с привязками профилей.
+	void getGroups(QObject *receiver, Callback<Page<Group>> callback, ListQuery query = {});
+	// Обходит Groups с query до конца или лимита, возвращая явную полноту.
+	void getAllGroups(QObject *receiver, Callback<Collection<Group>> callback, ListQuery query = {});
+	// Читает страницу сохранённых Session с фильтрами query.
+	void getSessions(QObject *receiver, Callback<Page<Session>> callback, ListQuery query = {});
+	// Обходит Session с query до конца или лимита, возвращая явную полноту.
+	void getAllSessions(QObject *receiver, Callback<Collection<Session>> callback, ListQuery query = {});
+	// Читает страницу Assets с query и указателями на их поколения.
+	void getAssets(QObject *receiver, Callback<Page<Asset>> callback, ListQuery query = {});
+	// Обходит Assets с query до конца или лимита, возвращая явную полноту.
+	void getAllAssets(QObject *receiver, Callback<Collection<Asset>> callback, ListQuery query = {});
+	// Читает страницу назначений Stream id с фильтрами query и ограничением жизни receiver/callback.
 	void getStreamDestinations(QString id, QObject *receiver, Callback<Page<Destination>> callback,
 				   ListQuery query = {});
+	// Обходит назначения Stream id с query; callback получает полноту, receiver ограничивает его жизнь.
 	void getAllStreamDestinations(QString id, QObject *receiver, Callback<Collection<Destination>> callback,
 				      ListQuery query = {});
+	// Читает страницу Session для Stream id, сохраняя фильтры query.
 	void getStreamSessions(QString id, QObject *receiver, Callback<Page<Session>> callback, ListQuery query = {});
+	// Обходит Session Stream id до конца или лимита, возвращая явную полноту.
 	void getAllStreamSessions(QString id, QObject *receiver, Callback<Collection<Session>> callback,
 				  ListQuery query = {});
+	// Читает страницу выходов точной sessionId с фильтрами query.
 	void getOutputs(QString sessionId, QObject *receiver, Callback<Page<Output>> callback, ListQuery query = {});
+	// Обходит выходы точной sessionId до конца или лимита, возвращая явную полноту.
 	void getAllOutputs(QString sessionId, QObject *receiver, Callback<Collection<Output>> callback,
 			   ListQuery query = {});
+	// Читает страницу вариантов Asset assetId; query может фиксировать generation_id.
 	void getVariants(QString assetId, QObject *receiver, Callback<Page<Variant>> callback, ListQuery query = {});
+	// Обходит варианты Asset assetId с исходным query; callback получает явную полноту чтения.
 	void getAllVariants(QString assetId, QObject *receiver, Callback<Collection<Variant>> callback,
 			    ListQuery query = {});
 
 private:
+	// Скрывает очередь, менеджер и поколение отмены от потребителей типизированного API.
 	class Impl;
+	// Единственный владелец транспортного состояния; освобождается после shutdown в деструкторе.
 	std::unique_ptr<Impl> impl_;
 };
 } // namespace gost::api
