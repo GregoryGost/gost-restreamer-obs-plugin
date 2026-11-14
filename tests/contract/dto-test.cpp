@@ -32,6 +32,7 @@ private slots:
 	void historicalSnapshotsOwnTheirValues();
 	void ackMetricsRemainExactAndUnavailableIsNotZero();
 	void malformedJsonAndUnicodeAreRejected();
+	// Проверяет точный снимок схемы и различает источник контракта от неизвестного binary commit сервера.
 	void pinnedSchemaAndProvenanceDescribeReadbackContract();
 	void unnamedFfmpegRoleIsAValidPublicObservation();
 	void systemRemovalHasNoSessionOrGpuPayload();
@@ -286,21 +287,27 @@ void DtoTest::malformedJsonAndUnicodeAreRejected()
 void DtoTest::pinnedSchemaAndProvenanceDescribeReadbackContract()
 {
 	// Проверяется закреплённый снимок со своим происхождением; это не подтверждение сборки работающего сервера.
+	// schemaFile читает полученную OpenAPI, provenanceFile — метаданные её происхождения.
 	QFile schemaFile(QStringLiteral(GOST_TEST_FIXTURE_DIR) + QStringLiteral("/backend/openapi.json"));
 	QFile provenanceFile(QStringLiteral(GOST_TEST_FIXTURE_DIR) + QStringLiteral("/backend/provenance.json"));
 	QVERIFY(schemaFile.open(QIODevice::ReadOnly));
 	QVERIFY(provenanceFile.open(QIODevice::ReadOnly));
+	// bytes сохраняет точное тело схемы для SHA256; provenance содержит независимо закреплённые сведения получения.
 	const auto bytes = schemaFile.readAll();
 	const auto provenance = fixture::object(provenanceFile.readAll());
 	QCOMPARE(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().toUpper(),
 		 provenance.value(QStringLiteral("schema_sha256")).toString().toLatin1());
-	QCOMPARE(provenance.value(QStringLiteral("commit")).toString(),
-		 QStringLiteral("103d839b11591fbb786fd027aefa143a2ff79036"));
+	QVERIFY(provenance.value(QStringLiteral("commit")).isNull());
+	QCOMPARE(provenance.value(QStringLiteral("contract_source_commit")).toString(),
+		 QStringLiteral("067388bc1e36ac5220e001c72c47220ef0b72173"));
+	QCOMPARE(provenance.value(QStringLiteral("binary_hash_verified")), QJsonValue(false));
+	// schema адресует определения DTO без изменения исходного документа.
 	const auto schema = fixture::object(bytes)
 				    .value(QStringLiteral("components"))
 				    .toObject()
 				    .value(QStringLiteral("schemas"))
 				    .toObject();
+	// required проверяет обязательность field у выбранного type по точному массиву required OpenAPI.
 	const auto required = [&](const char *type, const char *field) {
 		return schema.value(QLatin1String(type))
 			.toObject()

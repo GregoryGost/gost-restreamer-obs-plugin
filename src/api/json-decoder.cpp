@@ -799,23 +799,46 @@ bool fromJson(const QJsonValue &json, OutputDetail &value, Error &error)
 	r.field("runtime_reason", value.runtimeReason);
 	return r.good();
 }
+// Принимает необязательные location/message; value не копируется в клиентскую модель.
+bool fromJson(const QJsonValue &json, FieldError &value, Error &error)
+{
+	if (!json.isObject()) {
+		error = makeError(ErrorKind::Decode);
+		return false;
+	}
+	// object содержит одну ошибку поля, а pair связывает допустимое имя с полем DTO.
+	const auto object = json.toObject();
+	for (auto pair : {std::pair{"location", &value.location}, std::pair{"message", &value.message}})
+		if (object.contains(QLatin1String(pair.first)) &&
+		    !fromJson(object.value(QLatin1String(pair.first)), *pair.second, error))
+			return false;
+	return true;
+}
+// Читает необязательные поля Problem; отсутствие/null списка errors означает отсутствие деталей.
+// Статус тела проверяется отдельно в decodeProblem, чтобы несовместимое тело не подменяло HTTP-отказ.
 bool fromJson(const QJsonValue &json, Problem &value, Error &error)
 {
-	Reader r(json, error);
-	r.field("type", value.type);
-	r.field("title", value.title);
-	r.field("status", value.status);
-	r.field("detail", value.detail);
-	if (json.isObject()) {
-		const auto o = json.toObject();
-		for (auto pair : {std::pair{"instance", &value.instance}, std::pair{"code", &value.code},
-				  std::pair{"field", &value.field}}) {
-			if (o.contains(QLatin1String(pair.first)) &&
-			    !fromJson(o.value(QLatin1String(pair.first)), *pair.second, error))
-				return false;
-		}
+	if (!json.isObject()) {
+		error = makeError(ErrorKind::Decode);
+		return false;
 	}
-	return r.good();
+	// object сохраняет только проверяемый документ; pair связывает допустимое строковое имя с DTO.
+	const auto object = json.toObject();
+	for (auto pair :
+	     {std::pair{"type", &value.type}, std::pair{"title", &value.title}, std::pair{"detail", &value.detail},
+	      std::pair{"instance", &value.instance}, std::pair{"code", &value.code}, std::pair{"field", &value.field}})
+		if (object.contains(QLatin1String(pair.first)) &&
+		    !fromJson(object.value(QLatin1String(pair.first)), *pair.second, error))
+			return false;
+	if (object.contains(QStringLiteral("status")) &&
+	    !fromJson(object.value(QStringLiteral("status")), value.status, error))
+		return false;
+	// errors не содержит value после преобразования каждого элемента в FieldError.
+	const auto errors = object.value(QStringLiteral("errors"));
+	value.errors.clear();
+	if (!errors.isUndefined() && !errors.isNull() && !fromJson(errors, value.errors, error))
+		return false;
+	return true;
 }
 bool fromJson(const QJsonValue &json, Preparation &value, Error &error)
 {

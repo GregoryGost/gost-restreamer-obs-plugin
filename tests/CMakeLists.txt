@@ -47,8 +47,12 @@ gost_add_offline_test(connection integration/connection-controller-test.cpp)
 gost_add_offline_test(stats-baseline unit/stats-baseline-test.cpp)
 gost_add_offline_test(obs-stop unit/obs-stop-test.cpp)
 gost_add_offline_test(operations integration/restream-operations-test.cpp)
+gost_add_offline_test(configuration-api contract/configuration-api-test.cpp)
+gost_add_offline_test(configuration integration/configuration-controller-test.cpp)
+gost_add_offline_test(configuration-ui unit/configuration-ui-test.cpp)
+gost_add_offline_test(settings-preferences unit/settings-preferences-test.cpp)
 
-foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection stats-baseline obs-stop operations)
+foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection stats-baseline obs-stop operations configuration-api configuration configuration-ui settings-preferences)
   # Определения компилятора закрепляют пути фикстур/локализаций и явных временных файлов.
   # ENVIRONMENT задаётся целиком для каждого теста, включая lifecycle: TEMP/TMP не наследуют AppData.
   target_compile_definitions(
@@ -74,5 +78,7 @@ set_tests_properties(
   gost-restreamer.dto gost-restreamer.sse gost-restreamer.state gost-restreamer.settings
   gost-restreamer.network gost-restreamer.connection gost-restreamer.stats-baseline
   gost-restreamer.obs-stop gost-restreamer.operations
+  gost-restreamer.configuration-api gost-restreamer.configuration gost-restreamer.configuration-ui
+  gost-restreamer.settings-preferences
   PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GOST_QT_TEST_ROOT}/bin"
 )

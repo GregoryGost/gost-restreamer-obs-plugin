@@ -42,6 +42,10 @@ target_sources(
     src/core/plugin-lifecycle.hpp
     src/core/settings-store.cpp
     src/core/settings-store.hpp
+    src/core/log-sink.hpp
+    src/core/configuration-state.hpp
+    src/core/configuration-controller.cpp
+    src/core/configuration-controller.hpp
     src/core/connection-controller.cpp
     src/core/connection-controller.hpp
     src/core/operations-state.hpp
@@ -52,6 +56,9 @@ target_sources(
     src/api/models.hpp
     src/api/json-decoder.cpp
     src/api/json-decoder.hpp
+    src/api/configuration-requests.hpp
+    src/api/json-encoder.cpp
+    src/api/json-encoder.hpp
     src/api/api-client.cpp
     src/api/api-client.hpp
     src/api/event-client.cpp
@@ -71,6 +78,13 @@ target_sources(
     src/ui/restream-dock.hpp
     src/ui/management-window.cpp
     src/ui/management-window.hpp
+    src/ui/configuration-editor.cpp
+    src/ui/configuration-editor.hpp
+    src/ui/profile-editor.cpp
+    src/ui/profile-editor.hpp
+    src/ui/secret-field.cpp
+    src/ui/secret-field.hpp
+    src/ui/confirmation-dialog.hpp
 )
 target_include_directories(gost-restreamer-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 # Публичные заголовки core используют Qt и C++20, поэтому требования передаются тестам и модулю.

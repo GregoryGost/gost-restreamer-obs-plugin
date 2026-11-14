@@ -134,18 +134,23 @@ void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding_data()
 void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding()
 {
 	// Сначала читается точный старый документ без переписывания. Только изменение предпочтения
-	// переводит файл в формат v2; повторный load должен сохранить и новый лимит, и прежнюю привязку.
+	// переводит файл в текущий формат v3; повторный load сохраняет новый лимит и прежнюю привязку.
+	// retries задаёт явное новое число повторов из таблицы сценариев.
 	QFETCH(int, retries);
+	// temp содержит все файлы этого сценария в workspace; file адресует единственный JSON настроек.
 	WorkspaceTemp temp(QStringLiteral("retry-preference"));
 	QVERIFY(temp.isValid());
 	const auto file = temp.filePath(QStringLiteral("settings.json"));
+	// legacy воспроизводит документ v1 с существующими UUID и привязкой, которые нельзя потерять при миграции.
 	const QByteArray legacy = R"({"schema_version":1,"server_origin":"http://server","auto_connect":false,
 "reconnect":false,"profiles":[{"uuid":"644ee3d5-bc59-4345-8a9e-3b3fc5de1f59","name":"A","locator":"profiles/a"}],
 "bindings":[{"origin":"http://server","profile_uuid":"644ee3d5-bc59-4345-8a9e-3b3fc5de1f59","stream_id":"saved"}]})";
+	// origin и uuid задают точную прежнюю пару сервера и профиля для последующей проверки привязки.
 	const auto origin = QStringLiteral("http://server");
 	const auto uuid = QStringLiteral("644ee3d5-bc59-4345-8a9e-3b3fc5de1f59");
 	QVERIFY(write(file, legacy));
 	{
+		// settings загружает старый файл и сохраняет его лишь после явного изменения числа повторов.
 		SettingsStore settings(file);
 		QVERIFY(settings.load());
 		QCOMPARE(settings.sseRejectionRetries(), 3);
@@ -154,10 +159,12 @@ void SettingsStoreTest::migratesRetryPreferenceWithExistingBinding()
 		settings.setSseRejectionRetries(retries);
 		QVERIFY(!settings.unsaved());
 	}
+	// document проверяет фактический формат на диске независимо от RAM первого экземпляра.
 	const auto document = QJsonDocument::fromJson(contents(file)).object();
-	QCOMPARE(document.value(QStringLiteral("schema_version")).toInt(), 2);
+	QCOMPARE(document.value(QStringLiteral("schema_version")).toInt(), 3);
 	QVERIFY(document.value(QStringLiteral("sse_rejection_retries")).isDouble());
 	QCOMPARE(document.value(QStringLiteral("sse_rejection_retries")).toInt(-2), retries);
+	// restored подтверждает чтение актуального документа новым экземпляром хранилища.
 	SettingsStore restored(file);
 	QVERIFY(restored.load());
 	QCOMPARE(restored.sseRejectionRetries(), retries);

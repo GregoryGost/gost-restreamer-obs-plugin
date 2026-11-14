@@ -130,10 +130,11 @@ $dockMenuExpandPattern = $null
 $dockMenuExpandState = $null
 $gearName = if ($russian) { 'Открыть управление и настройки' } else { 'Open management and settings' }
 $title = if ($russian) { 'GOST Restreamer — Управление и настройки' } else { 'GOST Restreamer — Management and settings' }
+# pages задаёт независимый порядок восьми разделов, включая самостоятельные группы и профили.
 $pages = if ($russian) {
-    @('Потоки', 'Выходы', 'Группы и профили', 'Заглушки', 'Диагностика', 'Настройки', 'Расширенные')
+    @('Потоки', 'Выходы', 'Группы кодирования', 'Профили', 'Заглушки', 'Диагностика', 'Настройки', 'Расширенные')
 } else {
-    @('Streams', 'Outputs', 'Groups and profiles', 'Fallback', 'Diagnostics', 'Settings', 'Advanced')
+    @('Streams', 'Outputs', 'Encoding groups', 'Profiles', 'Fallback', 'Diagnostics', 'Settings', 'Advanced')
 }
 $processCondition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ObsProcessId)

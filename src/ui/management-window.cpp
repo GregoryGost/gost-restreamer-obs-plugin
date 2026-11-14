@@ -4,6 +4,9 @@
 #include "core/connection-controller.hpp"
 #include "core/settings-store.hpp"
 #include "core/restream-controller.hpp"
+#include "core/configuration-controller.hpp"
+#include "ui/configuration-editor.hpp"
+#include "ui/confirmation-dialog.hpp"
 #include "ui/restream-dock.hpp"
 #include "ui/status-label.hpp"
 
@@ -13,6 +16,7 @@
 #include <QEvent>
 #include <QFile>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
@@ -23,14 +27,18 @@
 #include <QPalette>
 #include <QPixmap>
 #include <QPushButton>
+#include <QPointer>
+#include <QShowEvent>
+#include <QHideEvent>
 #include <QSignalBlocker>
 #include <QScrollArea>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QStyle>
-#include <QTabWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -112,16 +120,34 @@ QWidget *makePage(const QString &title, const QString &message, QWidget *parent)
 	return page;
 }
 
+// Показывает локализованные стандартные Yes/No для parent с исходным выбором No.
+// title и message выводятся обычным текстом; удаление родителя во время exec не оставляет висячий диалог.
+int askConfirmation(QWidget *parent, const TextLookup &text, const QString &title, const QString &message)
+{
+	// dialog принадлежит parent; QPointer позволяет корректно завершить вложенный цикл при удалении окна.
+	QPointer<QMessageBox> dialog =
+		new QMessageBox(QMessageBox::Question, title, message, QMessageBox::Yes | QMessageBox::No, parent);
+	dialog->setTextFormat(Qt::PlainText);
+	dialog->setDefaultButton(QMessageBox::No);
+	localizeConfirmation(*dialog, text);
+	// choice сохраняет стандартный идентификатор ответа до удаления временного диалога.
+	const int choice = dialog->exec();
+	delete dialog.data();
+	return choice;
+}
+
 } // namespace
 
 // Создаёт страницы единого окна и соединения с общими сервисами; закрытие окна только скрывает его.
 ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent,
-				   ConnectionController *connection, RestreamController *restream)
+				   ConnectionController *connection, RestreamController *restream,
+				   ConfigurationController *configuration)
 	: QWidget(parent, Qt::Window),
 	  stateStore_(stateStore),
 	  text_(std::move(text)),
 	  connection_(connection),
-	  restream_(restream)
+	  restream_(restream),
+	  configuration_(configuration)
 {
 	// Qt::Window сохраняет самостоятельное окно при родителе OBS. WA_DeleteOnClose=false обеспечивает
 	// повторное открытие того же экземпляра; WA_QuitOnClose=false не позволяет ему завершить приложение.
@@ -140,6 +166,7 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	navigation->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Expanding);
 	// pages хранит все разделы единого расширенного окна.
 	auto *pages = new QStackedWidget(this);
+	pages_ = pages;
 	pages->setObjectName(QStringLiteral("managementPages"));
 	layout->addWidget(navigation);
 	layout->addWidget(pages, 1);
@@ -150,11 +177,16 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 		navigation->addSection(text_(titleKey), icon, fallback);
 		pages->addWidget(page);
 	};
-	// streamPage и streamLayout содержат только текущий Stream, проверку и предварительный запуск.
+	// streamPage содержит только редактирование конфигурации потока и его назначений.
 	auto *streamPage = new QWidget(pages);
-	// streamLayout располагает имена назначений, предварительное заключение и команды.
+	// streamLayout содержит только заголовок и редактор конфигурации потока.
 	auto *streamLayout = new QVBoxLayout(streamPage);
 	addPageHeading(*streamLayout, text_("Page.Streams"));
+	if (configuration_) {
+		streamEditor_ = new ConfigurationEditor(stateStore_, *configuration_, text_, ConfigurationKind::Stream,
+							streamPage);
+		streamLayout->addWidget(streamEditor_, 1);
+	}
 	// plainLabel создаёт подпись с переносом строк; серверные имена отображаются обычным текстом, без HTML.
 	const auto plainLabel = [](QWidget *parent, const char *name) {
 		// label принадлежит странице и допускает длинные локализованные подписи.
@@ -164,39 +196,27 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 		label->setWordWrap(true);
 		return label;
 	};
-	selectedStream_ = plainLabel(streamPage, "selectedStream");
-	destinations_ = plainLabel(streamPage, "fallbackDestinations");
-	fallbackStatus_ = plainLabel(streamPage, "fallbackPrecheckStatus");
-	streamLayout->addWidget(selectedStream_);
-	streamLayout->addWidget(destinations_);
-	streamLayout->addWidget(fallbackStatus_);
-	// warning объясняет предел клиентской проверки и необходимость обновления старой заглушки.
-	auto *warning = plainLabel(streamPage, "fallbackRebuildWarning");
-	warning->setText(text_("Fallback.RebuildWarning"));
-	streamLayout->addWidget(warning);
-	checkFallback_ = new QPushButton(text_("Operation.CheckFallback"), streamPage);
-	checkFallback_->setObjectName(QStringLiteral("fallbackCheckButton"));
-	startFallback_ = new QPushButton(text_("Operation.StartFallback"), streamPage);
-	startFallback_->setObjectName(QStringLiteral("fallbackStartButton"));
-	startFallback_->setToolTip(text_("Fallback.StartHint"));
-	startFallback_->setAccessibleDescription(text_("Fallback.StartHint"));
-	streamLayout->addWidget(checkFallback_);
-	streamLayout->addWidget(startFallback_);
-	streamOperation_ = plainLabel(streamPage, "streamOperationStatus");
-	streamLayout->addWidget(streamOperation_);
-	streamLayout->addStretch();
-	// streamScroll сохраняет размер окна при длинном списке назначений и подробном результате пакета.
+	// streamScroll сохраняет размер окна при длинном списке назначений и сообщениях редактора.
 	auto *streamScroll = new QScrollArea(pages);
 	streamScroll->setFrameShape(QFrame::NoFrame);
 	streamScroll->setWidgetResizable(true);
 	streamScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	streamScroll->setWidget(streamPage);
 	addPage("Page.Streams", streamScroll, "settings/stream.svg", QStyle::SP_MediaPlay);
-	// outputsPage и outputsLayout показывают лишь существующие выходы нынешней Session, без редактора назначений.
+	// outputsPage и outputsLayout разделяют изменяемую конфигурацию и прикреплённые Output текущей Session.
 	auto *outputsPage = new QWidget(pages);
 	// outputsLayout размещает выбор выхода, независимые состояния и явные действия.
 	auto *outputsLayout = new QVBoxLayout(outputsPage);
 	addPageHeading(*outputsLayout, text_("Page.Outputs"));
+	if (configuration_) {
+		destinationEditor_ = new ConfigurationEditor(stateStore_, *configuration_, text_,
+							     ConfigurationKind::Destination, outputsPage);
+		outputsLayout->addWidget(destinationEditor_, 1);
+		connect(destinationEditor_, &ConfigurationEditor::requestAttachDestination, this,
+			&ManagementWindow::attachDestination);
+		connect(destinationEditor_, &ConfigurationEditor::selectionChanged, this,
+			&ManagementWindow::refreshOperations);
+	}
 	currentOutputs_ = new QComboBox(outputsPage);
 	currentOutputs_->setObjectName(QStringLiteral("currentOutputs"));
 	currentOutputs_->setAccessibleName(text_("Page.Outputs"));
@@ -218,6 +238,27 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	outputButtons->addWidget(outputRestart_);
 	outputButtons->addWidget(outputDetach_);
 	outputsLayout->addLayout(outputButtons);
+	// fallbackBox отделяет предварительный запуск всего выбранного потока от команд одного Output.
+	auto *fallbackBox = new QGroupBox(text_("Fallback.OutputsHeading"), outputsPage);
+	fallbackBox->setObjectName(QStringLiteral("outputFallbackControls"));
+	// fallbackLayout содержит явные действия; результаты появляются только после проверки.
+	auto *fallbackLayout = new QVBoxLayout(fallbackBox);
+	selectedStream_ = plainLabel(fallbackBox, "selectedStream");
+	destinations_ = plainLabel(fallbackBox, "fallbackDestinations");
+	fallbackStatus_ = plainLabel(fallbackBox, "fallbackPrecheckStatus");
+	fallbackLayout->addWidget(selectedStream_);
+	fallbackLayout->addWidget(destinations_);
+	fallbackLayout->addWidget(fallbackStatus_);
+	checkFallback_ = new QPushButton(text_("Operation.CheckFallback"), fallbackBox);
+	checkFallback_->setObjectName(QStringLiteral("fallbackCheckButton"));
+	checkFallback_->setToolTip(text_("Fallback.PrecheckHint"));
+	startFallback_ = new QPushButton(text_("Operation.StartFallback"), fallbackBox);
+	startFallback_->setObjectName(QStringLiteral("fallbackStartButton"));
+	startFallback_->setToolTip(text_("Fallback.StartHint") + QLatin1Char('\n') + text_("Fallback.RebuildWarning"));
+	startFallback_->setAccessibleDescription(startFallback_->toolTip());
+	fallbackLayout->addWidget(checkFallback_);
+	fallbackLayout->addWidget(startFallback_);
+	outputsLayout->addWidget(fallbackBox);
 	outputOperation_ = plainLabel(outputsPage, "outputOperationStatus");
 	outputsLayout->addWidget(outputOperation_);
 	outputsLayout->addStretch();
@@ -228,17 +269,28 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	outputsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	outputsScroll->setWidget(outputsPage);
 	addPage("Page.Outputs", outputsScroll, "settings/output.svg", QStyle::SP_DriveNetIcon);
-	// groups содержит существующие информационные вкладки групп и профилей.
+	// groups содержит отдельную страницу групп кодирования в едином окне.
 	auto *groups = new QWidget(pages);
-	// groupsLayout размещает внутренние вкладки без дополнительного главного окна.
+	// groupsLayout располагает заголовок и редактор связей группы.
 	auto *groupsLayout = new QVBoxLayout(groups);
-	// tabs сохраняет внутреннюю навигацию групп и профилей.
-	auto *tabs = new QTabWidget(groups);
-	tabs->addTab(makePage(text_("Page.Groups"), text_("Page.Groups.NotAvailable"), tabs), text_("Page.Groups"));
-	tabs->addTab(makePage(text_("Page.Profiles"), text_("Page.Profiles.NotAvailable"), tabs),
-		     text_("Page.Profiles"));
-	groupsLayout->addWidget(tabs);
-	addPage("Page.GroupsProfiles", groups, "sources/group.svg", QStyle::SP_DirIcon);
+	addPageHeading(*groupsLayout, text_("Page.Groups"));
+	// profiles и profilesLayout представляют полный профиль самостоятельным разделом навигации.
+	auto *profiles = new QWidget(pages);
+	auto *profilesLayout = new QVBoxLayout(profiles);
+	addPageHeading(*profilesLayout, text_("Page.Profiles"));
+	if (configuration_) {
+		groupEditor_ =
+			new ConfigurationEditor(stateStore_, *configuration_, text_, ConfigurationKind::Group, groups);
+		profileEditor_ = new ConfigurationEditor(stateStore_, *configuration_, text_,
+							 ConfigurationKind::Profile, profiles);
+		groupsLayout->addWidget(groupEditor_, 1);
+		profilesLayout->addWidget(profileEditor_, 1);
+	} else {
+		groupsLayout->addWidget(makePage({}, text_("Page.Groups.NotAvailable"), groups));
+		profilesLayout->addWidget(makePage({}, text_("Page.Profiles.NotAvailable"), profiles));
+	}
+	addPage("Page.Groups", groups, "sources/group.svg", QStyle::SP_DirIcon);
+	addPage("Page.Profiles", profiles, "settings/advanced.svg", QStyle::SP_FileDialogContentsView);
 	addPage("Page.Fallback", makePage(text_("Page.Fallback"), text_("Page.Fallback.NotAvailable"), pages),
 		"sources/image.svg", QStyle::SP_FileIcon);
 
@@ -307,10 +359,6 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	connectionMessage_->setTextFormat(Qt::PlainText);
 	connectionMessage_->setWordWrap(true);
 	settingsLayout->addWidget(connectionMessage_);
-	// streamingNotice напоминает о штатной настройке сервиса трансляции в OBS.
-	auto *streamingNotice = new QLabel(text_("Settings.ObsServiceNotice"), settingsPage);
-	streamingNotice->setWordWrap(true);
-	settingsLayout->addWidget(streamingNotice);
 	settingsLayout->addStretch();
 	addPage("Page.Settings", settingsPage, "settings/general.svg", QStyle::SP_ComputerIcon);
 
@@ -329,7 +377,25 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	sseRejectionRetries_->setKeyboardTracking(false);
 	sseRejectionRetries_->setAccessibleName(text_("Settings.SseRejectionRetries"));
 	advancedForm->addRow(text_("Settings.SseRejectionRetries"), sseRejectionRetries_);
+	httpTimeout_ = new QSpinBox(advancedPage);
+	httpTimeout_->setObjectName(QStringLiteral("httpTimeoutSeconds"));
+	httpTimeout_->setRange(SettingsStore::MinHttpTimeoutSeconds, SettingsStore::MaxHttpTimeoutSeconds);
+	httpTimeout_->setKeyboardTracking(false);
+	httpTimeout_->setAccessibleName(text_("Settings.HttpTimeout"));
+	httpTimeout_->setToolTip(text_("Settings.HttpTimeoutHint"));
+	advancedForm->addRow(text_("Settings.HttpTimeout"), httpTimeout_);
+	logMode_ = new QComboBox(advancedPage);
+	logMode_->setObjectName(QStringLiteral("clientLogMode"));
+	logMode_->setAccessibleName(text_("Settings.LogMode"));
+	logMode_->addItem(text_("Settings.LogNormal"), false);
+	logMode_->addItem(text_("Settings.LogDetailed"), true);
+	advancedForm->addRow(text_("Settings.LogMode"), logMode_);
 	advancedLayout->addLayout(advancedForm);
+	// logNotice поясняет единый журнал OBS без вывода каких-либо серверных значений.
+	auto *logNotice = new QLabel(text_("Settings.LogNotice"), advancedPage);
+	logNotice->setTextFormat(Qt::PlainText);
+	logNotice->setWordWrap(true);
+	advancedLayout->addWidget(logNotice);
 	advancedSettingsMessage_ = new QLabel(advancedPage);
 	advancedSettingsMessage_->setObjectName(QStringLiteral("advancedSettingsMessage"));
 	advancedSettingsMessage_->setTextFormat(Qt::PlainText);
@@ -348,11 +414,12 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 		// origin содержит проверенный канонический адрес, если пользователь ввёл допустимое значение.
 		const auto origin = SettingsStore::canonicalOrigin(apiUrl_->text());
 		if (origin && !stateStore_.serverOrigin().isEmpty() && *origin != stateStore_.serverOrigin()) {
+			// guard запрещает продолжение после удаления окна во вложенном цикле подтверждения.
+			const QPointer<ManagementWindow> guard = this;
 			// choice подтверждает смену уже выбранного сервера, сохраняя явный пользовательский выбор.
-			const auto choice = QMessageBox::question(this, text_("Settings.ChangeServerTitle"),
-								  text_("Settings.ChangeServerConfirm").arg(*origin),
-								  QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-			if (choice != QMessageBox::Yes) {
+			const auto choice = askConfirmation(this, text_, text_("Settings.ChangeServerTitle"),
+							    text_("Settings.ChangeServerConfirm").arg(*origin));
+			if (!guard || choice != QMessageBox::Yes) {
 				return;
 			}
 		}
@@ -382,13 +449,23 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 			connection_->setSseRejectionRetries(retries);
 		}
 	});
+	// seconds изменяет общий срок только будущих обычных REST-заданий.
+	connect(httpTimeout_, &QSpinBox::valueChanged, this, [this](int seconds) {
+		if (connection_)
+			connection_->setHttpTimeoutSeconds(seconds);
+	});
+	// index указывает один из двух закрытых режимов; отображаемое имя не сериализуется.
+	connect(logMode_, &QComboBox::currentIndexChanged, this, [this](int index) {
+		if (connection_ && index >= 0)
+			connection_->setDetailedLogging(logMode_->itemData(index).toBool());
+	});
 	// Обработчик использует точный itemData выбранного index, а не отображаемое имя Stream.
 	connect(streams_, &QComboBox::currentIndexChanged, this, [this](int index) {
 		if (connection_ && index >= 0) {
 			connection_->selectStream(streams_->itemData(index).toString());
 		}
 	});
-	connect(navigation, &QListWidget::currentRowChanged, pages, &QStackedWidget::setCurrentIndex);
+	connect(navigation, &QListWidget::currentRowChanged, this, &ManagementWindow::changePage);
 	connect(&stateStore_, &StateStore::obsStateChanged, this, &ManagementWindow::refresh);
 	connect(&stateStore_, &StateStore::serverStateChanged, this, &ManagementWindow::refresh);
 	connect(&stateStore_, &StateStore::streamsChanged, this, &ManagementWindow::refreshStreams);
@@ -410,9 +487,146 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	connect(currentOutputs_, &QComboBox::currentIndexChanged, this, &ManagementWindow::refreshOperations);
 	connect(&stateStore_, &StateStore::operationsChanged, this, &ManagementWindow::refreshOperations);
 	connect(&stateStore_, &StateStore::runtimeStateChanged, this, &ManagementWindow::refreshOperations);
-	navigation->setCurrentRow(0);
+	connect(&stateStore_, &StateStore::configurationEditorChanged, this, &ManagementWindow::refreshOperations);
+	// initialPage восстанавливает вид существующего RAM-черновика при редком пересоздании самого окна.
+	int initialPage = 0;
+	if (configuration_ && stateStore_.configurationEditor().draft) {
+		switch (stateStore_.configurationEditor().kind) {
+		case ConfigurationKind::Stream:
+			break;
+		case ConfigurationKind::Destination:
+			initialPage = 1;
+			break;
+		case ConfigurationKind::Group:
+			initialPage = 2;
+			break;
+		case ConfigurationKind::Profile:
+			initialPage = 3;
+			break;
+		}
+	}
+	currentPage_ = initialPage;
+	navigation->setCurrentRow(initialPage);
 	refreshStreams();
 	refresh();
+}
+
+// Возвращает карточку фактически показанного раздела, включая выбранную внутреннюю вкладку.
+ConfigurationEditor *ManagementWindow::currentEditor() const
+{
+	switch (currentPage_) {
+	case 0:
+		return streamEditor_;
+	case 1:
+		return destinationEditor_;
+	case 2:
+		return groupEditor_;
+	case 3:
+		return profileEditor_;
+	default:
+		return nullptr;
+	}
+}
+
+// Обновляет текущую карточку; контроллер сохраняет её несохранённый ввод в общей RAM-модели.
+void ManagementWindow::activateCurrentEditor()
+{
+	// editor принадлежит окну и получает данные только через общий контроллер.
+	if (auto *editor = currentEditor())
+		editor->activate();
+}
+
+// Маскирует также невидимые карточки, чтобы переключение страницы не раскрыла старое значение.
+void ManagementWindow::hideSecrets()
+{
+	// editor перебирает только созданные конфигурационные страницы этого окна.
+	for (auto *editor : {streamEditor_, destinationEditor_, groupEditor_, profileEditor_})
+		if (editor)
+			editor->hideSecrets();
+}
+
+// Повторный показ возвращает маску; интерактивная активация ждёт окончания обработки показа Qt.
+void ManagementWindow::showEvent(QShowEvent *event)
+{
+	QWidget::showEvent(event);
+	hideSecrets();
+	// Обработчик может открыть подтверждение. Вложенный EXIT удаляет окно, поэтому exec нельзя
+	// начинать внутри QWidget::show(). Контекст this отменяет вызов при раннем уничтожении окна.
+	QTimer::singleShot(0, this, [this] {
+		if (isVisible())
+			activateCurrentEditor();
+	});
+}
+
+// Скрытие не уничтожает окно, черновик или принадлежащую Runtime операцию.
+void ManagementWindow::hideEvent(QHideEvent *event)
+{
+	hideSecrets();
+	QWidget::hideEvent(event);
+}
+
+// Переход выполняется только после решения о dirty-форме; отказ возвращает выделение навигации.
+void ManagementWindow::changePage(int row)
+{
+	if (row < 0 || row >= pages_->count())
+		return;
+	if (navigationChanging_) {
+		// blocked предотвращает повторную навигацию во вложенном цикле подтверждения.
+		const QSignalBlocker blocked(navigation_);
+		navigation_->setCurrentRow(currentPage_);
+		return;
+	}
+	if (row == currentPage_) {
+		pages_->setCurrentIndex(row);
+		return;
+	}
+	navigationChanging_ = true;
+	// guard обнаруживает уничтожение окна во время модального подтверждения.
+	const QPointer<ManagementWindow> guard = this;
+	// editor указывает прежнюю страницу, чья форма должна разрешить переход.
+	auto *editor = currentEditor();
+	// allowed сохраняет ответ до проверки жизни окна после вложенного event loop.
+	const bool allowed = !editor || editor->canLeave(true);
+	if (!guard)
+		return;
+	if (!allowed) {
+		// blocked восстанавливает прежний ряд без нового вызова changePage.
+		const QSignalBlocker blocked(navigation_);
+		navigation_->setCurrentRow(currentPage_);
+		navigationChanging_ = false;
+		return;
+	}
+	hideSecrets();
+	currentPage_ = row;
+	pages_->setCurrentIndex(row);
+	navigationChanging_ = false;
+	activateCurrentEditor();
+}
+
+// Подтверждение фиксирует точную Session, а контроллер повторно проверяет её перед POST.
+void ManagementWindow::attachDestination(const QString &destinationId)
+{
+	if (!restream_ || !stateStore_.dockServer().session)
+		return;
+	// context/sessionId фиксируют цель до диалога; destination хранит подтверждённую карточку.
+	const auto context = stateStore_.dockContext();
+	const auto sessionId = stateStore_.dockServer().session->id;
+	const auto destination = stateStore_.configuration().destinations.value(destinationId);
+	if (destination.id != destinationId || destination.streamId != context.streamId)
+		return;
+	// guard отслеживает удаление окна; confirmation принадлежит Qt и безопасно исчезает вместе с родителем.
+	const QPointer<ManagementWindow> guard = this;
+	const QPointer<QMessageBox> confirmation = new QMessageBox(
+		QMessageBox::Question, text_("Operation.AddOutput"),
+		text_("Operation.ConfirmAddOutput").arg(destination.name), QMessageBox::Yes | QMessageBox::No, this);
+	confirmation->setTextFormat(Qt::PlainText);
+	confirmation->setDefaultButton(QMessageBox::No);
+	localizeConfirmation(*confirmation, text_);
+	// choice не используется до проверки, что окно пережило вложенный цикл событий.
+	const auto choice = confirmation->exec();
+	delete confirmation.data();
+	if (guard && choice == QMessageBox::Yes)
+		restream_->addOutput(context, sessionId, destinationId);
 }
 
 void ManagementWindow::refreshStreams()
@@ -452,6 +666,9 @@ void ManagementWindow::refresh()
 	const QSignalBlocker blockReconnect(reconnect_);
 	// blockSseRetries не допускает обратного сохранения отражённого лимита повторов.
 	const QSignalBlocker blockSseRetries(sseRejectionRetries_);
+	// blockTimeout и blockLog исключают обратное сохранение отражённых предпочтений.
+	const QSignalBlocker blockTimeout(httpTimeout_);
+	const QSignalBlocker blockLog(logMode_);
 	autoConnect_->setChecked(stateStore_.autoConnect());
 	reconnect_->setChecked(stateStore_.reconnect());
 	if (sseRejectionRetries_->value() != stateStore_.sseRejectionRetries()) {
@@ -460,6 +677,10 @@ void ManagementWindow::refresh()
 	autoConnect_->setEnabled(connection_ != nullptr);
 	reconnect_->setEnabled(connection_ != nullptr);
 	sseRejectionRetries_->setEnabled(connection_ && stateStore_.reconnect());
+	httpTimeout_->setValue(stateStore_.httpTimeoutSeconds());
+	httpTimeout_->setEnabled(connection_ != nullptr);
+	logMode_->setCurrentIndex(stateStore_.detailedLogging() ? 1 : 0);
+	logMode_->setEnabled(connection_ != nullptr);
 	connectButton_->setEnabled(connection_ != nullptr);
 	disconnectButton_->setEnabled(connection_ && stateStore_.connectionStatus() != ConnectionStatus::Disconnected);
 	connectionStatus_->setConnectionStatus(text_, stateStore_.connectionStatus());
@@ -509,6 +730,9 @@ void ManagementWindow::refreshOperations()
 	// busy исключает одновременные несовместимые команды общего исполнителя.
 	const bool busy = operations.current && operations.current->phase != OperationPhase::Idle &&
 			  operations.current->phase != OperationPhase::Finished;
+	// settled запрещает разрешение нового fallback до завершения конфигурационной записи и её сверки.
+	const bool settled = !stateStore_.configurationEditor().writing &&
+			     !stateStore_.configurationEditor().reconciliationRequired;
 	// fallback относится только к нынешнему контексту; старое заключение не разрешает новый запуск.
 	const auto &fallback = operations.fallback;
 	// matching означает, что имена и revision проверки принадлежат выбранному Stream.
@@ -524,12 +748,9 @@ void ManagementWindow::refreshOperations()
 		for (const auto &destination : fallback.destinations)
 			names.append(destination.name.isEmpty() ? text_("Dock.UnnamedOutput") : destination.name);
 	}
-	destinations_->setText(
-		names.isEmpty()
-			? text_(matching && fallback.messageKey == QStringLiteral("Fallback.NoEnabledDestinations")
-					? "Fallback.NoEnabledDestinations"
-					: "Fallback.DestinationsUnknown")
-			: text_("Fallback.Destinations").arg(names.join(QLatin1Char('\n'))));
+	destinations_->setText(names.isEmpty() ? QString{}
+					       : text_("Fallback.Destinations").arg(names.join(QLatin1Char('\n'))));
+	destinations_->setVisible(!names.isEmpty());
 	// readinessText отделяет предварительное заключение от действительной готовности медиатракта.
 	const char *readinessText = "Fallback.Unknown";
 	if (matching) {
@@ -551,17 +772,18 @@ void ManagementWindow::refreshOperations()
 				 (matching && !fallback.messageKey.isEmpty()
 					  ? QLatin1Char('\n') + text_(fallback.messageKey.toUtf8().constData())
 					  : QString{}));
-	checkFallback_->setEnabled(connected && !busy);
+	fallbackStatus_->setVisible(
+		matching && (fallback.readiness != FallbackReadiness::Unknown || !fallback.messageKey.isEmpty()));
+	checkFallback_->setEnabled(connected && !busy && settled);
 	// noActive требует полного свежего поиска, а не отсутствия Session в частично прочитанном ответе.
 	const bool noActive = server.sessionStatus.availability == RuntimeAvailability::Fresh &&
 			      server.sessionStatus.complete &&
 			      (!server.session || server.session->state == QStringLiteral("STOPPED") ||
 			       server.session->state == QStringLiteral("FAILED") ||
 			       server.session->state == QStringLiteral("INTERRUPTED"));
-	startFallback_->setEnabled(connected && !busy && noActive && matching &&
+	startFallback_->setEnabled(connected && !busy && settled && noActive && matching &&
 				   fallback.readiness == FallbackReadiness::Ready && !fallback.destinations.isEmpty());
-	streamOperation_->setText(formatOperations(operations, text_));
-	outputOperation_->setText(streamOperation_->text());
+	outputOperation_->setText(formatOperations(operations, text_));
 	// sessionId отделяет выбор выхода от прежней Session с похожими именами и ID.
 	const auto sessionId = server.session ? server.session->id : QString{};
 	// ids содержит нынешние прикреплённые выходы в стабильном порядке QMap.
@@ -611,6 +833,23 @@ void ManagementWindow::refreshOperations()
 	outputStop_->setEnabled(eligible && metadata.desiredRunning);
 	outputRestart_->setEnabled(eligible);
 	outputDetach_->setEnabled(eligible);
+	if (destinationEditor_) {
+		// destinationId адресует карточку, destination — её подтверждённая конфигурация в текущем кеше.
+		const auto destinationId = destinationEditor_->selectedDestinationId();
+		const auto destination = stateStore_.configuration().destinations.constFind(destinationId);
+		// attached выявляет существующее прикрепление по сохранённому ID назначения, а не имени.
+		const bool attached = std::any_of(
+			server.outputs.cbegin(), server.outputs.cend(), [&destinationId](const DockOutput &output) {
+				return output.attached && output.destinationId == destinationId;
+			});
+		destinationEditor_->setAttachAvailable(
+			connected && !busy && server.session && server.session->state == QStringLiteral("RUNNING") &&
+			server.sessionStatus.availability == RuntimeAvailability::Fresh &&
+			server.outputsStatus.availability == RuntimeAvailability::Fresh &&
+			server.outputsStatus.complete &&
+			destination != stateStore_.configuration().destinations.cend() &&
+			destination->streamId == context.streamId && !attached);
+	}
 	// runtimeText остаётся неизвестным без отдельного свежего наблюдения исполнения выхода.
 	QString runtimeText = text_("Observation.NoData");
 	// runtimeSession связывает наблюдение с той же Session, а не с порядком строк UI.
@@ -659,13 +898,14 @@ void ManagementWindow::dispatchOutputAction(OperationAction action)
 	const auto sessionId = displayedSessionId_;
 	const auto outputId = currentOutputs_->currentData().toString();
 	if (action == OperationAction::DetachOutput || action == OperationAction::RestartOutput) {
+		// guard запрещает обращение к контроллеру через уничтоженное окно после диалога.
+		const QPointer<ManagementWindow> guard = this;
 		// choice подтверждает прерывание именно исходного Output; новое состояние проверяет фасад.
-		const auto choice = QMessageBox::question(this, text_("Operation.ConfirmTitle"),
-							  text_(action == OperationAction::DetachOutput
-									? "Operation.ConfirmDetach"
-									: "Operation.ConfirmRestart"),
-							  QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-		if (choice != QMessageBox::Yes)
+		const auto choice =
+			askConfirmation(this, text_, text_("Operation.ConfirmTitle"),
+					text_(action == OperationAction::DetachOutput ? "Operation.ConfirmDetach"
+										      : "Operation.ConfirmRestart"));
+		if (!guard || choice != QMessageBox::Yes)
 			return;
 	}
 	restream_->outputActions(context, sessionId, outputId, action);
@@ -685,13 +925,19 @@ void ManagementWindow::startFallback()
 	// destination — одно назначение из проверенного списка, без endpoint и ключей.
 	for (const auto &destination : fallback.destinations)
 		names.append(destination.name.isEmpty() ? text_("Dock.UnnamedOutput") : destination.name);
-	// confirmation выводит имена назначений только обычным текстом, даже если серверное имя похоже на HTML.
-	QMessageBox confirmation(QMessageBox::Question, text_("Operation.StartFallback"),
-				 text_("Fallback.ConfirmStart").arg(names.join(QLatin1Char('\n'))),
-				 QMessageBox::Yes | QMessageBox::No, this);
-	confirmation.setTextFormat(Qt::PlainText);
-	confirmation.setDefaultButton(QMessageBox::No);
-	if (confirmation.exec() != QMessageBox::Yes)
+	// guard отслеживает окно, confirmation выводит имена обычным текстом и допускает удаление родителем.
+	const QPointer<ManagementWindow> guard = this;
+	const QPointer<QMessageBox> confirmation =
+		new QMessageBox(QMessageBox::Question, text_("Operation.StartFallback"),
+				text_("Fallback.ConfirmStart").arg(names.join(QLatin1Char('\n'))),
+				QMessageBox::Yes | QMessageBox::No, this);
+	confirmation->setTextFormat(Qt::PlainText);
+	confirmation->setDefaultButton(QMessageBox::No);
+	localizeConfirmation(*confirmation, text_);
+	// choice содержит ответ только для прежнего набора назначений и проверяется после жизни окна.
+	const auto choice = confirmation->exec();
+	delete confirmation.data();
+	if (!guard || choice != QMessageBox::Yes)
 		return;
 	restream_->startFallback(fallback.context, fallback.revision);
 }

@@ -92,6 +92,8 @@ bool fromJson(const QJsonValue &, Capabilities &, Error &);
 bool fromJson(const QJsonValue &, PolicyResult &, Error &);
 bool fromJson(const QJsonValue &, OutputDetail &, Error &);
 bool fromJson(const QJsonValue &, Problem &, Error &);
+// Читает только location/message ошибки поля; серверное value намеренно игнорируется.
+bool fromJson(const QJsonValue &, FieldError &, Error &);
 bool fromJson(const QJsonValue &, Preparation &, Error &);
 template<class T> bool fromJson(const QJsonValue &json, JsonField<T> &value, Error &error)
 {

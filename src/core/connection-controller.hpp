@@ -54,6 +54,10 @@ public:
 	void setReconnect(bool enabled);
 	// Сохраняет число новых циклов snapshot/SSE после отказа 400/409; -1 означает отсутствие конечного лимита.
 	void setSseRejectionRetries(int retries);
+	// Сохраняет общий срок новых обычных REST-запросов в пределах 5–60 секунд.
+	void setHttpTimeoutSeconds(int seconds);
+	// Сохраняет выбор подробных безопасных записей штатного журнала OBS.
+	void setDetailedLogging(bool detailed);
 	// Идемпотентно запрещает дальнейшие действия, завершает оба сетевых клиента и помечает данные устаревшими.
 	void shutdown();
 

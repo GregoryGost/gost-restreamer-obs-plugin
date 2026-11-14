@@ -4,6 +4,7 @@
 #include "core/stats-baseline.hpp"
 #include "core/restream-controller.hpp"
 #include "ui/status-label.hpp"
+#include "ui/confirmation-dialog.hpp"
 
 #include <QFormLayout>
 #include <QGridLayout>
@@ -18,6 +19,7 @@
 #include <QPalette>
 #include <QPainter>
 #include <QPushButton>
+#include <QPointer>
 #include <QSet>
 #include <QStandardItemModel>
 #include <QScrollArea>
@@ -427,6 +429,8 @@ QString formatOperations(const OperationsState &operations, const TextLookup &te
 			return text("Operation.CheckFallback");
 		case OperationAction::StartFallback:
 			return text("Operation.StartFallback");
+		case OperationAction::AddOutput:
+			return text("Operation.AddOutput");
 		case OperationAction::Pause:
 			return text("Dock.Pause");
 		case OperationAction::Resume:
@@ -1328,13 +1332,21 @@ void RestreamDock::dispatchSessionAction(OperationAction action)
 			outputIds.append(output.key());
 	}
 	if (action == OperationAction::StopAll || action == OperationAction::RestartAll) {
+		// alive запрещает доступ к доку после завершения OBS во вложенном цикле диалога.
+		const QPointer<RestreamDock> alive(this);
+		// confirmation принадлежит доку; QPointer замечает удаление вместе с родителем.
+		const QPointer<QMessageBox> confirmation =
+			new QMessageBox(QMessageBox::Question, text_("Operation.ConfirmTitle"),
+					text_(action == OperationAction::StopAll ? "Operation.ConfirmStopAll"
+										 : "Operation.ConfirmRestartAll"),
+					QMessageBox::Yes | QMessageBox::No, this);
+		confirmation->setDefaultButton(QMessageBox::No);
+		localizeConfirmation(*confirmation, text_);
 		// choice относится только к исходной цели, которую контроллер повторно проверит после диалога.
-		const auto choice =
-			QMessageBox::question(this, text_("Operation.ConfirmTitle"),
-					      text_(action == OperationAction::StopAll ? "Operation.ConfirmStopAll"
-										       : "Operation.ConfirmRestartAll"),
-					      QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-		if (choice != QMessageBox::Yes)
+		const auto choice = confirmation->exec();
+		if (confirmation)
+			delete confirmation;
+		if (!alive || choice != QMessageBox::Yes)
 			return;
 	}
 	switch (action) {
@@ -1395,10 +1407,22 @@ void RestreamDock::outputActions(DockContext context, QString sessionId, QString
 		emit outputDetailsRequested(context, sessionId, outputId);
 		return;
 	}
-	if (selected == restart &&
-	    QMessageBox::question(this, text_("Operation.ConfirmTitle"), text_("Operation.ConfirmRestart"),
-				  QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
-		return;
+	if (selected == restart) {
+		// alive замечает завершение OBS, пока пользователь отвечает на подтверждение.
+		const QPointer<RestreamDock> alive(this);
+		// confirmation сохраняет стандартные ответы и их смысл после явного перевода.
+		const QPointer<QMessageBox> confirmation =
+			new QMessageBox(QMessageBox::Question, text_("Operation.ConfirmTitle"),
+					text_("Operation.ConfirmRestart"), QMessageBox::Yes | QMessageBox::No, this);
+		confirmation->setDefaultButton(QMessageBox::No);
+		localizeConfirmation(*confirmation, text_);
+		// choice фиксируется до удаления собственного диалога.
+		const auto choice = confirmation->exec();
+		if (confirmation)
+			delete confirmation;
+		if (!alive || choice != QMessageBox::Yes)
+			return;
+	}
 	restream_->outputActions(context, sessionId, outputId,
 				 selected == start  ? OperationAction::StartOutput
 				 : selected == stop ? OperationAction::StopOutput

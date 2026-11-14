@@ -85,6 +85,8 @@ QString commandKind(OperationAction action)
 	switch (action) {
 	case OperationAction::StartFallback:
 		return QStringLiteral("start_session");
+	case OperationAction::AddOutput:
+		return QStringLiteral("add_output");
 	case OperationAction::Pause:
 		return QStringLiteral("pause_session");
 	case OperationAction::Resume:
@@ -130,6 +132,9 @@ public:
 		QObject::connect(&poll, &QTimer::timeout, &owner, [this] { pollCurrent(); });
 		// Изменения наблюдений прерывают только новые шаги; известную квитанцию можно дочитать без SSE.
 		QObject::connect(&state, &StateStore::serverStateChanged, &owner, [this] { observeState(); });
+		// Конфигурационная запись отзывает Ready, но не отменяет уже принятые команды.
+		QObject::connect(&state, &StateStore::configurationInvalidated, &owner,
+				 [this](quint64) { invalidateFallback(); });
 		// Явный disconnect отменяет command API, в отличие от терминального HTTP 204 подписки.
 		QObject::connect(&connection, &ConnectionController::explicitlyDisconnected, &owner,
 				 [this] { disconnectExplicitly(); });
@@ -154,6 +159,8 @@ public:
 		qsizetype resultIndex = -1;
 		// sent отделяет неотправленное намерение от возможного принятия сервером.
 		bool sent = false;
+		// destinationId фиксирует payload прикрепления; возвращённый Output имеет отдельный ID.
+		QString destinationId;
 	};
 
 	// owner ограничивает callbacks временем жизни публичного фасада.
@@ -206,6 +213,46 @@ public:
 	QVector<api::Destination> destinations;
 	// destinationIndex задаёт последовательное чтение точных Group/Profile для предварительной проверки.
 	qsizetype destinationIndex = 0;
+	// Одна отложенная проверка объединяет несколько успешных конфигурационных изменений.
+	bool deferredPrecheck = false;
+
+	// Не допускает проверку пригодности до завершения записи и сверки её неизвестного результата.
+	bool configurationSettled() const
+	{
+		return !state.configurationEditor().writing && !state.configurationEditor().reconciliationRequired;
+	}
+
+	// Снимает пригодность прежнего precheck немедленно, сохраняя текущий workflow.
+	void invalidateFallback()
+	{
+		if (stopped)
+			return;
+		model.fallback.readiness = FallbackReadiness::Unknown;
+		model.fallback.messageKey = QStringLiteral("Fallback.Incomplete");
+		++precheckRevision;
+		publish();
+	}
+
+	// Планирует одну проверку после освобождения исполнителя, без отмены живого шага.
+	void refreshFallbackAfterConfiguration()
+	{
+		if (stopped)
+			return;
+		deferredPrecheck = true;
+		if (busy)
+			return;
+		// Отложенный обработчик объединяет запросы обновления в одном обороте GUI.
+		QTimer::singleShot(0, &owner, [this] {
+			if (stopped || busy || !deferredPrecheck || !available(context) || !configurationSettled())
+				return;
+			// Сохранённый неизвестный шаг ещё нужен явному повтору; автоматическая проверка не стирает его payload.
+			if (model.current && model.current->outcome == OperationOutcome::Unknown &&
+			    model.current->retryAvailable)
+				return;
+			deferredPrecheck = false;
+			checkFallback(context);
+		});
+	}
 
 	// Проверяет поколение и логический выбор; статус SSE здесь намеренно не участвует.
 	bool current(quint64 expected) const
@@ -299,6 +346,7 @@ public:
 					 state.connectionStatus() == ConnectionStatus::Connected;
 		observedStatus = state.connectionStatus();
 		if (context != state.dockContext()) {
+			deferredPrecheck = false;
 			archiveInterrupted();
 			++generation;
 			busy = false;
@@ -324,8 +372,11 @@ public:
 			if (!publish())
 				return;
 		}
-		if (!busy || !model.current)
+		if (!busy || !model.current) {
+			if (deferredPrecheck && reconnected)
+				refreshFallbackAfterConfiguration();
 			return;
+		}
 		// replacement фиксирует именно следующую Session, а не временную потерю SSE при прежнем эфире.
 		const bool replacement = state.dockServer().sessionStatus.availability == RuntimeAvailability::Fresh &&
 					 state.dockServer().session && !model.current->sessionId.isEmpty() &&
@@ -397,7 +448,11 @@ public:
 		}
 		variants.clear();
 		destinations.clear();
+		// guard ограничивает отложенное обновление временем жизни контроллера.
+		const QPointer<RestreamController> guard = &owner;
 		publish();
+		if (guard && deferredPrecheck)
+			refreshFallbackAfterConfiguration();
 	}
 
 	// Выставляет новый общий срок до постановки первого HTTP запроса в очередь.
@@ -423,6 +478,9 @@ public:
 			       (live->sessionId.isEmpty() || receipt.sessionId == live->sessionId);
 		if (receipt.sessionId != live->sessionId)
 			return false;
+		if (live->action == OperationAction::AddOutput)
+			return receipt.targetId == live->sessionId && validId(receipt.outputId) &&
+			       (live->outputId.isEmpty() || receipt.outputId == live->outputId);
 		return live->outputId.isEmpty()
 			       ? receipt.targetId == live->sessionId && receipt.outputId.isEmpty()
 			       : receipt.targetId == live->outputId && receipt.outputId == live->outputId;
@@ -436,6 +494,10 @@ public:
 			return;
 		}
 		live->commandId = receipt.id;
+		if (live->action == OperationAction::AddOutput) {
+			live->outputId = receipt.outputId;
+			model.current->outputId = receipt.outputId;
+		}
 		if (live->action == OperationAction::StartFallback && !receipt.sessionId.isEmpty()) {
 			live->sessionId = receipt.sessionId;
 			model.current->sessionId = receipt.sessionId;
@@ -496,10 +558,24 @@ public:
 	{
 		if (!live || !busy || stopped)
 			return;
+		// firstFallback отличает новый запуск от явной сверки прежнего отправленного request_id.
+		const bool firstFallback = live->action == OperationAction::StartFallback && !live->sent;
+		if (firstFallback && (!configurationSettled() ||
+				      model.fallback.configurationGeneration != state.configurationGeneration())) {
+			finish(OperationOutcome::Failed, QStringLiteral("Fallback.Incomplete"));
+			return;
+		}
 		live->sent = true;
 		model.current->phase = OperationPhase::Sending;
 		if (!publish())
 			return;
+		// Обработчик сигнала мог начать запись конфигурации до фактической передачи HTTP.
+		if (firstFallback && (!configurationSettled() ||
+				      model.fallback.configurationGeneration != state.configurationGeneration())) {
+			live->sent = false;
+			finish(OperationOutcome::Failed, QStringLiteral("Fallback.Incomplete"));
+			return;
+		}
 		// expected ограждает результат от вытеснения Stop All/контекстом.
 		const auto expected = generation;
 		// callback принимает квитанцию либо завершает неоднозначную потерю ответа без нового POST.
@@ -523,6 +599,9 @@ public:
 		switch (live->action) {
 		case OperationAction::StartFallback:
 			api.startSession(context.streamId, live->requestId, live->destinations, &owner, callback);
+			break;
+		case OperationAction::AddOutput:
+			api.addOutput(live->sessionId, live->destinationId, live->requestId, &owner, callback);
 			break;
 		case OperationAction::Pause:
 			api.pauseSession(live->sessionId, live->requestId, &owner, callback);
@@ -567,13 +646,18 @@ public:
 					      }
 					      if (result.value->id != live->outputId ||
 						  result.value->sessionId != live->sessionId ||
-						  result.value->destination.streamId != context.streamId) {
+						  result.value->destination.streamId != context.streamId ||
+						  (live->action == OperationAction::AddOutput &&
+						   (result.value->destination.id != live->destinationId ||
+						    result.value->group.streamId != context.streamId ||
+						    result.value->group.id != result.value->destination.groupId))) {
 						      finish(OperationOutcome::Unknown,
 							     QStringLiteral("Operation.InvalidTarget"));
 						      return;
 					      }
 					      // desired и attached задают оракул конкретной команды, независимо от платформенного runtime.
-					      const bool desired = live->action == OperationAction::StartOutput;
+					      const bool desired = live->action == OperationAction::StartOutput ||
+								   live->action == OperationAction::AddOutput;
 					      const bool attached = live->action != OperationAction::DetachOutput;
 					      if (result.value->desiredRunning == desired &&
 						  result.value->attached == attached)
@@ -786,6 +870,110 @@ public:
 		return true;
 	}
 
+	// Проверяет актуальные Destination/Group и полный состав выходов исходной RUNNING Session.
+	void validateAddOutput()
+	{
+		// expected ограничивает всю цепочку проверки одним живым намерением.
+		const auto expected = generation;
+		// Обработчик подтверждает Session, не заменяя её новым текущим эфиром.
+		api.getSession(live->sessionId, &owner, [this, expected](auto, api::Result<api::Session> session) {
+			if (!current(expected) || !busy)
+				return;
+			if (!session || session.value->id != live->sessionId ||
+			    session.value->streamId != context.streamId ||
+			    session.value->stream.id != context.streamId ||
+			    session.value->state != QStringLiteral("RUNNING")) {
+				finish(OperationOutcome::Failed, QStringLiteral("Operation.InvalidTarget"));
+				return;
+			}
+			// Обработчик читает текущее назначение, включая выключенное для автоматического запуска.
+			api.getDestination(
+				live->destinationId, &owner,
+				[this, expected](auto, api::Result<api::Destination> destination) {
+					if (!current(expected) || !busy)
+						return;
+					if (!destination || destination.value->id != live->destinationId ||
+					    destination.value->streamId != context.streamId ||
+					    !validId(destination.value->groupId)) {
+						finish(OperationOutcome::Failed,
+						       QStringLiteral("Operation.InvalidTarget"));
+						return;
+					}
+					// groupId фиксирует связь назначения для последующего точного GET.
+					const auto groupId = destination.value->groupId;
+					// Обработчик подтверждает принадлежность Group выбранному Stream.
+					api.getGroup(groupId, &owner, [this, expected, groupId](auto, api::Result<api::Group> group) {
+						if (!current(expected) || !busy)
+							return;
+						if (!group || group.value->id != groupId ||
+						    group.value->streamId != context.streamId) {
+							finish(OperationOutcome::Failed,
+							       QStringLiteral("Operation.InvalidTarget"));
+							return;
+						}
+						// Обработчик исключает уже attached назначение по полному списку, не по наличию runtime.
+						api.getAllOutputs(
+							live->sessionId, &owner,
+							[this,
+							 expected](auto,
+								   api::Result<api::Collection<api::Output>> outputs) {
+								if (!current(expected) || !busy)
+									return;
+								if (!outputs || !outputs.value->complete) {
+									finish(OperationOutcome::Failed,
+									       QStringLiteral(
+										       "Operation.InvalidTarget"));
+									return;
+								}
+								// ids обнаруживает повтор идентичности между страницами неатомарного списка.
+								QSet<QString> ids;
+								// output проверяется по исходной Session и снимку назначения.
+								for (const auto &output : outputs.value->items) {
+									if (!validId(output.id) ||
+									    ids.contains(output.id) ||
+									    output.sessionId != live->sessionId ||
+									    output.destination.streamId !=
+										    context.streamId ||
+									    (output.attached &&
+									     output.destination.id ==
+										     live->destinationId)) {
+										finish(OperationOutcome::Failed,
+										       QStringLiteral(
+											       "Operation.InvalidTarget"));
+										return;
+									}
+									ids.insert(output.id);
+								}
+								if (stopNewSteps ||
+								    !sessionTarget(live->sessionId, true) ||
+								    state.connectionStatus() !=
+									    ConnectionStatus::Connected) {
+									finish(OperationOutcome::Failed,
+									       QStringLiteral(
+										       "Operation.InvalidTarget"));
+									return;
+								}
+								sendPost();
+							});
+					});
+				});
+		});
+	}
+
+	// Фиксирует точную цель, request_id и payload прикрепления до каких-либо сетевых запросов.
+	bool addOutput(const DockContext &expected, const QString &sessionId, const QString &destinationId)
+	{
+		if (!available(expected) || !sessionTarget(sessionId, true) || !validId(destinationId))
+			return false;
+		begin(OperationAction::AddOutput, sessionId);
+		prepareSessionStep(OperationAction::AddOutput);
+		live->destinationId = destinationId;
+		model.current->destinationId = destinationId;
+		if (publish())
+			validateAddOutput();
+		return true;
+	}
+
 	// Ограниченно ждёт остановки OBS, затем обязательно адресует исходную Session.
 	bool stopAll(const DockContext &expected, const QString &sessionId)
 	{
@@ -825,7 +1013,9 @@ public:
 	void finishPrecheck(FallbackReadiness readiness, QString message)
 	{
 		if (readiness == FallbackReadiness::Ready &&
-		    (stopNewSteps || state.connectionStatus() != ConnectionStatus::Connected)) {
+		    (stopNewSteps || !configurationSettled() ||
+		     state.connectionStatus() != ConnectionStatus::Connected ||
+		     model.fallback.configurationGeneration != state.configurationGeneration())) {
 			readiness = FallbackReadiness::Unknown;
 			message = QStringLiteral("Fallback.Incomplete");
 		}
@@ -982,13 +1172,14 @@ public:
 	// Запускает строго policy->Asset->current Generation->variants->Enabled Group/Profile.
 	bool checkFallback(const DockContext &expectedContext)
 	{
-		if (!available(expectedContext))
+		if (!available(expectedContext) || !configurationSettled())
 			return false;
 		begin(OperationAction::CheckFallback);
 		model.current->phase = OperationPhase::Prechecking;
 		model.fallback = {};
 		model.fallback.context = context;
 		model.fallback.revision = ++precheckRevision;
+		model.fallback.configurationGeneration = state.configurationGeneration();
 		model.fallback.readiness = FallbackReadiness::Checking;
 		variants.clear();
 		destinations.clear();
@@ -1110,7 +1301,9 @@ public:
 		const bool noActive = !session || session->state == QStringLiteral("STOPPED") ||
 				      session->state == QStringLiteral("FAILED") ||
 				      session->state == QStringLiteral("INTERRUPTED");
-		if (!available(expected) || model.fallback.context != expected || model.fallback.revision != revision ||
+		if (!available(expected) || !configurationSettled() || model.fallback.context != expected ||
+		    model.fallback.revision != revision ||
+		    model.fallback.configurationGeneration != state.configurationGeneration() ||
 		    model.fallback.readiness != FallbackReadiness::Ready || model.fallback.destinations.isEmpty() ||
 		    state.dockServer().sessionStatus.availability != RuntimeAvailability::Fresh ||
 		    !state.dockServer().sessionStatus.complete || !noActive)
@@ -1244,6 +1437,24 @@ RestreamController::~RestreamController()
 bool RestreamController::checkFallback(const DockContext &context)
 {
 	return impl_->checkFallback(context);
+}
+
+// Немедленно отзывает прежнюю пригодность без отмены командного транспорта.
+void RestreamController::invalidateFallback()
+{
+	impl_->invalidateFallback();
+}
+
+// Объединяет запросы одной свежей проверки после конфигурационных изменений.
+void RestreamController::refreshFallbackAfterConfiguration()
+{
+	impl_->refreshFallbackAfterConfiguration();
+}
+
+// Передаёт прикрепление точного назначения к исходной RUNNING Session.
+bool RestreamController::addOutput(const DockContext &context, const QString &sessionId, const QString &destinationId)
+{
+	return impl_->addOutput(context, sessionId, destinationId);
 }
 
 // Запускает только показанную пользователю редакцию предварительной проверки.

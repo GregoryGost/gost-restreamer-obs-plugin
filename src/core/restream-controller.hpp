@@ -42,6 +42,12 @@ public:
 	~RestreamController() override;
 	// Читает policy/current variants/полные профили; результат публикуется через operationsChanged.
 	bool checkFallback(const DockContext &context);
+	// Отзывает пригодность старой проверки без отмены текущего командного workflow.
+	void invalidateFallback();
+	// Выполняет одну свежую проверку после сохранения либо откладывает её до освобождения исполнителя.
+	void refreshFallbackAfterConfiguration();
+	// Прикрепляет точное назначение к исходной RUNNING Session без отдельного startOutput.
+	bool addOutput(const DockContext &context, const QString &sessionId, const QString &destinationId);
 	// Запускает только подтверждённый непустой набор указанной проверки при отсутствии Session.
 	bool startFallback(const DockContext &context, quint64 precheckRevision);
 	// Адресует паузу точной RUNNING Session; не запускает OBS и не меняет group source напрямую.

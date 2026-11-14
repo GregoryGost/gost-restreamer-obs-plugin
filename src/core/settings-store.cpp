@@ -63,6 +63,7 @@ std::optional<QString> SettingsStore::canonicalOrigin(const QString &text)
 	return url.toString(QUrl::FullyEncoded);
 }
 
+// Проверяет весь поддержанный документ перед заменой RAM; одно чтение не мигрирует файл.
 bool SettingsStore::load()
 {
 	// Реестр и привязки сначала разбираются во временные переменные: ошибка в конце документа
@@ -76,9 +77,11 @@ bool SettingsStore::load()
 		emit changed();
 		return false;
 	}
+	// file читает только явно переданный путь настроек.
 	QFile file(filePath_);
 	if (!file.exists())
 		return true;
+	// reject сохраняет исходный файл и сообщает key как локализуемую причину отказа.
 	auto reject = [this](QString key = QStringLiteral("Settings.UnsupportedFormat")) {
 		// Повреждённый или неизвестный формат блокирует последующие записи, сохраняя исходный файл владельца.
 		writeAllowed_ = false;
@@ -91,47 +94,74 @@ bool SettingsStore::load()
 		return reject(QStringLiteral("Settings.ReadError"));
 	if (file.size() > MaxSettingsBytes)
 		return reject();
+	// bytes ограничены до разбора, чтобы повреждённый файл не потребовал неограниченную память.
 	const auto bytes = file.read(MaxSettingsBytes + 1);
 	if (file.error() != QFileDevice::NoError)
 		return reject(QStringLiteral("Settings.ReadError"));
 	if (bytes.size() > MaxSettingsBytes || !bytes.isValidUtf8())
 		return reject();
+	// parseError различает синтаксический отказ, document содержит целый проверяемый JSON.
 	QJsonParseError parseError;
 	const auto document = QJsonDocument::fromJson(bytes, &parseError);
 	if (parseError.error != QJsonParseError::NoError || !document.isObject())
 		return reject();
+	// root содержит корневую запись, schemaVersion выбирает её точный набор полей.
 	const auto root = document.object();
 	const int schemaVersion = root.value(QStringLiteral("schema_version")).toInt(-1);
-	if (schemaVersion != 1 && schemaVersion != 2)
+	if (schemaVersion != 1 && schemaVersion != 2 && schemaVersion != 3)
 		return reject();
+	// keys перечисляет все допустимые ключи выбранной версии, включая обязательные новые поля.
 	QStringList keys{QStringLiteral("schema_version"), QStringLiteral("server_origin"),
 			 QStringLiteral("auto_connect"),   QStringLiteral("reconnect"),
 			 QStringLiteral("profiles"),       QStringLiteral("bindings")};
+	// retries получает прежний default только у схемы v1 без соответствующего поля.
 	int retries = DefaultSseRejectionRetries;
-	if (schemaVersion == 2) {
+	if (schemaVersion >= 2) {
+		// key обозначает единственное добавленное поле схемы v2.
 		const auto key = QStringLiteral("sse_rejection_retries");
 		keys.append(key);
 		retries = root.value(key).toInt(UnlimitedSseRejectionRetries - 1);
+	}
+	// timeoutSeconds и detailed получают совместимые значения при чтении v1/v2.
+	int timeoutSeconds = DefaultHttpTimeoutSeconds;
+	bool detailed = false;
+	if (schemaVersion == 3) {
+		keys.append({QStringLiteral("http_timeout_seconds"), QStringLiteral("log_level")});
+		// timeoutValue должен быть целым числом секунд; logLevel допускает только два режима.
+		const auto timeoutValue = root.value(QStringLiteral("http_timeout_seconds"));
+		const auto logLevel = root.value(QStringLiteral("log_level"));
+		timeoutSeconds = timeoutValue.toInt(-1);
+		if (!timeoutValue.isDouble() || timeoutSeconds < MinHttpTimeoutSeconds ||
+		    timeoutSeconds > MaxHttpTimeoutSeconds || !logLevel.isString() ||
+		    (logLevel.toString() != QStringLiteral("normal") &&
+		     logLevel.toString() != QStringLiteral("detailed")))
+			return reject();
+		detailed = logLevel.toString() == QStringLiteral("detailed");
 	}
 	if (!exactKeys(root, keys) || retries < UnlimitedSseRejectionRetries ||
 	    !root.value(QStringLiteral("server_origin")).isString() ||
 	    !root.value(QStringLiteral("auto_connect")).isBool() || !root.value(QStringLiteral("reconnect")).isBool() ||
 	    !root.value(QStringLiteral("profiles")).isArray() || !root.value(QStringLiteral("bindings")).isArray())
 		return reject();
+	// origin проверяется в сохранённой канонической форме, без неявного исправления файла.
 	const auto origin = root.value(QStringLiteral("server_origin")).toString();
 	if (!origin.isEmpty() && canonicalOrigin(origin) != std::optional<QString>(origin))
 		return reject();
+	// profiles собирает временный реестр, locators исключает повтор путей, records содержит входные записи.
 	QMap<QString, ProfileRecord> profiles;
 	QSet<QString> locators;
 	const auto records = root.value(QStringLiteral("profiles")).toArray();
 	if (records.size() > MaxProfiles)
 		return reject();
+	// entry содержит одну ещё не принятую запись реестра.
 	for (const auto &entry : records) {
 		if (!entry.isObject())
 			return reject();
+		// record проверяется до создания типизированной записи профиля.
 		const auto record = entry.toObject();
 		if (!exactKeys(record, {QStringLiteral("uuid"), QStringLiteral("name"), QStringLiteral("locator")}))
 			return reject();
+		// profile содержит UUID и изменяемые атрибуты одной проверяемой записи.
 		ProfileRecord profile{record.value(QStringLiteral("uuid")).toString(),
 				      record.value(QStringLiteral("name")).toString(),
 				      record.value(QStringLiteral("locator")).toString()};
@@ -143,17 +173,21 @@ bool SettingsStore::load()
 		profiles.insert(profile.uuid, profile);
 		locators.insert(profile.locator);
 	}
+	// bindings собирает временные привязки, entries содержит их исходный массив.
 	QMap<QString, QMap<QString, QString>> bindings;
 	const auto entries = root.value(QStringLiteral("bindings")).toArray();
 	if (entries.size() > MaxBindings)
 		return reject();
+	// entry содержит одну привязку, которую нельзя принять частично.
 	for (const auto &entry : entries) {
 		if (!entry.isObject())
 			return reject();
+		// binding содержит точные origin/UUID/Stream одной пары.
 		const auto binding = entry.toObject();
 		if (!exactKeys(binding,
 			       {QStringLiteral("origin"), QStringLiteral("profile_uuid"), QStringLiteral("stream_id")}))
 			return reject();
+		// server адресует сервер, uuid — профиль OBS, stream — выбранную на этой паре запись.
 		const auto server = binding.value(QStringLiteral("origin")).toString();
 		const auto uuid = binding.value(QStringLiteral("profile_uuid")).toString();
 		const auto stream = binding.value(QStringLiteral("stream_id")).toString();
@@ -169,6 +203,8 @@ bool SettingsStore::load()
 	autoConnect_ = root.value(QStringLiteral("auto_connect")).toBool();
 	reconnect_ = root.value(QStringLiteral("reconnect")).toBool();
 	sseRejectionRetries_ = retries;
+	httpTimeoutSeconds_ = timeoutSeconds;
+	detailedLogging_ = detailed;
 	profiles_ = std::move(profiles);
 	bindings_ = std::move(bindings);
 	currentUuid_.clear();
@@ -182,6 +218,7 @@ bool SettingsStore::load()
 	return true;
 }
 
+// Атомарно сохраняет рабочие предпочтения схемы v3 без прямой перезаписи файла.
 bool SettingsStore::save()
 {
 	// unsaved устанавливается до любой операции: даже заблокированная запись должна быть видна UI.
@@ -192,31 +229,39 @@ bool SettingsStore::save()
 		emit changed();
 		return false;
 	}
+	// profiles содержит JSON реестра; profile обозначает одну устойчивую идентичность OBS.
 	QJsonArray profiles;
 	for (const auto &profile : profiles_)
 		profiles.append(QJsonObject{{QStringLiteral("uuid"), profile.uuid},
 					    {QStringLiteral("name"), profile.name},
 					    {QStringLiteral("locator"), profile.locator}});
+	// bindings содержит JSON привязок; server и binding обходят origin и UUID без изменения исходных карт.
 	QJsonArray bindings;
 	for (auto server = bindings_.cbegin(); server != bindings_.cend(); ++server)
 		for (auto binding = server->cbegin(); binding != server->cend(); ++binding)
 			bindings.append(QJsonObject{{QStringLiteral("origin"), server.key()},
 						    {QStringLiteral("profile_uuid"), binding.key()},
 						    {QStringLiteral("stream_id"), binding.value()}});
-	const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 2},
-						     {QStringLiteral("server_origin"), origin_},
-						     {QStringLiteral("auto_connect"), autoConnect_},
-						     {QStringLiteral("reconnect"), reconnect_},
-						     {QStringLiteral("sse_rejection_retries"), sseRejectionRetries_},
-						     {QStringLiteral("profiles"), profiles},
-						     {QStringLiteral("bindings"), bindings}})
-				   .toJson(QJsonDocument::Compact);
+	// bytes содержит один полный снимок RAM; в нём нет серверных ключей или endpoint.
+	const auto bytes =
+		QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 3},
+					  {QStringLiteral("server_origin"), origin_},
+					  {QStringLiteral("auto_connect"), autoConnect_},
+					  {QStringLiteral("reconnect"), reconnect_},
+					  {QStringLiteral("sse_rejection_retries"), sseRejectionRetries_},
+					  {QStringLiteral("http_timeout_seconds"), httpTimeoutSeconds_},
+					  {QStringLiteral("log_level"),
+					   detailedLogging_ ? QStringLiteral("detailed") : QStringLiteral("normal")},
+					  {QStringLiteral("profiles"), profiles},
+					  {QStringLiteral("bindings"), bindings}})
+			.toJson(QJsonDocument::Compact);
 	if (bytes.size() > MaxSettingsBytes || !QDir().mkpath(QFileInfo(filePath_).absolutePath())) {
 		error_ = QStringLiteral("Не удалось сохранить настройки; изменения доступны в памяти.");
 		errorKey_ = QStringLiteral("Settings.WriteError");
 		emit changed();
 		return false;
 	}
+	// file заменяет прежний документ только после успешного commit.
 	QSaveFile file(filePath_);
 	// Запрет прямой записи сохраняет прежний файл, если атомарная замена невозможна.
 	file.setDirectWriteFallback(false);
@@ -248,6 +293,18 @@ bool SettingsStore::reconnect() const noexcept
 int SettingsStore::sseRejectionRetries() const noexcept
 {
 	return sseRejectionRetries_;
+}
+
+// Возвращает рабочий пользовательский срок новых REST-запросов, в секундах.
+int SettingsStore::httpTimeoutSeconds() const noexcept
+{
+	return httpTimeoutSeconds_;
+}
+
+// Возвращает выбор подробных безопасных записей штатного журнала OBS.
+bool SettingsStore::detailedLogging() const noexcept
+{
+	return detailedLogging_;
 }
 bool SettingsStore::unsaved() const noexcept
 {
@@ -315,6 +372,27 @@ void SettingsStore::setSseRejectionRetries(int retries)
 {
 	if (retries >= UnlimitedSseRejectionRetries && retries != sseRejectionRetries_) {
 		sseRejectionRetries_ = retries;
+		persist();
+	}
+}
+
+// Принимает seconds в RAM только в разрешённом диапазоне и сохраняет фактическое изменение.
+bool SettingsStore::setHttpTimeoutSeconds(int seconds)
+{
+	if (seconds < MinHttpTimeoutSeconds || seconds > MaxHttpTimeoutSeconds)
+		return false;
+	if (seconds != httpTimeoutSeconds_) {
+		httpTimeoutSeconds_ = seconds;
+		persist();
+	}
+	return true;
+}
+
+// Сохраняет detailed, не изменяя язык, оформление или параметры соединения.
+void SettingsStore::setDetailedLogging(bool detailed)
+{
+	if (detailed != detailedLogging_) {
+		detailedLogging_ = detailed;
 		persist();
 	}
 }

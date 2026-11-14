@@ -167,6 +167,11 @@ public:
 	// Публикует предпочтения и безопасную ошибку сохранения из SettingsStore.
 	void syncPreferences()
 	{
+		// guard запрещает второе уведомление, если первое синхронно завершило владельца.
+		const QPointer<ConnectionController> guard = &owner;
+		state.setClientPreferences(settings.httpTimeoutSeconds(), settings.detailedLogging());
+		if (!guard)
+			return;
 		state.setPreferences(settings.autoConnect(), settings.reconnect(), settings.sseRejectionRetries(),
 				     settings.unsaved(), settings.error(), settings.errorKey());
 	}
@@ -313,8 +318,9 @@ public:
 							break;
 						}
 						receivedIds.insert(output.id);
-						outputs.insert(output.id, {output.destination.name, output.attached,
-									   output.desiredRunning});
+						outputs.insert(output.id,
+							       {output.destination.name, output.attached,
+								output.desiredRunning, output.destination.id});
 					}
 					if (valid) {
 						batch->next.outputs = std::move(outputs);
@@ -651,25 +657,37 @@ public:
 				state.setCapabilities(std::move(*caps.value));
 				if (!current(capsContext))
 					return;
-				api.getAllStreams(&owner, [this](auto listContext,
-								 api::Result<api::Collection<api::Stream>> streams) {
-					if (!current(listContext))
-						return;
-					if (!streams) {
-						schedule(Phase::Handshake);
-						return;
-					}
-					// complete сохраняет полноту до переноса элементов ответа в StateStore.
-					const bool complete = streams.value->complete;
-					state.setStreams(std::move(streams.value->items), complete);
-					if (!current(listContext))
-						return;
-					resolveSelection(state.profileNotice(), state.profileNoticeKey());
-					if (!current(listContext))
-						return;
-					snapshot();
-				});
+				readHandshakeStreams();
 			});
+		});
+	}
+
+	// Читает Streams для handshake, не позволяя старому списку затереть результат записи редактора.
+	void readHandshakeStreams()
+	{
+		// configurationVersion фиксирует все записи, начатые до создания этого GET.
+		const auto configurationVersion = state.configurationGeneration();
+		// listContext проверяет подключение; streams содержит полный либо явно неполный обход списка.
+		api.getAllStreams(&owner, [this, configurationVersion](
+						  auto listContext, api::Result<api::Collection<api::Stream>> streams) {
+			if (!current(listContext))
+				return;
+			if (!streams || configurationVersion != state.configurationGeneration()) {
+				// Новый ограниченный цикл не оставляет handshake зависшим после отброшенного GET.
+				// Отмена касается только observation API, независимая запись продолжает выполняться.
+				schedule(Phase::Handshake);
+				return;
+			}
+			// complete сохраняет полноту до переноса элементов в общее состояние.
+			const bool complete = streams.value->complete;
+			// guard учитывает синхронное удаление владельца обработчиками публикации списка.
+			const QPointer<ConnectionController> guard = &owner;
+			state.setStreams(std::move(streams.value->items), complete);
+			if (!guard || !current(listContext))
+				return;
+			resolveSelection(state.profileNotice(), state.profileNoticeKey());
+			if (guard && current(listContext))
+				snapshot();
 		});
 	}
 
@@ -922,6 +940,20 @@ void ConnectionController::setSseRejectionRetries(int retries)
 {
 	if (!impl_->stopped)
 		impl_->settings.setSseRejectionRetries(retries);
+}
+
+// Делегирует seconds хранилищу; сроки уже созданных HTTP-заданий не изменяются.
+void ConnectionController::setHttpTimeoutSeconds(int seconds)
+{
+	if (!impl_->stopped)
+		impl_->settings.setHttpTimeoutSeconds(seconds);
+}
+
+// Принимает detailed в локальные предпочтения, не включая отдельный файл журнала.
+void ConnectionController::setDetailedLogging(bool detailed)
+{
+	if (!impl_->stopped)
+		impl_->settings.setDetailedLogging(detailed);
 }
 
 void ConnectionController::shutdown()

@@ -1,13 +1,51 @@
 #pragma once
 #include "api/models.hpp"
+#include "api/configuration-requests.hpp"
 #include <QObject>
 #include <QUrl>
 #include <QStringList>
 #include <memory>
 
 namespace gost::api {
+// Закрытый набор методов диагностики исключает произвольные строки и payload.
+enum class HttpMethod { Get, Post, Patch, Delete };
+// Тип маршрута не содержит origin, идентификаторов, пути или query.
+enum class RouteType {
+	Health,
+	Capabilities,
+	Snapshot,
+	Stream,
+	Destination,
+	Profile,
+	Group,
+	Session,
+	Command,
+	Asset,
+	Other
+};
+// Безопасные метаданные завершённого REST-запроса.
+struct HttpDiagnostic {
+	// Использованный HTTP-метод.
+	HttpMethod method = HttpMethod::Get;
+	// Категория типизированного маршрута.
+	RouteType route = RouteType::Other;
+	// Полученный HTTP-статус либо ноль при отсутствии ответа.
+	int status = 0;
+	// Время транспорта в миллисекундах; ожидание очереди исключено.
+	qint64 durationMs = 0;
+	// Число принятых байтов без содержимого ответа.
+	qsizetype receivedBytes = 0;
+	// Классификация ошибки без сообщений сервера.
+	std::optional<ErrorKind> error;
+	// Число активных запросов после завершения этого запроса.
+	qsizetype activeRequests = 0;
+	// Число ожидающих запросов в момент завершения.
+	qsizetype queuedRequests = 0;
+};
+// Обработчик диагностики выполняется в потоке клиента и не должен уничтожать клиент.
+using DiagnosticCallback = std::function<void(const HttpDiagnostic &)>;
 /**
- * Асинхронно читает REST API и отправляет типизированные команды одного выбранного сервера.
+ * Асинхронно читает REST API, изменяет конфигурацию и отправляет типизированные команды выбранного сервера.
  * Проверяет ответы перед выдачей DTO.
  * Клиент владеет своим QNetworkAccessManager, очередью запросов и активными ответами. Все методы,
  * сетевые сигналы и обработчики результата выполняются в потоке клиента с работающим циклом Qt.
@@ -20,13 +58,13 @@ namespace gost::api {
  * поэтому ожидание вызывающей стороны должно завершаться и по её собственному жизненному циклу.
  *
  * Очередь, число активных операций, размеры тел и обход списков ограничиваются Limits. Ошибки
- * транспорта, HTTP, таймаута, размера и контракта различаются в Result. GET и POST не повторяются:
+ * транспорта, HTTP, таймаута, размера и контракта различаются в Result. Запросы не повторяются:
  * восстановлением подключения и ручным повтором команд управляет вызывающий код.
  * Редиректы автоматически не выполняются; Location команды проверяется без перехода по ссылке.
  */
 class APIClient : public QObject {
 public:
-	// Создаёт клиент без выбранного сервера; limits копируются на всё время его жизни.
+	// Создаёт клиент без выбранного сервера; limits задают бюджеты, сроки новых запросов можно изменить отдельно.
 	explicit APIClient(Limits limits = {}, QObject *parent = nullptr);
 	// Отменяет собственные запросы до уничтожения менеджера и захваченных обработчиков.
 	~APIClient() override;
@@ -48,6 +86,38 @@ public:
 	void cancelAll();
 	// Необратимо закрывает клиент и отменяет задания. Повторный вызов безопасен; новые запросы игнорируются.
 	void shutdown();
+	// Меняет сроки только новых заданий: absolute=timeoutMs, idle=min(10000, timeoutMs).
+	// Диапазон пользовательской настройки проверяет SettingsStore; положительные короткие сроки допустимы тестам.
+	void setHttpTimeoutMs(int timeoutMs);
+	// Устанавливает безопасный sink без зависимости API от OBS и без глобального Qt-handler.
+	void setDiagnosticCallback(DiagnosticCallback callback);
+	// Создаёт Stream; callback получает проверенный DTO ответа 201.
+	void createStream(StreamCreate request, QObject *receiver, Callback<Stream> callback);
+	// Изменяет Stream по ревизии; callback получает DTO ответа 200.
+	void patchStream(QString id, StreamPatch request, QObject *receiver, Callback<Stream> callback);
+	// Удаляет Stream по ревизии; успехом является пустой ответ 204.
+	void deleteStream(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback);
+	// Создаёт Destination; секретные строки сохраняются точно.
+	void createDestination(DestinationCreate request, QObject *receiver, Callback<Destination> callback);
+	// Изменяет явно указанные поля Destination по ревизии.
+	void patchDestination(QString id, DestinationPatch request, QObject *receiver, Callback<Destination> callback);
+	// Удаляет Destination по ревизии без автоматического каскада.
+	void deleteDestination(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback);
+	// Создаёт связь Group с потоком и профилем.
+	void createGroup(GroupCreate request, QObject *receiver, Callback<Group> callback);
+	// Изменяет явно указанные связи/имя Group по ревизии.
+	void patchGroup(QString id, GroupPatch request, QObject *receiver, Callback<Group> callback);
+	// Удаляет Group по ревизии; сервер решает допустимость удаления.
+	void deleteGroup(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback);
+	// Создаёт именованный профиль с полным рецептом.
+	void createProfile(ProfileCreate request, QObject *receiver, Callback<Profile> callback);
+	// Заменяет явно переданные имя/полный рецепт Profile по ревизии.
+	void patchProfile(QString id, ProfilePatch request, QObject *receiver, Callback<Profile> callback);
+	// Удаляет Profile по ревизии без скрытого изменения связанных групп.
+	void deleteProfile(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback);
+	// Прикрепляет destinationId к точной Session; ответ 202 означает лишь принятие команды.
+	void addOutput(QString sessionId, QString destinationId, QString requestId, QObject *receiver,
+		       Callback<Receipt> callback);
 	// Проверки live/ready описывают HTTP-сервис; их успех не подтверждает готовность медиатракта.
 	void getReady(QObject *receiver, Callback<Health> callback);
 	// Читает live-проверку процесса сервера; receiver ограничивает доставку результата callback.

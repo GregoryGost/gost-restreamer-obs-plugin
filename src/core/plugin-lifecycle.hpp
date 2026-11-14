@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ui/text-lookup.hpp"
+#include "core/log-sink.hpp"
 
 #include <QObject>
 
@@ -14,6 +15,7 @@ class StateStore;
 class SettingsStore;
 class ConnectionController;
 class RestreamController;
+class ConfigurationController;
 
 // Параметры загрузки модуля, не содержащие состояния команд.
 struct PluginOptions {
@@ -21,6 +23,8 @@ struct PluginOptions {
 	// Пустой путь не заменяется автоматически пользовательским/системным каталогом.
 	QString version;
 	QString settingsFile;
+	// Принимает только подготовленные безопасные записи; production-адаптер направляет их в obs_log.
+	LogSink logSink;
 };
 
 /**
@@ -63,6 +67,8 @@ public:
 	ConnectionController *connectionController() const noexcept;
 	// Возвращает заимствованный фасад явных команд; после shutdown результат равен nullptr.
 	RestreamController *restreamController() const noexcept;
+	// Возвращает заимствованный контроллер редакторов либо nullptr после завершения Runtime.
+	ConfigurationController *configurationController() const noexcept;
 
 private:
 	// Runtime создаёт и завершает общие сервисы независимо от видимости окон.

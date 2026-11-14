@@ -1,5 +1,6 @@
 #include "api/api-client.hpp"
 #include "api/json-decoder.hpp"
+#include "api/json-encoder.hpp"
 #include "api/network-origin.hpp"
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
@@ -14,7 +15,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QElapsedTimer>
 #include <algorithm>
+#include <type_traits>
 #include <utility>
 
 namespace gost::api {
@@ -24,6 +27,42 @@ QString segment(const QString &id)
 {
 	// Непрозрачный ID целиком кодируется как один сегмент, включая возможные разделители пути.
 	return QString::fromLatin1(QUrl::toPercentEncoding(id));
+}
+// Возвращает категорию заранее известного маршрута, не передавая его текст диагностике.
+RouteType routeType(const QString &path)
+{
+	if (path.startsWith(QStringLiteral("/health/")))
+		return RouteType::Health;
+	if (path == QStringLiteral("/system/capabilities"))
+		return RouteType::Capabilities;
+	if (path == QStringLiteral("/events/snapshot"))
+		return RouteType::Snapshot;
+	if (path.startsWith(QStringLiteral("/streams")))
+		return RouteType::Stream;
+	if (path.startsWith(QStringLiteral("/destinations")))
+		return RouteType::Destination;
+	if (path.startsWith(QStringLiteral("/transcode-profiles")))
+		return RouteType::Profile;
+	if (path.startsWith(QStringLiteral("/transcode-groups")))
+		return RouteType::Group;
+	if (path.startsWith(QStringLiteral("/sessions")))
+		return RouteType::Session;
+	if (path.startsWith(QStringLiteral("/commands")))
+		return RouteType::Command;
+	if (path.startsWith(QStringLiteral("/fallback-assets")))
+		return RouteType::Asset;
+	return RouteType::Other;
+}
+// Преобразует внутреннее обозначение Qt в закрытый безопасный набор методов.
+HttpMethod diagnosticMethod(QNetworkAccessManager::Operation method)
+{
+	if (method == QNetworkAccessManager::PostOperation)
+		return HttpMethod::Post;
+	if (method == QNetworkAccessManager::DeleteOperation)
+		return HttpMethod::Delete;
+	if (method == QNetworkAccessManager::CustomOperation)
+		return HttpMethod::Patch;
+	return HttpMethod::Get;
 }
 // Преобразует фильтры query в параметры URL, сохраняя точные значения непрозрачных курсоров и ID.
 QUrlQuery queryParameters(const ListQuery &query)
@@ -52,7 +91,7 @@ QUrlQuery queryParameters(const ListQuery &query)
 class APIClient::Impl {
 public:
 	// Обработчик полного ограниченного тела после транспортной классификации.
-	using RawCallback = Callback<QByteArray>;
+	using RawCallback = std::function<void(RequestContext, Result<QByteArray>, HttpDiagnostic)>;
 	// Состояние одного запроса разделяется между очередью и захватами обработчиков через shared_ptr.
 	// Job не владеет receiver и reply. reply принадлежит network; оба таймера являются его детьми.
 	// finished отмечает конец транспорта, а не готовность результата: в reply ещё могут оставаться байты.
@@ -69,12 +108,22 @@ public:
 		QString path;
 		// Параметры только этого запроса, в том числе фильтры страниц.
 		QUrlQuery query;
-		// GET сохраняет прежнюю семантику; POST выбирается только типизированными командами.
+		// Метод выбирается только типизированными wrapper; CustomOperation обозначает PATCH.
 		QNetworkAccessManager::Operation method = QNetworkAccessManager::GetOperation;
-		// Неизменяемый JSON исходной команды; не смешивается с накапливаемым ответом body.
+		// Неизменяемый JSON исходной команды/конфигурации; не смешивается с накапливаемым ответом body.
 		QByteArray requestBody;
-		// Единственный успешный HTTP-статус: GET 200 или команда 202.
+		// Единственный успешный статус: GET/PATCH 200, create 201, команда 202 или DELETE 204.
 		int expectedStatus = 200;
+		// Зафиксированный общий срок в миллисекундах; изменение настройки не затрагивает очередь.
+		int deadlineMs = 15000;
+		// Зафиксированный срок простоя этого запроса в миллисекундах.
+		int idleMs = 10000;
+		// Измеряет транспорт после отправки, отдельно от очереди.
+		QElapsedTimer elapsed;
+		// Последний HTTP-статус, включая досрочный отказ по размеру или сроку.
+		int status = 0;
+		// Локальная ошибка кодирования передаётся без потери пути поля.
+		std::optional<Error> inputError;
 		// Локальная проверка параметров позволяет отклонить запрос до сетевого допуска.
 		bool inputValid = true;
 		// Обработчик полного тела после транспортной проверки.
@@ -102,6 +151,8 @@ public:
 	APIClient *owner;
 	// Ограничения копируются при создании и не меняются для уже принятых заданий.
 	Limits limits;
+	// Получает только безопасные типизированные метаданные; не владеет клиентом.
+	DiagnosticCallback diagnosticCallback;
 	// Собственный менеджер с NoProxy владеет сетевыми ответами этого экземпляра клиента.
 	QNetworkAccessManager network;
 	// Проверенный HTTP(S) origin, не содержащий пути, параметров или учётных данных.
@@ -116,7 +167,7 @@ public:
 	QQueue<std::shared_ptr<Job>> queue;
 	// Отправленные задания, занимающие не более maxActiveRequests слотов.
 	QHash<QNetworkReply *, std::shared_ptr<Job>> active;
-	// owner задаёт Qt-владение менеджером, limits — неизменные бюджеты; глобальная proxy-политика не меняется.
+	// owner задаёт Qt-владение менеджером, limits — начальные бюджеты; глобальная proxy-политика не меняется.
 	Impl(APIClient *owner, Limits limits) : owner(owner), limits(limits), network(owner)
 	{
 		// Для явно выбранного локального сервера обходим системное определение прокси: WinHTTP может
@@ -134,8 +185,47 @@ public:
 	// возврата из deliver обращаться к Impl можно лишь после проверки, что клиент ещё существует.
 	void deliver(const std::shared_ptr<Job> &job, Result<QByteArray> result)
 	{
-		if (current(job))
-			job->callback(job->context, std::move(result));
+		if (!current(job))
+			return;
+		// diagnostic не содержит строк из запроса или ответа; очередь измеряется до callback.
+		HttpDiagnostic diagnostic;
+		diagnostic.method = diagnosticMethod(job->method);
+		diagnostic.route = routeType(job->path);
+		diagnostic.status = job->status;
+		diagnostic.durationMs = job->elapsed.isValid() ? job->elapsed.elapsed() : 0;
+		diagnostic.receivedBytes = result.value ? result.value->size() : job->body.size();
+		diagnostic.activeRequests = active.size();
+		diagnostic.queuedRequests = queue.size();
+		job->callback(job->context, std::move(result), diagnostic);
+	}
+	// Выдаёт финальную классификацию после DTO-декодирования; серверные тексты sink не получает.
+	void report(HttpDiagnostic diagnostic, const std::optional<Error> &error)
+	{
+		if (error)
+			diagnostic.error = error->kind;
+		// callback удерживает текущий sink во время вызова, в том числе при его явной замене.
+		const auto callback = diagnosticCallback;
+		if (callback)
+			callback(diagnostic);
+	}
+	// Декодирует успешный JSON до диагностики и передаёт ровно один окончательный результат callback.
+	// Ошибка DTO после ответа имеет requestSent=true; callback может уничтожить owner.
+	// requireIdentity дополнительно требует непустой Record ID; expectedId фиксирует адресуемую PATCH-сущность.
+	template<class T>
+	void decoded(RequestContext context, Result<QByteArray> rawResult, HttpDiagnostic diagnostic,
+		     const Callback<T> &callback, const QString &expectedId = {}, bool requireIdentity = false)
+	{
+		// result содержит только полностью проверенный DTO либо исходную классифицированную ошибку.
+		auto result = rawResult ? decode<T>(*rawResult.value) : Result<T>::failure(*rawResult.error);
+		if constexpr (std::is_base_of_v<Record, T>) {
+			if (result && requireIdentity &&
+			    (result.value->id.isEmpty() || (!expectedId.isEmpty() && result.value->id != expectedId)))
+				result = Result<T>::failure(makeError(ErrorKind::Contract, diagnostic.status));
+		}
+		if (rawResult && result.error)
+			result.error->requestSent = true;
+		report(diagnostic, result.error);
+		callback(context, std::move(result));
 	}
 	// Завершает активный job результатом result не более одного раза; abort прерывает незавершённый транспорт.
 	// До callback удаляет запись из active и отключает
@@ -149,6 +239,9 @@ public:
 		if (!reply || !active.contains(reply))
 			return;
 		active.remove(reply);
+		job->status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+		if (result.error)
+			result.error->requestSent = true;
 		job->reply = nullptr;
 		QObject::disconnect(reply, nullptr, owner, nullptr);
 		if (abort)
@@ -188,7 +281,8 @@ public:
 	// и expectedStatus задают GET либо POST. inputValid запрещает отправку локально неверных параметров.
 	void raw(QString path, QUrlQuery query, QObject *receiver, RawCallback callback, qsizetype cap,
 		 QNetworkAccessManager::Operation method = QNetworkAccessManager::GetOperation,
-		 QByteArray requestBody = {}, int expectedStatus = 200, bool inputValid = true)
+		 QByteArray requestBody = {}, int expectedStatus = 200, bool inputValid = true,
+		 std::optional<Error> inputError = std::nullopt)
 	{
 		if (stopped || !receiver)
 			return;
@@ -203,13 +297,24 @@ public:
 		job->requestBody = std::move(requestBody);
 		job->expectedStatus = expectedStatus;
 		job->inputValid = inputValid;
+		job->inputError = std::move(inputError);
+		job->deadlineMs = std::max(1, limits.httpDeadlineMs);
+		job->idleMs = std::max(1, limits.httpIdleMs);
 		job->callback = std::move(callback);
 		job->cap = cap;
 		if (!job->inputValid || origin.isEmpty() || limits.maxActiveRequests <= 0 || limits.readBytes <= 0 ||
 		    cap <= 0) {
 			// Отложенный отказ использует тот же context/serial/receiver, что и настоящий ответ.
 			QTimer::singleShot(0, owner, [this, job] {
-				deliver(job, Result<QByteArray>::failure(makeError(ErrorKind::Contract)));
+				deliver(job, Result<QByteArray>::failure(
+						     job->inputError.value_or(makeError(ErrorKind::Contract))));
+			});
+			return;
+		}
+		if (job->requestBody.size() > limits.restBodyBytes) {
+			// Превышение исходящего документа отсекается до передачи транспорту; результат записи известен локально.
+			QTimer::singleShot(0, owner, [this, job] {
+				deliver(job, Result<QByteArray>::failure(makeError(ErrorKind::Limit)));
 			});
 			return;
 		}
@@ -257,12 +362,19 @@ public:
 			request.setRawHeader("Accept", "application/json");
 			request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
 					     QNetworkRequest::ManualRedirectPolicy);
-			if (job->method == QNetworkAccessManager::PostOperation)
+			if (job->method == QNetworkAccessManager::PostOperation ||
+			    job->method == QNetworkAccessManager::CustomOperation)
 				request.setHeader(QNetworkRequest::ContentTypeHeader,
 						  QStringLiteral("application/json"));
 			// reply принадлежит network; команда отправляется ровно один раз без транспортного retry.
+			job->elapsed.start();
 			auto *reply = job->method == QNetworkAccessManager::PostOperation
 					      ? network.post(request, job->requestBody)
+				      : job->method == QNetworkAccessManager::CustomOperation
+					      ? network.sendCustomRequest(request, QByteArrayLiteral("PATCH"),
+									  job->requestBody)
+				      : job->method == QNetworkAccessManager::DeleteOperation
+					      ? network.deleteResource(request)
 					      : network.get(request);
 			job->reply = reply;
 			active.insert(reply, job);
@@ -278,8 +390,8 @@ public:
 			QObject::connect(job->deadline, &QTimer::timeout, owner, timeout);
 			QObject::connect(job->idle, &QTimer::timeout, owner, timeout);
 			// Оба бюджета начинаются при отправке, а не во время ожидания места в очереди.
-			job->deadline->start(std::max(1, limits.httpDeadlineMs));
-			job->idle->start(std::max(1, limits.httpIdleMs));
+			job->deadline->start(job->deadlineMs);
+			job->idle->start(job->idleMs);
 			// readyRead запускает ограниченное чтение, finished дополнительно фиксирует конец транспорта.
 			QObject::connect(reply, &QIODevice::readyRead, owner, [this, job] { drain(job); });
 			QObject::connect(reply, &QNetworkReply::finished, owner, [this, job] {
@@ -310,7 +422,7 @@ public:
 		const auto bytes = reply->read(std::min(limits.readBytes, room + 1));
 		if (!bytes.isEmpty()) {
 			job->body.append(bytes);
-			job->idle->start(std::max(1, limits.httpIdleMs));
+			job->idle->start(job->idleMs);
 		}
 		if (job->body.size() > job->cap) {
 			complete(job, Result<QByteArray>::failure(makeError(ErrorKind::Limit)), true);
@@ -346,14 +458,19 @@ public:
 			return;
 		}
 		if (reply->error() != QNetworkReply::NoError) {
-			complete(job, Result<QByteArray>::failure(makeError(ErrorKind::Transport, status)));
+			complete(job, Result<QByteArray>::failure(
+					      makeError(reply->error() == QNetworkReply::SslHandshakeFailedError
+								? ErrorKind::Tls
+								: ErrorKind::Transport,
+							status)));
 			return;
 		}
-		if (status != job->expectedStatus || media != QStringLiteral("application/json")) {
+		if (status != job->expectedStatus || (status != 204 && media != QStringLiteral("application/json")) ||
+		    (status == 204 && !job->body.isEmpty())) {
 			complete(job, Result<QByteArray>::failure(makeError(ErrorKind::Contract, status)));
 			return;
 		}
-		if (job->method == QNetworkAccessManager::PostOperation) {
+		if (job->expectedStatus == 202) {
 			// receipt нужен здесь только для связи Location с id; типизированный callback декодирует DTO.
 			const auto receipt = decode<Receipt>(job->body);
 			if (!receipt) {
@@ -400,12 +517,9 @@ public:
 		raw(
 			std::move(path), {}, receiver,
 			// context и result — исходный контекст и полное тело; ошибки передаются без журналирования payload.
-			[callback = std::move(callback)](RequestContext context, Result<QByteArray> result) {
-				if (!result) {
-					callback(context, Result<Receipt>::failure(*result.error));
-					return;
-				}
-				callback(context, decode<Receipt>(*result.value));
+			[this, callback = std::move(callback)](RequestContext context, Result<QByteArray> result,
+							       HttpDiagnostic diagnostic) {
+				decoded<Receipt>(context, std::move(result), diagnostic, callback);
 			},
 			limits.restBodyBytes, QNetworkAccessManager::PostOperation,
 			QJsonDocument(payload).toJson(QJsonDocument::Compact), 202, valid);
@@ -419,14 +533,50 @@ public:
 		raw(
 			std::move(path), std::move(query), receiver,
 			// context и result — контекст исходного GET и его полное тело либо классифицированная ошибка.
-			[callback = std::move(callback)](RequestContext context, Result<QByteArray> result) {
-				if (!result) {
-					callback(context, Result<T>::failure(*result.error));
-					return;
-				}
-				callback(context, decode<T>(*result.value));
+			[this, callback = std::move(callback)](RequestContext context, Result<QByteArray> result,
+							       HttpDiagnostic diagnostic) {
+				decoded<T>(context, std::move(result), diagnostic, callback);
 			},
 			cap ? cap : limits.restBodyBytes);
+	}
+	// Отправляет типизированный create/PATCH без повтора; локальная ошибка кодирования не выходит в сеть.
+	// path — фиксированный маршрут, request — DTO намерения, valid проверяет непустой ID wrapper.
+	// method/status различают create201 и PATCH200; expectedId связывает результат PATCH с исходным ID.
+	template<class T, class Request>
+	void mutate(QString path, Request request, QNetworkAccessManager::Operation method, int status, bool valid,
+		    QObject *receiver, Callback<T> callback, QString expectedId = {})
+	{
+		// encoded содержит весь исходящий JSON либо безопасную ошибку известного поля.
+		auto encoded = encodeRequest(request);
+		raw(
+			std::move(path), {}, receiver,
+			// Обработчик проверяет непустой ID создания либо expectedId изменения до выдачи DTO callback.
+			[this, callback = std::move(callback), expectedId = std::move(expectedId)](
+				RequestContext context, Result<QByteArray> result, HttpDiagnostic diagnostic) {
+				decoded<T>(context, std::move(result), diagnostic, callback, expectedId, true);
+			},
+			limits.restBodyBytes, method,
+			encoded ? QJsonDocument(*encoded.value).toJson(QJsonDocument::Compact) : QByteArray{}, status,
+			valid && bool(encoded), encoded.error);
+	}
+	// Передаёт expectedRevision только в DELETE query и принимает 204 без JSON/MIME.
+	void remove(QString path, quint64 expectedRevision, bool valid, QObject *receiver, Callback<Empty> callback)
+	{
+		// query содержит точную decimal-строку, безопасную для обычного кодирования URL.
+		QUrlQuery query;
+		query.addQueryItem(QStringLiteral("expected_revision"), QString::number(expectedRevision));
+		raw(
+			std::move(path), std::move(query), receiver,
+			// Обработчик создаёт пустой успешный результат; тело никогда не разбирается как Receipt.
+			[this, callback = std::move(callback)](RequestContext context, Result<QByteArray> rawResult,
+							       HttpDiagnostic diagnostic) {
+				// result различает подтверждённый 204 и классифицированный сетевой/серверный отказ.
+				auto result = rawResult ? Result<Empty>::success({})
+							: Result<Empty>::failure(*rawResult.error);
+				report(diagnostic, result.error);
+				callback(context, std::move(result));
+			},
+			limits.restBodyBytes, QNetworkAccessManager::DeleteOperation, {}, 204, valid);
 	}
 	// Читает одну страницу path с фильтрами query; результат callback ограничен жизнью receiver.
 	template<class T> void page(QString path, QObject *receiver, Callback<Page<T>> callback, ListQuery query)
@@ -475,20 +625,25 @@ public:
 		raw(
 			walk->path, queryParameters(walk->query), walk->receiver,
 			// ctx и rawResult относятся к одной странице; обработчик принимает её целиком по бюджету байтов.
-			[this, walk](RequestContext ctx, Result<QByteArray> rawResult) {
+			[this, walk](RequestContext ctx, Result<QByteArray> rawResult, HttpDiagnostic diagnostic) {
 				if (!rawResult) {
+					report(diagnostic, rawResult.error);
 					walk->callback(ctx, Result<Collection<T>>::failure(*rawResult.error));
 					return;
 				}
 				// remaining — остаток общего бюджета исходных JSON-байтов всех страниц.
 				const auto remaining = limits.pageWalkBytes - walk->result.bytes;
 				if (rawResult.value->size() > remaining) {
+					report(diagnostic, {});
 					// Страница либо принимается целиком по объёму, либо сохраняются только предыдущие страницы.
 					walk->callback(ctx, Result<Collection<T>>::success(std::move(walk->result)));
 					return;
 				}
 				// result содержит проверенную страницу без частично декодированных DTO.
 				auto result = decode<Page<T>>(*rawResult.value);
+				if (result.error)
+					result.error->requestSent = true;
+				report(diagnostic, result.error);
 				if (!result) {
 					walk->callback(ctx, Result<Collection<T>>::failure(*result.error));
 					return;
@@ -566,6 +721,108 @@ void APIClient::shutdown()
 		return;
 	impl_->stopped = true;
 	impl_->cancel();
+}
+// Изменяет только сроки новых Job; уже сохранённые deadlineMs/idleMs не переписываются.
+void APIClient::setHttpTimeoutMs(int timeoutMs)
+{
+	impl_->limits.httpDeadlineMs = std::max(1, timeoutMs);
+	impl_->limits.httpIdleMs = std::min(10000, impl_->limits.httpDeadlineMs);
+}
+// Заменяет sink в потоке клиента; метаданные не включают строки запроса/ответа.
+void APIClient::setDiagnosticCallback(DiagnosticCallback callback)
+{
+	impl_->diagnosticCallback = std::move(callback);
+}
+
+// Создаёт Stream; request проверяется до передачи транспорту, receiver ограничивает callback.
+void APIClient::createStream(StreamCreate request, QObject *receiver, Callback<Stream> callback)
+{
+	impl_->mutate<Stream>(QStringLiteral("/streams"), std::move(request), QNetworkAccessManager::PostOperation, 201,
+			      true, receiver, std::move(callback));
+}
+// Изменяет точный id Stream по ревизии request; callback получает проверенный полный DTO.
+void APIClient::patchStream(QString id, StreamPatch request, QObject *receiver, Callback<Stream> callback)
+{
+	impl_->mutate<Stream>(QStringLiteral("/streams/") + segment(id), std::move(request),
+			      QNetworkAccessManager::CustomOperation, 200, !id.isEmpty(), receiver, std::move(callback),
+			      id);
+}
+// Удаляет точный id Stream по expectedRevision; receiver ограничивает пустой результат 204.
+void APIClient::deleteStream(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback)
+{
+	impl_->remove(QStringLiteral("/streams/") + segment(id), expectedRevision, !id.isEmpty(), receiver,
+		      std::move(callback));
+}
+
+// Создаёт Destination; request проверяется до передачи транспорту, receiver ограничивает callback.
+void APIClient::createDestination(DestinationCreate request, QObject *receiver, Callback<Destination> callback)
+{
+	impl_->mutate<Destination>(QStringLiteral("/destinations"), std::move(request),
+				   QNetworkAccessManager::PostOperation, 201, true, receiver, std::move(callback));
+}
+// Изменяет точный id Destination по ревизии request; callback получает проверенный полный DTO.
+void APIClient::patchDestination(QString id, DestinationPatch request, QObject *receiver,
+				 Callback<Destination> callback)
+{
+	impl_->mutate<Destination>(QStringLiteral("/destinations/") + segment(id), std::move(request),
+				   QNetworkAccessManager::CustomOperation, 200, !id.isEmpty(), receiver,
+				   std::move(callback), id);
+}
+// Удаляет точный id Destination по expectedRevision; receiver ограничивает пустой результат 204.
+void APIClient::deleteDestination(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback)
+{
+	impl_->remove(QStringLiteral("/destinations/") + segment(id), expectedRevision, !id.isEmpty(), receiver,
+		      std::move(callback));
+}
+
+// Создаёт Group; request проверяется до передачи транспорту, receiver ограничивает callback.
+void APIClient::createGroup(GroupCreate request, QObject *receiver, Callback<Group> callback)
+{
+	impl_->mutate<Group>(QStringLiteral("/transcode-groups"), std::move(request),
+			     QNetworkAccessManager::PostOperation, 201, true, receiver, std::move(callback));
+}
+// Изменяет точный id Group по ревизии request; callback получает проверенный полный DTO.
+void APIClient::patchGroup(QString id, GroupPatch request, QObject *receiver, Callback<Group> callback)
+{
+	impl_->mutate<Group>(QStringLiteral("/transcode-groups/") + segment(id), std::move(request),
+			     QNetworkAccessManager::CustomOperation, 200, !id.isEmpty(), receiver, std::move(callback),
+			     id);
+}
+// Удаляет точный id Group по expectedRevision; receiver ограничивает пустой результат 204.
+void APIClient::deleteGroup(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback)
+{
+	impl_->remove(QStringLiteral("/transcode-groups/") + segment(id), expectedRevision, !id.isEmpty(), receiver,
+		      std::move(callback));
+}
+
+// Создаёт Profile; request проверяется до передачи транспорту, receiver ограничивает callback.
+void APIClient::createProfile(ProfileCreate request, QObject *receiver, Callback<Profile> callback)
+{
+	impl_->mutate<Profile>(QStringLiteral("/transcode-profiles"), std::move(request),
+			       QNetworkAccessManager::PostOperation, 201, true, receiver, std::move(callback));
+}
+// Изменяет точный id Profile по ревизии request; callback получает проверенный полный DTO.
+void APIClient::patchProfile(QString id, ProfilePatch request, QObject *receiver, Callback<Profile> callback)
+{
+	impl_->mutate<Profile>(QStringLiteral("/transcode-profiles/") + segment(id), std::move(request),
+			       QNetworkAccessManager::CustomOperation, 200, !id.isEmpty(), receiver,
+			       std::move(callback), id);
+}
+// Удаляет точный id Profile по expectedRevision; receiver ограничивает пустой результат 204.
+void APIClient::deleteProfile(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback)
+{
+	impl_->remove(QStringLiteral("/transcode-profiles/") + segment(id), expectedRevision, !id.isEmpty(), receiver,
+		      std::move(callback));
+}
+
+// Отправляет одну команду прикрепления destinationId; requestId и точная Session сохраняются вызывающим кодом.
+void APIClient::addOutput(QString sessionId, QString destinationId, QString requestId, QObject *receiver,
+			  Callback<Receipt> callback)
+{
+	impl_->post(QStringLiteral("/sessions/") + segment(sessionId) + QStringLiteral("/outputs"),
+		    {{QStringLiteral("request_id"), requestId}, {QStringLiteral("destination_id"), destinationId}},
+		    !sessionId.isEmpty() && !destinationId.isEmpty() && !requestId.isEmpty(), receiver,
+		    std::move(callback));
 }
 void APIClient::getReady(QObject *receiver, Callback<Health> callback)
 {

@@ -13,6 +13,7 @@ enum class OperationAction {
 	None,
 	CheckFallback,
 	StartFallback,
+	AddOutput,
 	Pause,
 	Resume,
 	StopAll,
@@ -44,6 +45,8 @@ struct FallbackPrecheck {
 	DockContext context;
 	// Номер завершённой/текущей проверки для защиты подтверждения в диалоге.
 	quint64 revision = 0;
+	// Эпоха конфигурации запрещает старой проверке вернуть Ready после начала записи.
+	quint64 configurationGeneration = 0;
 	// Предварительное заключение, не доказательство целостности медиа на сервере.
 	FallbackReadiness readiness = FallbackReadiness::Unknown;
 	// assetId адресует проверенный Asset политики.
@@ -54,7 +57,7 @@ struct FallbackPrecheck {
 	QVector<FallbackDestination> destinations;
 	// Ключ безопасного сообщения для локализации; полученные failure.message не копируются.
 	QString messageKey;
-	// READY не подтверждает версию генератора; UI всегда показывает предупреждение о rebuild.
+	// READY не подтверждает версию генератора; необходимость rebuild объясняется в справке перед запуском.
 	bool rebuildWarning = true;
 };
 
@@ -84,6 +87,8 @@ struct WorkflowResult {
 	QString sessionId;
 	// outputId адресует текущий шаг Output внутри исходной Session.
 	QString outputId;
+	// Destination фиксируется при прикреплении и не подменяется другим назначением после ответа.
+	QString destinationId;
 	// requestId связывает одинаковые payload при явном ручном повторе.
 	QString requestId;
 	// commandId адресует проверенную квитанцию живого шага.

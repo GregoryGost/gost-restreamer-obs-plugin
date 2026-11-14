@@ -153,6 +153,55 @@ const ConfigurationState &StateStore::configuration() const noexcept
 {
 	return configuration_;
 }
+
+// Возвращает независимую форму, которую refresh коллекций не переписывает.
+const ConfigurationEditorState &StateStore::configurationEditor() const noexcept
+{
+	return configurationEditor_;
+}
+
+// Сначала устанавливает RAM-форму, затем уведомляет её потребителей.
+void StateStore::setConfigurationEditor(ConfigurationEditorState editor)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	configurationEditor_ = std::move(editor);
+	emit configurationEditorChanged();
+}
+
+// Возвращает текущую эпоху конфигурационных чтений.
+quint64 StateStore::configurationGeneration() const noexcept
+{
+	return configurationGeneration_;
+}
+
+// Публикует смену эпохи до начала потенциальной серверной записи.
+void StateStore::invalidateConfiguration()
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	++configurationGeneration_;
+	emit configurationInvalidated(configurationGeneration_);
+}
+
+// Возвращает срок новых REST-заданий в секундах.
+int StateStore::httpTimeoutSeconds() const noexcept
+{
+	return httpTimeoutSeconds_;
+}
+
+// Возвращает выбранный режим безопасной диагностики.
+bool StateStore::detailedLogging() const noexcept
+{
+	return detailedLogging_;
+}
+
+// Ограничивает срок допустимым диапазоном и уведомляет наблюдателей настроек.
+void StateStore::setClientPreferences(int seconds, bool detailed)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	httpTimeoutSeconds_ = std::clamp(seconds, 5, 60);
+	detailedLogging_ = detailed;
+	emit serverStateChanged();
+}
 const HistoryState &StateStore::history() const noexcept
 {
 	return history_;

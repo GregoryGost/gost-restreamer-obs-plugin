@@ -34,11 +34,16 @@ struct DockSession {
 	bool desiredPaused = false;
 };
 
+// Содержит сохранённые намерения выхода и ID снимка назначения; исполнение наблюдается отдельно.
 struct DockOutput {
-	// Имя и намерения из REST; наблюдаемый статус/битрейт берутся отдельно из RuntimeOutput.
+	// name — серверное имя снимка назначения, которое используется только для отображения.
 	QString name;
+	// attached показывает подтверждённое прикрепление выхода к Session.
 	bool attached = false;
+	// desiredRunning задаёт сохранённое намерение запуска, не подтверждая публикацию.
 	bool desiredRunning = false;
+	// destinationId позволяет обнаружить уже прикреплённое назначение по точному публичному ID.
+	QString destinationId;
 };
 
 struct DockFallback {

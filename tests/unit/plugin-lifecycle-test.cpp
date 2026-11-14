@@ -1320,35 +1320,39 @@ void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons_data()
 {
 	QTest::addColumn<QString>("locale");
 	QTest::addColumn<QStringList>("pages");
-	QTest::newRow("russian") << QStringLiteral("ru-RU")
-				 << QStringList{QStringLiteral("Потоки"),           QStringLiteral("Выходы"),
-						QStringLiteral("Группы и профили"), QStringLiteral("Заглушки"),
-						QStringLiteral("Диагностика"),      QStringLiteral("Настройки"),
-						QStringLiteral("Расширенные")};
-	QTest::newRow("english") << QStringLiteral("en-US") << QStringList{QStringLiteral("Streams"),
-									   QStringLiteral("Outputs"),
-									   QStringLiteral("Groups and profiles"),
-									   QStringLiteral("Fallback"),
-									   QStringLiteral("Diagnostics"),
-									   QStringLiteral("Settings"),
-									   QStringLiteral("Advanced")};
+	QTest::newRow("russian") << QStringLiteral("ru-RU") << QStringList{QStringLiteral("Потоки"),
+									   QStringLiteral("Выходы"),
+									   QStringLiteral("Группы кодирования"),
+									   QStringLiteral("Профили"),
+									   QStringLiteral("Заглушки"),
+									   QStringLiteral("Диагностика"),
+									   QStringLiteral("Настройки"),
+									   QStringLiteral("Расширенные")};
+	QTest::newRow("english") << QStringLiteral("en-US")
+				 << QStringList{QStringLiteral("Streams"),         QStringLiteral("Outputs"),
+						QStringLiteral("Encoding groups"), QStringLiteral("Profiles"),
+						QStringLiteral("Fallback"),        QStringLiteral("Diagnostics"),
+						QStringLiteral("Settings"),        QStringLiteral("Advanced")};
 }
 
+// Проверяет отдельные локализованные страницы и сохранение действующих сообщений настроек.
 void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons()
 {
-	// Порядок списка и стека сопоставляется для каждого раздела. Иконка должна иметь реальное изображение,
-	// включая запасной QStyle при отсутствии темы OBS. Предупреждение о несохранённых настройках дополнительно видно в «Расширенных».
+	// locale выбирает словарь OBS, pages задаёт независимый ожидаемый порядок разделов.
 	QFETCH(QString, locale);
 	QFETCH(QStringList, pages);
+	// text переводит настоящие ресурсы, state/window создают единственное изолированное окно управления.
 	const auto text = localeLookup(locale);
 	gost::StateStore state;
 	gost::ManagementWindow window(state, text);
+	// navigation/stack должны сопоставлять каждый самостоятельный раздел одной странице.
 	auto *navigation = window.findChild<QListWidget *>();
 	auto *stack = window.findChild<QStackedWidget *>();
 	QVERIFY(navigation);
 	QVERIFY(stack);
 	QCOMPARE(navigation->count(), pages.size());
 	QCOMPARE(stack->count(), pages.size());
+	// index адресует каждую страницу; изображение проверяется и для резервной иконки Qt.
 	for (int index = 0; index < pages.size(); ++index) {
 		QCOMPARE(navigation->item(index)->text(), pages.at(index));
 		QVERIFY(!navigation->item(index)->icon().pixmap(navigation->iconSize()).isNull());
@@ -1356,14 +1360,10 @@ void PluginLifecycleTest::managementNavigationHasLocalizedPagesAndIcons()
 		QCOMPARE(stack->currentIndex(), index);
 		QVERIFY(stack->currentWidget());
 	}
-	QCOMPARE(window.findChildren<QTabWidget *>().size(), 1);
-	auto *tabs = stack->widget(2)->findChild<QTabWidget *>();
-	QVERIFY(tabs);
-	QCOMPARE(tabs->count(), 2);
-	QCOMPARE(tabs->tabText(0),
-		 locale == QStringLiteral("ru-RU") ? QStringLiteral("Группы") : QStringLiteral("Groups"));
-	QCOMPARE(tabs->tabText(1),
-		 locale == QStringLiteral("ru-RU") ? QStringLiteral("Профили") : QStringLiteral("Profiles"));
+	QVERIFY(!stack->widget(2)->findChild<QTabWidget *>());
+	QVERIFY(!stack->widget(3)->findChild<QTabWidget *>());
+	QVERIFY(stack->widget(2) != stack->widget(3));
+	// retries/message подтверждают сохранение настроек и реальных inline-сообщений в «Расширенных».
 	auto *retries = stack->currentWidget()->findChild<QSpinBox *>(QStringLiteral("sseRejectionRetries"));
 	auto *message = stack->currentWidget()->findChild<QLabel *>(QStringLiteral("advancedSettingsMessage"));
 	QVERIFY(retries && message);
@@ -1813,13 +1813,16 @@ void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
 {
 	// Выделенный пункт раскрытого списка отличается от сохранённого выбора. После обычного оперативного события
 	// обязаны сохраниться видимость, выделение и прокрутка, а не только currentData комбобокса.
+	// temp изолирует preferences; state хранит наблюдение, settings читает только сценарный файл.
 	WorkspaceTemp temp(QStringLiteral("stream-popup"));
 	QVERIFY(temp.isValid());
 	gost::StateStore state;
 	gost::SettingsStore settings(temp.filePath(QStringLiteral("settings.json")));
+	// api/events создают независимые REST/SSE-каналы, controller координирует рабочий выбор.
 	gost::api::APIClient api;
 	gost::api::EventClient events;
 	gost::ConnectionController controller(state, settings, api, events);
+	// streams содержит тысячу вариантов; index задаёт номер, stream — очередной синтетический DTO.
 	QVector<gost::api::Stream> streams;
 	for (int index = 0; index < 1000; ++index) {
 		gost::api::Stream stream;
@@ -1831,14 +1834,17 @@ void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
 	state.setSelection(QStringLiteral("stream-10"), true);
 	state.setConnection(QStringLiteral("http://127.0.0.1:8080"), gost::ConnectionStatus::Connected);
 	QVERIFY(state.installAnchor({QStringLiteral("popup-anchor"), {}, {gost::api::FieldState::Null, {}}}));
+	// window представляет обе страницы настроек без настоящего OBS.
 	gost::ManagementWindow window(state, localeLookup(), nullptr, &controller);
 	window.show();
+	// navigation выбирает настройки, selector открывает список рабочего потока.
 	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
 	auto *selector = window.findChild<QComboBox *>(QStringLiteral("streamSelector"));
 	QVERIFY(navigation && selector);
-	navigation->setCurrentRow(5);
+	navigation->setCurrentRow(6);
 	QVERIFY(selector->isEnabled());
 	selector->showPopup();
+	// view предоставляет раскрытый popup; highlighted/scroll фиксируют выделение и прокрутку до SSE.
 	auto *view = selector->view();
 	view->setCurrentIndex(view->model()->index(500, 0));
 	view->scrollTo(view->currentIndex(), QAbstractItemView::PositionAtCenter);
@@ -1847,6 +1853,7 @@ void PluginLifecycleTest::runtimeUpdatePreservesOpenStreamPopup()
 	const int scroll = view->verticalScrollBar()->value();
 	QVERIFY(scroll > 0);
 	// Последующее SSE-обновление не должно пересоздать список, потерять выделение или прокрутку открытого меню.
+	// update несёт новое наблюдение сеанса, не изменение списка конфигурации.
 	gost::api::RuntimeEvent update;
 	update.cursor = QStringLiteral("popup-event");
 	update.kind = QStringLiteral("state");
@@ -1897,19 +1904,24 @@ void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
 	// Вторая страница по размеру не входит в общий бюджет, сохранённый Stream находится именно там.
 	// Пока SSE-заголовки удерживаются, UI предупреждает о неполноте и позволяет выбрать уже полученный
 	// Stream. Новый выбор сохраняется на диске, отменяет старую подписку и начинает собственные снимок и SSE.
+	// locale определяет реальные ресурсы страницы; temp/server изолируют файлы и петлевые HTTP-запросы.
 	QFETCH(QString, locale);
 	WorkspaceTemp temp(QStringLiteral("partial-stream-list"));
 	QVERIFY(temp.isValid());
 	HttpServer server;
 	QVERIFY(server.listen());
+	// first содержит полученный Stream и cursor, second — не вошедший в бюджет сохранённый Stream.
 	const auto first = fixture::page({fixture::stream(QStringLiteral("received"))}, QStringLiteral("next-page"));
 	const auto second = fixture::page({fixture::stream(QStringLiteral("saved"))});
+	// readyRequests/pageRequests/snapshotRequests/eventRequests считают независимые фазы подключения.
 	int readyRequests = 0;
 	int pageRequests = 0;
 	int snapshotRequests = 0;
 	int eventRequests = 0;
+	// firstSubscription удерживает исходную подписку, selectedSubscription — подписку нового выбора.
 	HttpServer::Request firstSubscription;
 	HttpServer::Request selectedSubscription;
+	// Обработчик request отвечает только синтетическими чтениями и сохраняет адреса двух SSE-соединений.
 	server.handler = [&](const auto &request) {
 		if (request.target.startsWith("/api/v1/health/ready")) {
 			++readyRequests;
@@ -1929,10 +1941,12 @@ void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
 				selectedSubscription = request;
 		}
 	};
+	// path/settings адресуют локальные preferences, state отражает только наблюдения этой проверки.
 	const auto path = temp.filePath(QStringLiteral("settings.json"));
 	gost::SettingsStore settings(path);
 	settings.setAutoConnect(false);
 	gost::StateStore state;
+	// limits ограничивает общий объём страниц, api/events выполняют запросы, controller управляет выбором.
 	gost::api::Limits limits;
 	limits.pageWalkBytes = first.size() + second.size() - 1;
 	gost::api::APIClient api(limits);
@@ -1941,35 +1955,40 @@ void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
 	controller.observeProfile(gost::FrontendEvent::FinishedLoading,
 				  {QStringLiteral("A"), QStringLiteral("profiles/a"), {QStringLiteral("A")}, true});
 	QVERIFY(state.profileResolved());
+	// origin/profileId задают точную привязку сервера и устойчивого профиля OBS.
 	const auto origin = server.origin().toString();
 	const auto profileId = settings.profileUuid();
 	QVERIFY(settings.setSelectedStream(origin, profileId, QStringLiteral("saved")));
+	// text читает поставляемую локализацию; window показывает рабочее состояние контроллера.
 	const auto text = localeLookup(locale);
 	gost::ManagementWindow window(state, text, nullptr, &controller);
 	window.show();
+	// navigation переключает настройки; selector/reconnect/message показывают выбор, восстановление и предупреждение.
+	// retries задаёт лимит повторов SSE на самостоятельной странице расширенных параметров.
 	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
 	auto *selector = window.findChild<QComboBox *>(QStringLiteral("streamSelector"));
 	auto *reconnect = window.findChild<QCheckBox *>(QStringLiteral("reconnect"));
 	auto *message = window.findChild<QLabel *>(QStringLiteral("connectionMessage"));
 	auto *retries = window.findChild<QSpinBox *>(QStringLiteral("sseRejectionRetries"));
 	QVERIFY(navigation && selector && reconnect && message && retries);
-	navigation->setCurrentRow(5);
+	navigation->setCurrentRow(6);
 	QVERIFY(selector->isVisible());
 	QVERIFY(!retries->isVisible());
 	reconnect->setChecked(false);
-	navigation->setCurrentRow(6);
+	navigation->setCurrentRow(7);
 	QVERIFY(retries->isVisible());
 	QVERIFY(!retries->isEnabled());
-	navigation->setCurrentRow(5);
-	reconnect->setChecked(true);
 	navigation->setCurrentRow(6);
+	reconnect->setChecked(true);
+	navigation->setCurrentRow(7);
 	QVERIFY(retries->isEnabled());
 	QCOMPARE(retries->value(), 3);
 	retries->setValue(-1);
 	QCOMPARE(settings.sseRejectionRetries(), -1);
+	// restored независимо читает preferences после записи из интерфейса.
 	gost::SettingsStore restored(path);
 	QCOMPARE(restored.sseRejectionRetries(), -1);
-	navigation->setCurrentRow(5);
+	navigation->setCurrentRow(6);
 
 	controller.connectToServer(origin);
 	QTRY_VERIFY_WITH_TIMEOUT(firstSubscription.socket, 3000);
@@ -1987,6 +2006,7 @@ void PluginLifecycleTest::partialStreamListWarnsAndAllowsSelection()
 	QVERIFY(message->text().contains(text("Stream.ListIncomplete")));
 	QCOMPARE(selector->currentText(), text("Stream.Unconfirmed").arg(QStringLiteral("saved")));
 	QVERIFY(selector->isEnabled());
+	// receivedIndex адресует подтверждённый уже полученный Stream без обращения к неполной второй странице.
 	const int receivedIndex = selector->findData(QStringLiteral("received"));
 	QVERIFY(receivedIndex > 0);
 	selector->setCurrentIndex(receivedIndex);
@@ -2153,13 +2173,13 @@ void PluginLifecycleTest::commandFailureCodeIsPlainText()
 	// dock/window отображают один общий результат без новых собственных серверных чтений.
 	gost::RestreamDock dock(state, text);
 	gost::ManagementWindow window(state, text);
-	// dockStatus адресует результат Dock; streamStatus — страницы потоков; outputStatus — страницы выходов.
+	// dockStatus и outputStatus адресуют результаты операций в Dock и на странице выходов.
 	auto *dockStatus = dock.findChild<QLabel *>(QStringLiteral("operationStatus"));
-	auto *streamStatus = window.findChild<QLabel *>(QStringLiteral("streamOperationStatus"));
 	auto *outputStatus = window.findChild<QLabel *>(QStringLiteral("outputOperationStatus"));
-	QVERIFY(dockStatus && streamStatus && outputStatus);
+	QVERIFY(dockStatus && outputStatus);
+	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("streamOperationStatus")));
 	// label проверяется как настоящий QWidget, чтобы случайный переход к AutoText не скрыл риск HTML-интерпретации.
-	for (auto *label : {dockStatus, streamStatus, outputStatus}) {
+	for (auto *label : {dockStatus, outputStatus}) {
 		QTRY_VERIFY_WITH_TIMEOUT(label->text().contains(text("Operation.FailureCode").arg(code)), 1000);
 		QCOMPARE(label->textFormat(), Qt::PlainText);
 		QVERIFY(label->text().contains(code));

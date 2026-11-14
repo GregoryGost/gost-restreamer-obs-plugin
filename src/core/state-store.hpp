@@ -3,6 +3,7 @@
 #include "api/models.hpp"
 #include "core/dock-server-state.hpp"
 #include "core/operations-state.hpp"
+#include "core/configuration-state.hpp"
 #include "obs/obs-statistics.hpp"
 
 #include <QObject>
@@ -130,6 +131,20 @@ public:
 	const QString &profileNoticeKey() const noexcept;
 	// Возвращает конфигурационные REST-коллекции с их полнотой и свежестью.
 	const ConfigurationState &configuration() const noexcept;
+	// Возвращает единственную RAM-форму отдельно от серверного кеша.
+	const ConfigurationEditorState &configurationEditor() const noexcept;
+	// Публикует новое значение формы до синхронного сигнала интерфейсу.
+	void setConfigurationEditor(ConfigurationEditorState editor);
+	// Возвращает эпоху конфигурации для защиты чтений и предварительной проверки.
+	quint64 configurationGeneration() const noexcept;
+	// Отзывает пригодность прежних чтений перед записью и после её завершения.
+	void invalidateConfiguration();
+	// Возвращает общий срок новых обычных REST-заданий в секундах.
+	int httpTimeoutSeconds() const noexcept;
+	// Возвращает выбранный уровень штатного журнала OBS.
+	bool detailedLogging() const noexcept;
+	// Проецирует настройки из SettingsStore, не записывая их на диск.
+	void setClientPreferences(int seconds, bool detailed);
 	// Возвращает исторические записи без подмены текущих наблюдений исполнения.
 	const HistoryState &history() const noexcept;
 	// Возвращает детальные REST-чтения и статусы их доступности.
@@ -200,6 +215,10 @@ public:
 	void clearRuntime();
 
 signals:
+	// Сообщает о новом вводе, конфликте или результате конфигурационной записи.
+	void configurationEditorChanged();
+	// Отзывает старую предварительную проверку и адресные чтения указанной эпохи.
+	void configurationInvalidated(quint64 generation);
 	// Уведомляет о результате операции независимо от REST/SSE телеметрии.
 	void operationsChanged();
 	// Сообщает об изменении имени профиля или флага штатной трансляции OBS.
@@ -256,6 +275,14 @@ private:
 	QString profileNoticeKey_;
 	// Конфигурационные коллекции REST; не заменяют runtime.
 	ConfigurationState configuration_;
+	// RAM-черновик не сериализуется в настройки и переживает скрытие окна.
+	ConfigurationEditorState configurationEditor_;
+	// Изменение эпохи запрещает старому GET заменить результат записи.
+	quint64 configurationGeneration_ = 0;
+	// Срок новых HTTP-заданий; текущие задания сохраняют исходный deadline.
+	int httpTimeoutSeconds_ = 15;
+	// true включает безопасную подробную диагностику штатного журнала.
+	bool detailedLogging_ = false;
 	// Исторические Session/Output/Receipt с закреплёнными параметрами.
 	HistoryState history_;
 	// Отдельные детальные REST-ответы и статусы чтения.

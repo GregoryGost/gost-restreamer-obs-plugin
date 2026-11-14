@@ -12,6 +12,9 @@ class QComboBox;
 class QPushButton;
 class QSpinBox;
 class QListWidget;
+class QStackedWidget;
+class QShowEvent;
+class QHideEvent;
 
 namespace gost {
 
@@ -19,6 +22,8 @@ class StateStore;
 class ConnectionController;
 class StatusLabel;
 class RestreamController;
+class ConfigurationController;
+class ConfigurationEditor;
 
 /**
  * Единственное повторно используемое расширенное окно с внутренней навигацией.
@@ -36,17 +41,34 @@ class ManagementWindow final : public QWidget {
 public:
 	// Создаёт одно окно представления; заимствованные контроллеры переживают его скрытие и закрытие.
 	ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent = nullptr,
-			 ConnectionController *connection = nullptr, RestreamController *restream = nullptr);
+			 ConnectionController *connection = nullptr, RestreamController *restream = nullptr,
+			 ConfigurationController *configuration = nullptr);
 	// Выбирает выход только при совпадении исходного контекста и Session с нынешним отображением.
 	void selectOutput(const DockContext &context, const QString &sessionId, const QString &outputId);
 
+protected:
+	// Скрывает секреты и планирует активацию карточки после обработки показа окна Qt.
+	void showEvent(QShowEvent *event) override;
+	// Возвращает маску всем карточкам, сохраняя RAM-черновик и отправленные операции.
+	void hideEvent(QHideEvent *event) override;
+
 private:
+	// Возвращает редактор текущей страницы/вкладки либо nullptr для остальных разделов.
+	ConfigurationEditor *currentEditor() const;
+	// Активирует только текущий вид карточки, не меняя рабочий Stream.
+	void activateCurrentEditor();
+	// Возвращает маску всем секретным полям, в том числе на невидимых страницах.
+	void hideSecrets();
+	// Согласует переход row с изменённым черновиком и сохраняет прежний выбор при отказе.
+	void changePage(int row);
+	// Фиксирует Session и назначение до явного подтверждения нового прикрепления.
+	void attachDestination(const QString &destinationId);
 	// Обновляет подписи/доступность/предпочтения, сохраняя пользовательский ввод и раскрытый список.
 	void refresh();
 	// Перестраивает список лишь при изменении состава/выбора; сохраняет неполученный сохранённый ID
 	// как недоступный или неподтверждённый пункт, не меняя постоянную привязку.
 	void refreshStreams();
-	// Обновляет минимальные страницы текущего Stream и Output, сохраняя точные ID в itemData.
+	// Обновляет действия и результаты на странице выходов, сохраняя точные ID в itemData.
 	void refreshOperations();
 	// Передаёт действие для выбранного Output, фиксируя цель до подтверждения.
 	void dispatchOutputAction(OperationAction action);
@@ -58,9 +80,23 @@ private:
 	// connection_ меняет подключение и привязку Stream; restream_ выполняет только явные команды.
 	ConnectionController *connection_ = nullptr;
 	RestreamController *restream_ = nullptr;
+	// configuration_ координирует CRUD независимо от очередей наблюдения и команд.
+	ConfigurationController *configuration_ = nullptr;
+	// streamEditor_ и destinationEditor_ представляют конфигурацию, а не текущие runtime-снимки.
+	ConfigurationEditor *streamEditor_ = nullptr;
+	ConfigurationEditor *destinationEditor_ = nullptr;
+	// groupEditor_ и profileEditor_ размещаются на самостоятельных страницах того же окна.
+	ConfigurationEditor *groupEditor_ = nullptr;
+	ConfigurationEditor *profileEditor_ = nullptr;
+	// pages_ переключает существующие страницы без дополнительных окон.
+	QStackedWidget *pages_ = nullptr;
+	// currentPage_ сохраняет прежний раздел до парковки несохранённого ввода.
+	int currentPage_ = 0;
+	// navigationChanging_ исключает повторный переход из вложенного цикла подтверждения.
+	bool navigationChanging_ = false;
 	// navigation_ переключает существующие страницы при переходе из меню дока.
 	QListWidget *navigation_ = nullptr;
-	// selectedStream_ показывает выбранный Stream; destinations_ — фиксированные назначения проверки.
+	// selectedStream_ обозначает поток блока заглушки в «Выходах»; destinations_ — назначения проверки.
 	QLabel *selectedStream_ = nullptr;
 	QLabel *destinations_ = nullptr;
 	// fallbackStatus_ показывает предварительную пригодность отдельно от результата запуска.
@@ -80,8 +116,7 @@ private:
 	QPushButton *outputStop_ = nullptr;
 	QPushButton *outputRestart_ = nullptr;
 	QPushButton *outputDetach_ = nullptr;
-	// streamOperation_ и outputOperation_ показывают общую модель операций на обеих страницах.
-	QLabel *streamOperation_ = nullptr;
+	// outputOperation_ показывает общую модель операций на странице выходов.
 	QLabel *outputOperation_ = nullptr;
 	// apiUrl_ содержит черновик адреса; autoConnect_ задаёт автоподключение; reconnect_ — восстановление связи.
 	// sseRejectionRetries_ задаёт существующий лимит отклонённых подписок SSE.
@@ -89,6 +124,9 @@ private:
 	QCheckBox *autoConnect_ = nullptr;
 	QCheckBox *reconnect_ = nullptr;
 	QSpinBox *sseRejectionRetries_ = nullptr;
+	// httpTimeout_ редактирует общий срок новых REST-запросов, logMode_ — уровень штатного журнала OBS.
+	QSpinBox *httpTimeout_ = nullptr;
+	QComboBox *logMode_ = nullptr;
 	// streams_ и displayedSelectionId_ сохраняют выбор и не пересоздают раскрытый список при телеметрии.
 	QComboBox *streams_ = nullptr;
 	QString displayedSelectionId_;

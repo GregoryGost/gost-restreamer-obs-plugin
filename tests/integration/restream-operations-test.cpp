@@ -258,6 +258,99 @@ public:
 	// Непустое значение заменяет профиль варианта для отрицательных проверок сравнения.
 	QJsonObject variantProfile;
 };
+
+// Отвечает только на новые публичные маршруты прикрепления; остальные GET обслуживает OperationRig.
+// Начальная квитанция уже содержит Output ID, а runtime намеренно недоступен.
+class AddOutputScenario final {
+public:
+	// serverRig задаёт петлевую границу сервера, которая должна переживать объект сценария.
+	explicit AddOutputScenario(OperationRig &serverRig) : rig(serverRig)
+	{
+		// Перехватчик независимо моделирует принятие и долговечный результат команды.
+		rig.intercept = [this](const HttpServer::Request &request) {
+			if (request.method == "GET" && request.target == "/api/v1/destinations/destination") {
+				// destination выключен для автозапуска, но доступен для явного AddOutput.
+				auto destination = fixture::destination();
+				destination.insert(QStringLiteral("enabled"), false);
+				HttpServer::reply(request, fixture::bytes(destination));
+				return true;
+			}
+			if (request.method == "GET" && request.target.startsWith("/api/v1/sessions/session/outputs?")) {
+				HttpServer::reply(request,
+						  fixture::page(duplicateAttached ? QJsonArray{fixture::output()}
+										  : QJsonArray{}));
+				return true;
+			}
+			if (request.method == "POST" && request.target == "/api/v1/sessions/session/outputs") {
+				// payload сохраняет исходное намерение; receipt остаётся одной записью при повторе того же request_id.
+				const auto payload = QJsonDocument::fromJson(request.body).object();
+				if (receipt.isEmpty())
+					receipt = fixture::receipt(
+						payload.value(QStringLiteral("request_id")).toString(),
+						QStringLiteral("add_output"), QStringLiteral("session"),
+						QStringLiteral("session"), QStringLiteral("created-output"),
+						QStringLiteral("add-command"), QStringLiteral("PENDING"));
+				if (loseFirstResponse && rig.posts().size() == 1) {
+					if (request.socket)
+						request.socket->abort();
+					return true;
+				}
+				// initial отдельно изменяет начальную идентичность, не меняя сохранённую серверную квитанцию.
+				auto initial = receipt;
+				if (violation == QStringLiteral("initial-empty-output"))
+					initial.insert(QStringLiteral("output_id"), QString{});
+				if (violation == QStringLiteral("initial-wrong-target"))
+					initial.insert(QStringLiteral("target_id"), QStringLiteral("created-output"));
+				HttpServer::reply(request, fixture::bytes(initial), 202);
+				return true;
+			}
+			if (request.target == "/api/v1/commands/add-command") {
+				// terminal подтверждает именно эту команду, сохраняя либо намеренно нарушая её точные IDs.
+				auto terminal = receipt;
+				terminal.insert(QStringLiteral("status"), QStringLiteral("SUCCEEDED"));
+				if (violation == QStringLiteral("changed-receipt-output"))
+					terminal.insert(QStringLiteral("output_id"), QStringLiteral("other-output"));
+				HttpServer::reply(request, fixture::bytes(terminal));
+				return true;
+			}
+			if (request.target == "/api/v1/sessions/session/outputs/created-output") {
+				// output содержит публичные снимки и прикреплённость; unavailable runtime не означает публикацию.
+				auto output = fixture::output();
+				output.insert(QStringLiteral("id"), QStringLiteral("created-output"));
+				output.insert(QStringLiteral("runtime"), QJsonValue::Null);
+				output.insert(QStringLiteral("runtime_availability"), QStringLiteral("unavailable"));
+				output.insert(QStringLiteral("runtime_reason"), QStringLiteral("not_observed"));
+				if (violation == QStringLiteral("durable-wrong-session"))
+					output.insert(QStringLiteral("session_id"), QStringLiteral("other-session"));
+				if (violation == QStringLiteral("durable-wrong-destination")) {
+					// destination моделирует чужой сохранённый снимок при совпадающем ID самого Output.
+					auto destination = fixture::destination();
+					destination.insert(QStringLiteral("id"), QStringLiteral("other-destination"));
+					output.insert(QStringLiteral("destination"), destination);
+				}
+				if (violation == QStringLiteral("not-attached"))
+					output.insert(QStringLiteral("attached"), false);
+				if (violation == QStringLiteral("not-desired"))
+					output.insert(QStringLiteral("desired_running"), false);
+				HttpServer::reply(request, fixture::bytes(output));
+				return true;
+			}
+			return false;
+		};
+	}
+	// Снимает перехватчик до уничтожения захваченного this; запросы принадлежат rig.
+	~AddOutputScenario() { rig.intercept = {}; }
+	// Заимствованный сервер и настоящий исполнитель операции.
+	OperationRig &rig;
+	// Один независимо выбранный дефект начальной квитанции или долговечного DTO.
+	QString violation;
+	// Истинное значение моделирует уже прикреплённое назначение до POST.
+	bool duplicateAttached = false;
+	// Первый POST принят, но его HTTP-ответ потерян.
+	bool loseFirstResponse = false;
+	// Единственная серверная квитанция сохраняет идентичность при ручном повторе.
+	QJsonObject receipt;
+};
 } // namespace
 
 // Проверяет команды по независимым серверным квитанциям, состояниям и записанным POST.
@@ -324,7 +417,265 @@ private slots:
 	void fallbackRejectsMissingCompatibility();
 	// Старый контекст и новый исполнитель последовательности не отправляют сохранённые команды автоматически.
 	void contextChangeAndRestartDoNotReplay();
+	// Явное прикрепление выключенного Destination подтверждается квитанцией и публичным снимком без runtime.
+	void explicitAddOutputAcceptsDisabledDestinationWithoutClaimingPublication();
+	// Задаёт нарушения точной идентичности и неполное долговечное состояние AddOutput.
+	void addOutputRequiresExactReceiptAndDurableSnapshot_data();
+	// Ни чужая квитанция, ни другой Output, ни отсутствие attached/desired не объявляются успехом.
+	void addOutputRequiresExactReceiptAndDurableSnapshot();
+	// Дублирующее attached назначение отклоняется до отправки команды.
+	void addOutputRejectsAlreadyAttachedDestination();
+	// Ручной повтор потерянного AddOutput сохраняет Session, Destination, request_id и payload.
+	void lostAddOutputRetryKeepsExactIntent();
+	// Смена Session не переносит явный дедуплицированный повтор старого прикрепления на новый эфир.
+	void addOutputDoesNotMoveToReplacementSession();
+	// Изменение конфигурации отзывает Ready и не допускает запоздалое восстановление старой проверкой.
+	void configurationGenerationInvalidatesCompletedAndInFlightPrechecks();
+	// Обновление пригодности ждёт живую команду и объединяет несколько запросов в одну проверку.
+	void configurationRefreshDefersPrecheckUntilCommandFinishes();
+	// Проверка, начатая во время записи или неизвестного её исхода, не разрешает предварительный запуск.
+	void precheckCannotBecomeReadyWhileConfigurationNeedsConfirmation();
+	// Запись, начатая во время повторного поиска активной Session, отзывает право первого start POST.
+	void configurationWriteDuringSessionCheckPreventsFallbackPost();
 };
+
+void RestreamOperationsTest::explicitAddOutputAcceptsDisabledDestinationWithoutClaimingPublication()
+{
+	// rig/scenario возвращают disabled Destination и отсутствие runtime при сохранённом новом Output.
+	OperationRig rig({500, 5, 20});
+	QVERIFY(rig.initialize());
+	AddOutputScenario scenario(rig);
+	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
+	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Completed);
+	QVERIFY(rig.state.operations().current->stateConfirmed);
+	QCOMPARE(rig.state.operations().current->outputId, QStringLiteral("created-output"));
+	QCOMPARE(rig.posts().size(), 1);
+	QCOMPARE(rig.posts().first().target, QByteArray("/api/v1/sessions/session/outputs"));
+	QCOMPARE(QJsonDocument::fromJson(rig.posts().first().body)
+			 .object()
+			 .value(QStringLiteral("destination_id"))
+			 .toString(),
+		 QStringLiteral("destination"));
+	QCOMPARE(rig.frontend.stopRequests, 0);
+	QVERIFY(!rig.frontend.streaming);
+}
+void RestreamOperationsTest::addOutputRequiresExactReceiptAndDurableSnapshot_data()
+{
+	QTest::addColumn<QString>("violation");
+	// violation меняет один контракт независимо от корректных остальных полей.
+	for (const auto *violation :
+	     {"initial-empty-output", "initial-wrong-target", "changed-receipt-output", "durable-wrong-session",
+	      "durable-wrong-destination", "not-attached", "not-desired"})
+		QTest::newRow(violation) << QString::fromLatin1(violation);
+}
+void RestreamOperationsTest::addOutputRequiresExactReceiptAndDurableSnapshot()
+{
+	// violation задаёт независимое нарушение ID или долговечного attached/desired состояния нового Output.
+	QFETCH(QString, violation);
+	// rig/scenario принимают команду, но не предоставляют доказательство нужного публичного результата.
+	OperationRig rig({180, 5, 20});
+	QVERIFY(rig.initialize());
+	AddOutputScenario scenario(rig);
+	scenario.violation = violation;
+	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1500);
+	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Unknown);
+	QVERIFY(!rig.state.operations().current->stateConfirmed);
+	QCOMPARE(rig.posts().size(), 1);
+}
+void RestreamOperationsTest::addOutputRejectsAlreadyAttachedDestination()
+{
+	// rig/scenario возвращают existing attached Output в полном списке до POST.
+	OperationRig rig;
+	QVERIFY(rig.initialize());
+	AddOutputScenario scenario(rig);
+	scenario.duplicateAttached = true;
+	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Failed);
+	QVERIFY(rig.posts().isEmpty());
+}
+void RestreamOperationsTest::lostAddOutputRetryKeepsExactIntent()
+{
+	// rig/scenario сохраняют принятую квитанцию, но теряют первый HTTP-ответ.
+	OperationRig rig({500, 5, 20});
+	QVERIFY(rig.initialize());
+	AddOutputScenario scenario(rig);
+	scenario.loseFirstResponse = true;
+	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Unknown);
+	QCOMPARE(rig.posts().size(), 1);
+	// original фиксирует реальные байты первого намерения, а не заново собранный ожидаемый payload.
+	const auto original = rig.posts().first();
+	QVERIFY(rig.operations.retryUnknown(rig.context()));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Completed);
+	QCOMPARE(rig.posts().size(), 2);
+	QCOMPARE(rig.posts().last().target, original.target);
+	QCOMPARE(rig.posts().last().body, original.body);
+}
+void RestreamOperationsTest::addOutputDoesNotMoveToReplacementSession()
+{
+	// rig/scenario оставляют потерянное намерение для прежнего session ID.
+	OperationRig rig;
+	QVERIFY(rig.initialize());
+	AddOutputScenario scenario(rig);
+	scenario.loseFirstResponse = true;
+	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	// original содержит точную прежнюю цель и payload потерянного POST, включая request_id.
+	const auto original = rig.posts().first();
+	// replacement публикует следующий эфир того же Stream после неизвестного прежнего результата.
+	auto replacement = rig.state.dockServer();
+	replacement.session = DockSession{QStringLiteral("replacement-session"), QStringLiteral("RUNNING"), false};
+	rig.state.setDockServer(replacement);
+	QCOMPARE(rig.posts().size(), 1);
+	QVERIFY(rig.operations.retryUnknown(rig.context()));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QCOMPARE(rig.posts().size(), 2);
+	QCOMPARE(rig.posts().last().target, original.target);
+	QCOMPARE(rig.posts().last().body, original.body);
+	QVERIFY(!rig.posts().last().target.contains("replacement-session"));
+}
+void RestreamOperationsTest::configurationGenerationInvalidatesCompletedAndInFlightPrechecks()
+{
+	// rig сначала получает Ready, затем начинает новую проверку, удерживая ответ из старой конфигурации.
+	OperationRig rig({500, 5, 20});
+	QVERIFY(rig.initialize(false));
+	QVERIFY(rig.operations.checkFallback(rig.context()));
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.operations().fallback.readiness, FallbackReadiness::Ready, 1000);
+	// oldRevision — показанное пользователю подтверждение, которое теряет пригодность до записи.
+	const auto oldRevision = rig.state.operations().fallback.revision;
+	rig.state.invalidateConfiguration();
+	QVERIFY(rig.state.operations().fallback.readiness != FallbackReadiness::Ready);
+	QVERIFY(!rig.operations.startFallback(rig.context(), oldRevision));
+	// held сохраняет GET fallback-policy, начатый до следующего изменения конфигурационного поколения.
+	std::optional<HttpServer::Request> held;
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.target != "/api/v1/streams/stream/fallback-policy")
+			return false;
+		held = request;
+		return true;
+	};
+	QVERIFY(rig.operations.checkFallback(rig.context()));
+	QTRY_VERIFY_WITH_TIMEOUT(held.has_value(), 1000);
+	rig.state.invalidateConfiguration();
+	rig.intercept = {};
+	rig.respond(*held);
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QVERIFY(rig.state.operations().fallback.readiness != FallbackReadiness::Ready);
+	QVERIFY(rig.posts().isEmpty());
+}
+void RestreamOperationsTest::configurationRefreshDefersPrecheckUntilCommandFinishes()
+{
+	// rig удерживает GET квитанции Pause; deferred precheck не имеет права отменить этот живой шаг.
+	OperationRig rig({800, 5, 20});
+	QVERIFY(rig.initialize());
+	// held удерживает квитанцию Pause; policyReads считает свежие проверки; pauseCompleted фиксирует успех до смены workflow.
+	std::optional<HttpServer::Request> held;
+	int policyReads = 0;
+	bool pauseCompleted = false;
+	// Сигнал фиксирует подтверждённый Pause до того, как единственная модель перейдёт к CheckFallback.
+	connect(&rig.state, &StateStore::operationsChanged, this, [&] {
+		if (rig.state.operations().current &&
+		    rig.state.operations().current->action == OperationAction::Pause &&
+		    rig.state.operations().current->outcome == OperationOutcome::Completed)
+			pauseCompleted = true;
+	});
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.target.startsWith("/api/v1/commands/")) {
+			held = request;
+			return true;
+		}
+		if (request.target == "/api/v1/streams/stream/fallback-policy")
+			++policyReads;
+		return false;
+	};
+	QVERIFY(rig.operations.pause(rig.context(), QStringLiteral("session")));
+	QTRY_VERIFY_WITH_TIMEOUT(held.has_value(), 1000);
+	rig.operations.refreshFallbackAfterConfiguration();
+	rig.operations.refreshFallbackAfterConfiguration();
+	QCOMPARE(policyReads, 0);
+	// terminal завершает уже принятую Pause, сохраняя request/session/command identity.
+	auto terminal = rig.receipts.first();
+	terminal.insert(QStringLiteral("status"), QStringLiteral("SUCCEEDED"));
+	HttpServer::reply(*held, fixture::bytes(terminal));
+	QTRY_VERIFY_WITH_TIMEOUT(pauseCompleted, 1000);
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.operations().fallback.readiness, FallbackReadiness::Ready, 1000);
+	QCOMPARE(policyReads, 1);
+	QCOMPARE(rig.posts().size(), 1);
+}
+
+void RestreamOperationsTest::precheckCannotBecomeReadyWhileConfigurationNeedsConfirmation()
+{
+	// rig задаёт полное отсутствие Session и пригодные серверные fixtures проверки fallback.
+	OperationRig rig({500, 5, 20});
+	QVERIFY(rig.initialize(false));
+	// editor фиксирует текущую конфигурационную запись; её начало предшествует началу precheck.
+	ConfigurationEditorState editor;
+	editor.context = {rig.context().origin, rig.context().profileUuid, rig.context().streamId};
+	editor.kind = ConfigurationKind::Destination;
+	editor.id = QStringLiteral("destination");
+	editor.writing = true;
+	rig.state.setConfigurationEditor(editor);
+	// startedDuringWrite допускает локальный отказ или ограниченную проверку, но никогда Ready.
+	const bool startedDuringWrite = rig.operations.checkFallback(rig.context());
+	if (startedDuringWrite)
+		QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QVERIFY(rig.state.operations().fallback.readiness != FallbackReadiness::Ready);
+	QVERIFY(!rig.operations.startFallback(rig.context(), rig.state.operations().fallback.revision));
+	editor.writing = false;
+	editor.outcome = ConfigurationOutcome::Unknown;
+	editor.reconciliationRequired = true;
+	rig.state.setConfigurationEditor(editor);
+	// startedAfterUnknown проверяет тот же запрет после завершения HTTP с неопределённым исходом.
+	const bool startedAfterUnknown = rig.operations.checkFallback(rig.context());
+	if (startedAfterUnknown)
+		QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QVERIFY(rig.state.operations().fallback.readiness != FallbackReadiness::Ready);
+	QVERIFY(!rig.operations.startFallback(rig.context(), rig.state.operations().fallback.revision));
+	QVERIFY(rig.posts().isEmpty());
+	editor.reconciliationRequired = false;
+	rig.state.setConfigurationEditor(editor);
+	rig.operations.refreshFallbackAfterConfiguration();
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.operations().fallback.readiness, FallbackReadiness::Ready, 1000);
+	QVERIFY(rig.posts().isEmpty());
+}
+
+void RestreamOperationsTest::configurationWriteDuringSessionCheckPreventsFallbackPost()
+{
+	// rig предоставляет Ready до начала неизменяемого намерения предварительного запуска.
+	OperationRig rig({500, 5, 20});
+	QVERIFY(rig.initialize(false));
+	QVERIFY(rig.operations.checkFallback(rig.context()));
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.operations().fallback.readiness, FallbackReadiness::Ready, 1000);
+	// revision фиксирует показанную пригодность; held удерживает последний GET поиска отсутствующей Session.
+	const auto revision = rig.state.operations().fallback.revision;
+	std::optional<HttpServer::Request> held;
+	rig.intercept = [&](const HttpServer::Request &request) {
+		// query проверяет именно финальное STOPPING-чтение без зависимости от порядка заголовков/фильтров.
+		const QUrlQuery query(QUrl::fromEncoded("http://local" + request.target));
+		if (request.target.startsWith("/api/v1/streams/stream/sessions?") &&
+		    query.queryItemValue(QStringLiteral("state")) == QStringLiteral("STOPPING")) {
+			held = request;
+			return true;
+		}
+		return false;
+	};
+	QVERIFY(rig.operations.startFallback(rig.context(), revision));
+	QTRY_VERIFY_WITH_TIMEOUT(held.has_value(), 1000);
+	// editor сообщает о новой записи после admission StartFallback, но до его первого POST.
+	ConfigurationEditorState editor;
+	editor.context = {rig.context().origin, rig.context().profileUuid, rig.context().streamId};
+	editor.writing = true;
+	rig.state.setConfigurationEditor(editor);
+	HttpServer::reply(*held, fixture::page({}));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
+	QVERIFY(rig.state.operations().current->outcome != OperationOutcome::Completed);
+	QVERIFY(rig.posts().isEmpty());
+}
 
 void RestreamOperationsTest::pauseResumeRequireReceiptAndState()
 {

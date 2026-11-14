@@ -20,12 +20,10 @@ std::unique_ptr<gost::PluginLifecycle> lifecycle;
 
 } // namespace
 
+// Создаёт адаптер раньше lifecycle и освобождает их в обратном порядке при отказе.
+// Исключения C++ не пересекают границу загрузчика модулей OBS.
 bool obs_module_load(void)
 {
-	// Модуль создаёт адаптер раньше lifecycle, а при любой ошибке уничтожает в обратном порядке.
-	// Полученные строки копируются в QString. Выделенную OBS память пути освобождает bfree,
-	// чтобы выделение и освобождение выполнялись одним API, без delete/free из модуля плагина.
-	// Исключения из создания объектов C++ не должны пересекать границу загрузчика модулей OBS.
 	try {
 		if (lifecycle) {
 			return true;
@@ -34,9 +32,20 @@ bool obs_module_load(void)
 		// Путь выделяет OBS; QString копирует значение до освобождения через bfree.
 		const std::unique_ptr<char, decltype(&bfree)> settingsPath(obs_module_config_path("settings.json"),
 									   &bfree);
+		// options передаёт Runtime версию, собственный путь настроек и безопасный адаптер журнала.
 		gost::PluginOptions options;
 		options.version = QString::fromUtf8(PLUGIN_VERSION);
 		options.settingsFile = settingsPath ? QString::fromUtf8(settingsPath.get()) : QString{};
+		// Обработчик severity/message направляет готовую безопасную запись в штатный журнал OBS.
+		// Он не устанавливает глобальный Qt-handler и не обращается к содержимому HTTP-запросов.
+		options.logSink = [](gost::LogSeverity severity, const QString &message) {
+			// level переводит закрытую классификацию ядра в уровень OBS, bytes держит UTF-8 до obs_log.
+			const int level = severity == gost::LogSeverity::Error     ? LOG_ERROR
+					  : severity == gost::LogSeverity::Warning ? LOG_WARNING
+										   : LOG_INFO;
+			const auto bytes = message.toUtf8();
+			obs_log(level, "%s", bytes.constData());
+		};
 		lifecycle = std::make_unique<gost::PluginLifecycle>(
 			*frontend, [](const char *key) { return QString::fromUtf8(obs_module_text(key)); },
 			std::move(options));

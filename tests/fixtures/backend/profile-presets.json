@@ -1,0 +1,209 @@
+{
+  "provenance": {
+    "server_origin": "http://192.168.88.8:8080",
+    "route": "/api/v1/transcode-profiles?limit=499",
+    "retrieved_at_utc": "2026-11-14 12:33:48 UTC",
+    "contract_source_commit": "067388bc1e36ac5220e001c72c47220ef0b72173",
+    "complete": true
+  },
+  "items": [
+    {
+      "name": "AV1 1440p60",
+      "source_id": "a5dcaf722eabb3a49e05d8406e4f579c",
+      "source_revision": "4",
+      "profile": {
+        "mode": "copy",
+        "live_audio_mode": "copy",
+        "format": {
+          "video": {
+            "codec": "av1",
+            "width": 2560,
+            "height": 1440,
+            "frame_rate": {
+              "numerator": 60,
+              "denominator": 1
+            },
+            "codec_profile": "main",
+            "level": "",
+            "tier": "",
+            "pixel_format": "yuv420p",
+            "bit_depth": 8,
+            "color": {
+              "range": "limited",
+              "primaries": "bt709",
+              "transfer": "bt709",
+              "matrix": "bt709"
+            }
+          },
+          "audio": {
+            "codec": "aac",
+            "codec_profile": "LC",
+            "sample_rate_hz": 48000,
+            "channels": 2,
+            "channel_layout": "stereo"
+          }
+        },
+        "video_encoding": {
+          "target_bitrate_bps": "10000000",
+          "max_bitrate_bps": "10000000",
+          "buffer_bits": "20000000",
+          "gop_frames": 120,
+          "max_b_frames": 0,
+          "closed_gop": true
+        },
+        "audio_encoding": {
+          "bitrate_bps": "160000"
+        },
+        "encoding": {
+          "version": 2,
+          "video_encoder": "libsvtav1",
+          "audio_encoder": "aac",
+          "rate_control": "cbr",
+          "rescale_output": false,
+          "video_custom": "",
+          "audio_custom": "",
+          "svt_av1": {
+            "preset": 8,
+            "tuning": "psnr",
+            "aq_mode": 2,
+            "lookahead_frames": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "H.264 1440p60",
+      "source_id": "1f056170a68a3a0a8cec83b7c4fbd223",
+      "source_revision": "3",
+      "profile": {
+        "mode": "transcode",
+        "live_audio_mode": "copy",
+        "format": {
+          "video": {
+            "codec": "h264",
+            "width": 2560,
+            "height": 1440,
+            "frame_rate": {
+              "numerator": 60,
+              "denominator": 1
+            },
+            "codec_profile": "high",
+            "level": "",
+            "tier": "",
+            "pixel_format": "yuv420p",
+            "bit_depth": 8,
+            "color": {
+              "range": "limited",
+              "primaries": "bt709",
+              "transfer": "bt709",
+              "matrix": "bt709"
+            }
+          },
+          "audio": {
+            "codec": "aac",
+            "codec_profile": "LC",
+            "sample_rate_hz": 48000,
+            "channels": 2,
+            "channel_layout": "stereo"
+          }
+        },
+        "video_encoding": {
+          "target_bitrate_bps": "12000000",
+          "max_bitrate_bps": "12000000",
+          "buffer_bits": "24000000",
+          "gop_frames": 120,
+          "max_b_frames": 0,
+          "closed_gop": true
+        },
+        "audio_encoding": {
+          "bitrate_bps": "160000"
+        },
+        "encoding": {
+          "version": 2,
+          "video_encoder": "h264_nvenc",
+          "audio_encoder": "aac",
+          "rate_control": "cbr",
+          "rescale_output": true,
+          "video_custom": "",
+          "audio_custom": "",
+          "nvenc": {
+            "preset": "p4",
+            "tuning": "hq",
+            "multipass": "disabled",
+            "lookahead_frames": 0,
+            "enable_spatial_aq": false,
+            "enable_temporal_aq": false,
+            "aq_strength": 8
+          }
+        }
+      }
+    },
+    {
+      "name": "H.264 1080p60",
+      "source_id": "b3f2a84b6ca8a2e5637cea6e06cf0dbe",
+      "source_revision": "3",
+      "profile": {
+        "mode": "transcode",
+        "live_audio_mode": "copy",
+        "format": {
+          "video": {
+            "codec": "h264",
+            "width": 1920,
+            "height": 1080,
+            "frame_rate": {
+              "numerator": 60,
+              "denominator": 1
+            },
+            "codec_profile": "high",
+            "level": "",
+            "tier": "",
+            "pixel_format": "yuv420p",
+            "bit_depth": 8,
+            "color": {
+              "range": "limited",
+              "primaries": "bt709",
+              "transfer": "bt709",
+              "matrix": "bt709"
+            }
+          },
+          "audio": {
+            "codec": "aac",
+            "codec_profile": "LC",
+            "sample_rate_hz": 48000,
+            "channels": 2,
+            "channel_layout": "stereo"
+          }
+        },
+        "video_encoding": {
+          "target_bitrate_bps": "6000000",
+          "max_bitrate_bps": "6000000",
+          "buffer_bits": "12000000",
+          "gop_frames": 120,
+          "max_b_frames": 0,
+          "closed_gop": true
+        },
+        "audio_encoding": {
+          "bitrate_bps": "160000"
+        },
+        "encoding": {
+          "version": 2,
+          "video_encoder": "h264_nvenc",
+          "audio_encoder": "aac",
+          "rate_control": "cbr",
+          "rescale_output": true,
+          "video_custom": "",
+          "audio_custom": "",
+          "nvenc": {
+            "preset": "p4",
+            "tuning": "hq",
+            "multipass": "disabled",
+            "lookahead_frames": 0,
+            "enable_spatial_aq": false,
+            "enable_temporal_aq": false,
+            "aq_strength": 8
+          }
+        }
+      }
+    }
+  ]
+}
