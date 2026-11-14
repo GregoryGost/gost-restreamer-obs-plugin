@@ -142,8 +142,6 @@ public:
 	QString localError_;
 	// endpointValidationAttempted_ сохраняет видимость ошибки адреса до исправления или смены карточки.
 	bool endpointValidationAttempted_ = false;
-	// attachAvailable_ отражает свежую внешнюю проверку точной Session и не заменяет проверки сохранённости карточки и отсутствия изменений.
-	bool attachAvailable_ = false;
 	// list_ содержит только ID и безопасные имена; form_ объединяет поля выбранной карточки.
 	QListWidget *list_ = nullptr;
 	QWidget *form_ = nullptr;
@@ -169,12 +167,11 @@ public:
 	SecretField *secondSecret_ = nullptr;
 	// profileEditor_ редактирует полный рецепт только на странице Profile.
 	ProfileEditor *profileEditor_ = nullptr;
-	// create_, save_, remove_, reload_, attach_ передают явные действия контроллерам через UI-границу.
+	// create_, save_, remove_ и reload_ передают явные действия контроллеру конфигурации.
 	QPushButton *create_ = nullptr;
 	QPushButton *save_ = nullptr;
 	QPushButton *remove_ = nullptr;
 	QPushButton *reload_ = nullptr;
-	QPushButton *attach_ = nullptr;
 	// conflictBox_ и conflictLayout_ содержат локальное сравнение; resolution_ требует явного выбора полного профиля.
 	QGroupBox *conflictBox_ = nullptr;
 	QVBoxLayout *conflictLayout_ = nullptr;
@@ -363,16 +360,6 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 		if (ownsCard())
 			controller_.reload();
 	});
-	if (kind_ == ConfigurationKind::Destination) {
-		attach_ = new QPushButton(text_("Operation.AddOutput"), form_);
-		cardLayout->addWidget(attach_);
-		// Родитель фиксирует точную текущую Session и подтверждает действие отдельно от enabled.
-		QObject::connect(attach_, &QPushButton::clicked, &owner_, [this] {
-			if (attachAvailable_ && ownsEditor() && state_.configurationEditor().dirtyFields.isEmpty() &&
-			    !selectedId_.isEmpty())
-				emit owner_.requestAttachDestination(selectedId_);
-		});
-	}
 	conflictBox_ = new QGroupBox(text_("Editor.Conflict"), form_);
 	conflictLayout_ = new QVBoxLayout(conflictBox_);
 	cardLayout->addWidget(conflictBox_);
@@ -608,16 +595,16 @@ void ConfigurationEditor::Impl::relations()
 		relation(group_, groups, destination->groupId, config.groupsStatus.complete);
 	if (const auto *group = std::get_if<api::Group>(&draft))
 		relation(profile_, profiles, group->profileId, config.profilesStatus.complete);
-	// item показывает связанные группы Stream/Profile по ID; имена выводятся только обычным текстом.
+	// Карточка группы задаёт связи селекторами; обратный список назначений в ней не отображается.
+	if (kind_ == ConfigurationKind::Group) {
+		relationships_->clear();
+		relationships_->hide();
+		return;
+	}
+	// item показывает группы текущего профиля; имена выводятся только обычным текстом.
 	for (const auto &item : config.groups)
-		if ((kind_ == ConfigurationKind::Stream && item.streamId == selectedId_) ||
-		    (kind_ == ConfigurationKind::Profile && item.profileId == selectedId_))
+		if (kind_ == ConfigurationKind::Profile && item.profileId == selectedId_)
 			related.append(text_("Editor.GroupRelation").arg(item.name, item.id));
-	// item показывает назначения Stream/Group; неполные коллекции подписаны отдельно ниже.
-	for (const auto &item : config.destinations)
-		if ((kind_ == ConfigurationKind::Stream && item.streamId == selectedId_) ||
-		    (kind_ == ConfigurationKind::Group && item.groupId == selectedId_))
-			related.append(text_("Editor.DestinationRelation").arg(item.name, item.id));
 	if (!config.groupsStatus.complete || !config.destinationsStatus.complete)
 		related.append(text_("Editor.RelationsIncomplete"));
 	relationships_->setText(related.join(QLatin1Char('\n')));
@@ -836,9 +823,6 @@ void ConfigurationEditor::Impl::refresh()
 			    !editor.serverConflict);
 	reload_->setEnabled(hasCard && !editor.loading && !editor.writing &&
 			    (!editor.creating || editor.reconciliationRequired));
-	if (attach_)
-		attach_->setEnabled(editable && attachAvailable_ && !editor.creating && !editor.id.isEmpty() &&
-				    editor.dirtyFields.isEmpty());
 	conflict();
 	updating_ = false;
 }
@@ -870,7 +854,7 @@ void ConfigurationEditor::Impl::edited(const QString &field)
 		destination->platform = platform_->currentData().toString();
 		destination->streamId = stream_->currentData().toString();
 		destination->groupId = group_->currentData().toString();
-		// endpoint и key содержат отдельные намерения; выключенная замена удаляет поле из PATCH.
+		// endpoint и key содержат явные изменения; отсутствие намерения исключает поле из PATCH.
 		const auto endpoint = firstSecret_->replacement();
 		const auto key = secondSecret_->replacement();
 		if (endpoint) {
@@ -917,8 +901,6 @@ void ConfigurationEditor::Impl::edited(const QString &field)
 	// Доступность действий меняется без populate, сохраняя невалидный текст в форме.
 	save_->setEnabled(!editor.reconciliationRequired && !editor.serverConflict &&
 			  editor.destinationReconciliation.isEmpty());
-	if (attach_)
-		attach_->setEnabled(false);
 	if (editor.serverConflict) {
 		conflictIdentity_.clear();
 		conflict();
@@ -1278,14 +1260,4 @@ QString ConfigurationEditor::selectedDestinationId() const
 		       : QString{};
 }
 
-void ConfigurationEditor::setAttachAvailable(bool available)
-{
-	impl_->attachAvailable_ = available;
-	if (impl_->attach_) {
-		// editor обеспечивает локальные условия карточки независимо от внешней проверки Session.
-		const auto &editor = impl_->state_.configurationEditor();
-		impl_->attach_->setEnabled(available && impl_->ownsEditor() && !editor.creating && !editor.loading &&
-					   !editor.writing && !editor.id.isEmpty() && editor.dirtyFields.isEmpty());
-	}
-}
 } // namespace gost

@@ -106,7 +106,7 @@ private slots:
 	void dockWarnsAboutContinuingObs();
 	// Задаёт терминальные отказы в обеих локализациях без раскрытия серверного сообщения.
 	void commandFailureCodeIsPlainText_data();
-	// Код причины виден в обоих окнах как обычный текст; failure.message нигде не выводится.
+	// Код причины виден в Dock обычным текстом; редактор не показывает runtime-результат или failure.message.
 	void commandFailureCodeIsPlainText();
 	// До первого события StateStore не выдаёт неизвестные наблюдения OBS за полученные значения.
 	void stateStartsUnobserved();
@@ -2151,7 +2151,7 @@ void PluginLifecycleTest::commandFailureCodeIsPlainText()
 	// locale выбирает реальную локализацию; receiptStatus задаёт терминальную квитанцию отказа.
 	QFETCH(QString, locale);
 	QFETCH(QString, receiptStatus);
-	// text задаёт пользовательские подписи; state предоставляет общий результат обоим окнам.
+	// text задаёт пользовательские подписи; state хранит результат команды для Dock.
 	const auto text = localeLookup(locale);
 	gost::StateStore state;
 	// code содержит символы разметки для проверки буквального вывода; message моделирует запрещённый текст сервера.
@@ -2170,19 +2170,16 @@ void PluginLifecycleTest::commandFailureCodeIsPlainText()
 	workflow.receipt = receipt;
 	operations.current = workflow;
 	state.setOperations(operations);
-	// dock/window отображают один общий результат без новых собственных серверных чтений.
+	// dock показывает результат; window содержит только редактирование конфигурации.
 	gost::RestreamDock dock(state, text);
 	gost::ManagementWindow window(state, text);
-	// dockStatus и outputStatus адресуют результаты операций в Dock и на странице выходов.
+	// dockStatus показывает буквальный код отказа в месте управления текущим эфиром.
 	auto *dockStatus = dock.findChild<QLabel *>(QStringLiteral("operationStatus"));
-	auto *outputStatus = window.findChild<QLabel *>(QStringLiteral("outputOperationStatus"));
-	QVERIFY(dockStatus && outputStatus);
+	QVERIFY(dockStatus);
+	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("outputOperationStatus")));
 	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("streamOperationStatus")));
-	// label проверяется как настоящий QWidget, чтобы случайный переход к AutoText не скрыл риск HTML-интерпретации.
-	for (auto *label : {dockStatus, outputStatus}) {
-		QTRY_VERIFY_WITH_TIMEOUT(label->text().contains(text("Operation.FailureCode").arg(code)), 1000);
-		QCOMPARE(label->textFormat(), Qt::PlainText);
-		QVERIFY(label->text().contains(code));
-		QVERIFY(!label->text().contains(message));
-	}
+	QTRY_VERIFY_WITH_TIMEOUT(dockStatus->text().contains(text("Operation.FailureCode").arg(code)), 1000);
+	QCOMPARE(dockStatus->textFormat(), Qt::PlainText);
+	QVERIFY(dockStatus->text().contains(code));
+	QVERIFY(!dockStatus->text().contains(message));
 }

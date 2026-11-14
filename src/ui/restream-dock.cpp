@@ -1390,7 +1390,7 @@ void RestreamDock::outputActions(DockContext context, QString sessionId, QString
 			     fresh(stateStore_.dockServer().outputsStatus.availability);
 	// menu принадлежит стеку GUI и возвращает выбранное намерение, не захватывая индекс строки.
 	QMenu menu(this);
-	// start, stop и restart обозначают три явные команды; detach остаётся в расширенном окне.
+	// start, stop и restart обозначают три явные команды выбранного выхода.
 	auto *start = menu.addAction(text_("Operation.StartOutput"));
 	auto *stop = menu.addAction(text_("Operation.StopOutput"));
 	auto *restart = menu.addAction(text_("Operation.RestartOutput"));

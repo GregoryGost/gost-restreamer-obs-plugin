@@ -18,7 +18,7 @@ class StateStore;
 class StatusLabel;
 class RestreamController;
 
-// Формирует безопасный текст результатов для двух окон; квитанция и состояние площадки не смешиваются.
+// Формирует безопасный текст результатов команд; квитанция и состояние площадки не смешиваются.
 QString formatOperations(const OperationsState &operations, const TextLookup &text);
 
 /**

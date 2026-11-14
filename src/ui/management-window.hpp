@@ -43,7 +43,7 @@ public:
 	ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent = nullptr,
 			 ConnectionController *connection = nullptr, RestreamController *restream = nullptr,
 			 ConfigurationController *configuration = nullptr);
-	// Выбирает выход только при совпадении исходного контекста и Session с нынешним отображением.
+	// Открывает карточку назначения из Dock только для исходного контекста и Session.
 	void selectOutput(const DockContext &context, const QString &sessionId, const QString &outputId);
 
 protected:
@@ -61,25 +61,16 @@ private:
 	void hideSecrets();
 	// Согласует переход row с изменённым черновиком и сохраняет прежний выбор при отказе.
 	void changePage(int row);
-	// Фиксирует Session и назначение до явного подтверждения нового прикрепления.
-	void attachDestination(const QString &destinationId);
 	// Обновляет подписи/доступность/предпочтения, сохраняя пользовательский ввод и раскрытый список.
 	void refresh();
 	// Перестраивает список лишь при изменении состава/выбора; сохраняет неполученный сохранённый ID
 	// как недоступный или неподтверждённый пункт, не меняя постоянную привязку.
 	void refreshStreams();
-	// Обновляет действия и результаты на странице выходов, сохраняя точные ID в itemData.
-	void refreshOperations();
-	// Передаёт действие для выбранного Output, фиксируя цель до подтверждения.
-	void dispatchOutputAction(OperationAction action);
-	// Показывает фиксированные назначения и запускает готовую предварительную проверку без OBS start.
-	void startFallback();
 	// stateStore_ предоставляет состояние GUI-потока, text_ переводит подписи.
 	StateStore &stateStore_;
 	TextLookup text_;
-	// connection_ меняет подключение и привязку Stream; restream_ выполняет только явные команды.
+	// connection_ меняет подключение и привязку рабочего Stream.
 	ConnectionController *connection_ = nullptr;
-	RestreamController *restream_ = nullptr;
 	// configuration_ координирует CRUD независимо от очередей наблюдения и команд.
 	ConfigurationController *configuration_ = nullptr;
 	// streamEditor_ и destinationEditor_ представляют конфигурацию, а не текущие runtime-снимки.
@@ -96,28 +87,6 @@ private:
 	bool navigationChanging_ = false;
 	// navigation_ переключает существующие страницы при переходе из меню дока.
 	QListWidget *navigation_ = nullptr;
-	// selectedStream_ обозначает поток блока заглушки в «Выходах»; destinations_ — назначения проверки.
-	QLabel *selectedStream_ = nullptr;
-	QLabel *destinations_ = nullptr;
-	// fallbackStatus_ показывает предварительную пригодность отдельно от результата запуска.
-	QLabel *fallbackStatus_ = nullptr;
-	// checkFallback_ читает готовность; startFallback_ запускает только серверную Session.
-	QPushButton *checkFallback_ = nullptr;
-	QPushButton *startFallback_ = nullptr;
-	// currentOutputs_ хранит точные ID текущей Session; outputStatus_ разделяет намерение и runtime.
-	QComboBox *currentOutputs_ = nullptr;
-	QLabel *outputStatus_ = nullptr;
-	// displayedOutputContext_ и displayedSessionId_ предотвращают перенос выбора строки в другой эфир.
-	DockContext displayedOutputContext_;
-	QString displayedSessionId_;
-	// outputStart_ запускает выбранный Output; outputStop_ останавливает; outputRestart_ выполняет stop→start.
-	// outputDetach_ подтверждает и передаёт отсоединение, без скрытого повторного присоединения.
-	QPushButton *outputStart_ = nullptr;
-	QPushButton *outputStop_ = nullptr;
-	QPushButton *outputRestart_ = nullptr;
-	QPushButton *outputDetach_ = nullptr;
-	// outputOperation_ показывает общую модель операций на странице выходов.
-	QLabel *outputOperation_ = nullptr;
 	// apiUrl_ содержит черновик адреса; autoConnect_ задаёт автоподключение; reconnect_ — восстановление связи.
 	// sseRejectionRetries_ задаёт существующий лимит отклонённых подписок SSE.
 	QLineEdit *apiUrl_ = nullptr;

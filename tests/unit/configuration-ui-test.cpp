@@ -101,10 +101,12 @@ private slots:
 	void clearingDestinationEndpointShowsLocalFieldError();
 	// Поток показывает только свои назначения, без сводки групп и зависимости от их загрузки.
 	void streamSelectionUsesOwnDestinationNamesWithoutGroupSummary();
-	// Задаёт оба поставляемых языка для проверки распределения действий по страницам.
-	void fallbackControlsBelongToOutputs_data();
-	// Потоки содержат только редактор; проверка заглушки и её результаты доступны в выходах.
-	void fallbackControlsBelongToOutputs();
+	// Задаёт обе локализации для проверки отсутствия управления эфиром в редакторах.
+	void configurationPagesExcludeRuntimeControls_data();
+	// Потоки и выходы содержат только редактирование; команды текущего эфира остаются в Dock.
+	void configurationPagesExcludeRuntimeControls();
+	// Переход из Dock открывает назначение по ID, паркует прежний ввод и отвергает устаревшую цель.
+	void dockDetailsOpenSavedDestinationAndPreserveDraft();
 	// Сервис выбирается закрытым списком, неизвестное значение сохраняется до явного выбора.
 	void platformChoicesPreserveUnknownService();
 	// Карточка отправляет только изменённое имя, сохраняя точные секреты и рабочий Stream.
@@ -121,8 +123,6 @@ private slots:
 	void explicitDiscardAfterProfileChangeAllowsCurrentContext_data();
 	// Подтверждённый отказ от старого ввода не отправляет его и не блокирует текущий UUID.
 	void explicitDiscardAfterProfileChangeAllowsCurrentContext();
-	// Удаление родителя окна во вложенном AddOutput-диалоге не обращается к уничтоженным Widgets и не отправляет POST.
-	void addOutputConfirmationSurvivesParentTeardown();
 	// Чистый Unknown DELETE нельзя обойти кнопкой создания; адресная сверка 404 разрешает новое намерение.
 	void unknownDeleteRequiresReconciliationBeforeReplacingEditor();
 	// EXIT внутри реального подтверждения синхронно удаляет Runtime и окно без поздних вызовов Frontend.
@@ -845,76 +845,120 @@ void ConfigurationUiTest::streamSelectionUsesOwnDestinationNamesWithoutGroupSumm
 	QVERIFY(rig.mutations().isEmpty());
 }
 
-// Проверяет распределение действий по страницам с настоящими русскими и английскими подписями.
-void ConfigurationUiTest::fallbackControlsBelongToOutputs_data()
+// Проверяет отсутствие отложенных действий заглушки при обеих поставляемых локализациях.
+void ConfigurationUiTest::configurationPagesExcludeRuntimeControls_data()
 {
 	QTest::addColumn<QString>("locale");
 	QTest::newRow("ru") << QStringLiteral("ru-RU");
 	QTest::newRow("en") << QStringLiteral("en-US");
 }
 
-// Проверяет отсутствие операций в редакторе потока и показ результатов заглушки только после действия.
-void ConfigurationUiTest::fallbackControlsBelongToOutputs()
+// Страницы конфигурации не дублируют управление эфиром даже при готовом заключении о заглушке.
+void ConfigurationUiTest::configurationPagesExcludeRuntimeControls()
 {
-	// locale определяет поставляемый словарь; rig изолирует контроллеры и HTTP внутри теста.
+	// locale выбирает поставляемые подписи; rig изолирует контроллеры и HTTP внутри workspace.
 	QFETCH(QString, locale);
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
-	// translations и text предоставляют реальные подписи без обращения к пользовательским настройкам.
+	// translations и text предоставляют реальные подписи без пользовательских настроек.
 	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QLatin1Char('/') + locale +
 				       QStringLiteral(".ini"),
 			       QSettings::IniFormat);
 	const auto text = [&translations](const char *key) {
 		return translations.value(QString::fromUtf8(key), QString::fromUtf8(key)).toString();
 	};
-	// window показывает настоящие страницы; pages и navigation позволяют проверить переход между ними.
+	// window содержит настоящие редакторы; pages и navigation переключают разделы единого окна.
 	ManagementWindow window(rig.state, text, nullptr, &rig.connection, &rig.operations, &rig.configuration);
 	auto *pages = window.findChild<QStackedWidget *>(QStringLiteral("managementPages"));
 	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
-	// controls, check и start адресуют блок операций заглушки, принадлежащий странице выходов.
-	auto *controls = window.findChild<QGroupBox *>(QStringLiteral("outputFallbackControls"));
-	auto *check = window.findChild<QPushButton *>(QStringLiteral("fallbackCheckButton"));
-	auto *start = window.findChild<QPushButton *>(QStringLiteral("fallbackStartButton"));
-	// status и destinations должны появляться только для результатов проверки текущего контекста.
-	auto *status = window.findChild<QLabel *>(QStringLiteral("fallbackPrecheckStatus"));
-	auto *destinations = window.findChild<QLabel *>(QStringLiteral("fallbackDestinations"));
-	QVERIFY(pages && navigation && controls && check && start && status && destinations);
+	QVERIFY(pages && navigation);
 	window.show();
-	QTRY_COMPARE_WITH_TIMEOUT(pages->currentIndex(), 0, 1000);
+	QTRY_VERIFY_WITH_TIMEOUT(
+		rig.state.configurationEditor().draft.has_value() && !rig.state.configurationEditor().loading, 1000);
 	QVERIFY(pages->widget(0)->findChild<ConfigurationEditor *>());
-	QVERIFY(!pages->widget(0)->isAncestorOf(controls));
-	QVERIFY(!check->isVisible() && !start->isVisible());
-	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("streamOperationStatus")));
-	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("fallbackRebuildWarning")));
 	navigation->setCurrentRow(1);
 	QTRY_COMPARE_WITH_TIMEOUT(pages->currentIndex(), 1, 1000);
-	QVERIFY(pages->widget(1)->isAncestorOf(controls));
-	QVERIFY(check->isVisible() && start->isVisible());
-	QCOMPARE(controls->title(), text("Fallback.OutputsHeading"));
-	QVERIFY(status->isHidden() && destinations->isHidden());
-	QVERIFY(!start->isEnabled());
-	// operations моделирует явную проверку без серверной команды или запуска настоящего эфира.
+	QVERIFY(pages->widget(1)->findChild<ConfigurationEditor *>());
+	QVERIFY(!window.findChild<QGroupBox *>(QStringLiteral("outputFallbackControls")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("fallbackCheckButton")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("fallbackStartButton")));
+	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("fallbackPrecheckStatus")));
+	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("fallbackDestinations")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("outputDetachButton")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("outputStartButton")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("outputStopButton")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("outputRestartButton")));
+	QVERIFY(!window.findChild<QComboBox *>(QStringLiteral("currentOutputs")));
+	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("selectedOutputStatus")));
+	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("outputOperationStatus")));
+	// button проверяет отсутствие отдельного прикрепления и в дочерних карточках.
+	for (const auto *button : window.findChildren<QPushButton *>())
+		QVERIFY(button->text() != text("Operation.AddOutput"));
+	// operations моделирует уже полученное заключение без команды запуска и реального эфира.
 	auto operations = rig.state.operations();
 	operations.fallback.context = rig.state.dockContext();
-	operations.fallback.readiness = FallbackReadiness::Checking;
-	rig.state.setOperations(operations);
-	QVERIFY(status->isVisible());
-	QCOMPARE(status->text(), text("Fallback.Checking"));
-	operations.fallback.readiness = FallbackReadiness::Unavailable;
-	operations.fallback.messageKey = QStringLiteral("Fallback.NoPolicy");
-	rig.state.setOperations(operations);
-	QVERIFY(status->isVisible());
-	QVERIFY(status->text().contains(text("Fallback.NoPolicy")));
 	operations.fallback.readiness = FallbackReadiness::Ready;
-	operations.fallback.messageKey.clear();
 	operations.fallback.destinations = {{QStringLiteral("destination"), QStringLiteral("YouTube")}};
 	rig.state.setOperations(operations);
-	QVERIFY(destinations->isVisible());
-	QVERIFY(destinations->text().contains(QStringLiteral("YouTube")));
-	operations.fallback.context.streamId = QStringLiteral("other-stream");
-	rig.state.setOperations(operations);
-	QVERIFY(status->isHidden() && destinations->isHidden());
-	QVERIFY(!start->isEnabled());
+	QVERIFY(!window.findChild<QGroupBox *>(QStringLiteral("outputFallbackControls")));
+	QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("fallbackStartButton")));
+	QVERIFY(rig.mutations().isEmpty());
+}
+
+// Переходит от несохранённой группы к назначению из Dock без команд текущему эфиру.
+void ConfigurationUiTest::dockDetailsOpenSavedDestinationAndPreserveDraft()
+{
+	// rig предоставляет рабочий контекст и серверные карточки только внутри теста.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	QVERIFY(rig.configuration.open(ConfigurationKind::Group, QStringLiteral("group")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// draft хранит прежний ввод группы, который переход к выходу не должен терять.
+	auto draft = std::get<Group>(*rig.state.configurationEditor().draft);
+	draft.name = QStringLiteral("Unsaved group name");
+	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("name")}));
+	// metadata связывает точный Output текущего эфира с сохранённым назначением.
+	DockServerState metadata;
+	metadata.session = DockSession{QStringLiteral("session"), QStringLiteral("RUNNING"), false};
+	metadata.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputs.insert(QStringLiteral("output"),
+				{QStringLiteral("Output snapshot"), true, true, QStringLiteral("destination")});
+	rig.state.setDockServer(metadata);
+	// window начинает с открытой группы; pages и navigation отражают переход между существующими редакторами.
+	ManagementWindow window(rig.state, translatedKey, nullptr, &rig.connection, &rig.operations,
+				&rig.configuration);
+	auto *pages = window.findChild<QStackedWidget *>(QStringLiteral("managementPages"));
+	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
+	QVERIFY(pages && navigation);
+	window.show();
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading, 1000);
+	QCOMPARE(pages->currentIndex(), 2);
+	window.selectOutput(rig.state.dockContext(), QStringLiteral("session"), QStringLiteral("output"));
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading &&
+					 rig.state.configurationEditor().id == QStringLiteral("destination"),
+				 1000);
+	QCOMPARE(pages->currentIndex(), 1);
+	// destinationEditor и name подтверждают видимую карточку, а не только значение в контроллере.
+	auto *destinationEditor = pages->widget(1)->findChild<ConfigurationEditor *>();
+	QVERIFY(destinationEditor);
+	auto *name = destinationEditor->findChild<QLineEdit *>(QStringLiteral("configurationName"));
+	QVERIFY(name && name->isVisible());
+	QCOMPARE(destinationEditor->selectedDestinationId(), QStringLiteral("destination"));
+	QCOMPARE(name->text(), rig.destination.value(QStringLiteral("name")).toString());
+	navigation->setCurrentRow(2);
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().kind, ConfigurationKind::Group, 1000);
+	QCOMPARE(std::get<Group>(*rig.state.configurationEditor().draft).name, draft.name);
+	window.selectOutput(rig.state.dockContext(), QStringLiteral("previous-session"), QStringLiteral("output"));
+	QCOMPARE(pages->currentIndex(), 2);
+	QCOMPARE(std::get<Group>(*rig.state.configurationEditor().draft).name, draft.name);
+	// staleContext моделирует ссылку Dock, полученную до смены рабочего потока.
+	auto staleContext = rig.state.dockContext();
+	staleContext.streamId = QStringLiteral("other-stream");
+	window.selectOutput(staleContext, QStringLiteral("session"), QStringLiteral("output"));
+	QCOMPARE(pages->currentIndex(), 2);
+	QCOMPARE(rig.state.dockServer().session->id, QStringLiteral("session"));
+	QVERIFY(rig.state.dockServer().outputs.value(QStringLiteral("output")).attached);
 	QVERIFY(rig.mutations().isEmpty());
 }
 
@@ -948,6 +992,14 @@ void ConfigurationUiTest::destinationCardSavesNameWithoutReplacingSecrets()
 	// rig/page предоставляют настоящую карточку Destination поверх независимого configuration API.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
+	// metadata моделирует работающий эфир: сохранение карточки не должно посылать ему start/stop/add-output.
+	DockServerState metadata;
+	metadata.session = DockSession{QStringLiteral("session"), QStringLiteral("RUNNING"), false};
+	metadata.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.outputs.insert(QStringLiteral("output"),
+				{QStringLiteral("Running output"), true, true, QStringLiteral("destination")});
+	rig.state.setDockServer(metadata);
 	ConfigurationEditor page(rig.state, rig.configuration, translatedKey, ConfigurationKind::Destination);
 	page.activate();
 	QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
@@ -1146,50 +1198,6 @@ void ConfigurationUiTest::explicitDiscardAfterProfileChangeAllowsCurrentContext(
 	}
 	QCOMPARE(rig.state.configurationEditor().context.profileUuid, QStringLiteral("current-profile"));
 	QVERIFY(rig.state.configurationEditor().dirtyFields.isEmpty());
-	QVERIFY(rig.mutations().isEmpty());
-}
-
-void ConfigurationUiTest::addOutputConfirmationSurvivesParentTeardown()
-{
-	// rig подтверждает исходную RUNNING Session и доступное назначение без реального OBS/backend.
-	ConfigurationRig rig;
-	QVERIFY(rig.initialize());
-	// metadata и config содержат независимо подтверждённые условия открытия AddOutput-диалога.
-	DockServerState metadata;
-	metadata.session = DockSession{QStringLiteral("session"), QStringLiteral("RUNNING"), false};
-	metadata.sessionStatus = {RuntimeAvailability::Fresh, true, {}};
-	metadata.outputsStatus = {RuntimeAvailability::Fresh, true, {}};
-	rig.state.setDockServer(metadata);
-	auto config = rig.state.configuration();
-	config.destinations.insert(QStringLiteral("destination"),
-				   *decode<Destination>(fixture::bytes(fixture::destination())).value);
-	rig.state.setConfiguration(config);
-	// host владеет окном, window наблюдает его уничтожение, destinationPage адресует страницу назначения.
-	auto host = std::make_unique<QWidget>();
-	QPointer<ManagementWindow> window = new ManagementWindow(rig.state, translatedKey, host.get(), &rig.connection,
-								 &rig.operations, &rig.configuration);
-	ConfigurationEditor *destinationPage = nullptr;
-	// editor проходит внутренние страницы; селектор configurationGroup отличает карточку Destination.
-	for (auto *editor : window->findChildren<ConfigurationEditor *>())
-		if (editor->findChild<QComboBox *>(QStringLiteral("configurationGroup")))
-			destinationPage = editor;
-	QVERIFY(destinationPage);
-	// destroyedInsideConfirmation подтверждает teardown именно внутри exec, а не до открытия диалога.
-	bool destroyedInsideConfirmation = false;
-	// teardown живёт до конца сценария и отменяет callback при раннем отказе до открытия диалога.
-	QTimer teardown;
-	teardown.setSingleShot(true);
-	connect(&teardown, &QTimer::timeout, &teardown, [&] {
-		if (window && window->findChild<QMessageBox *>()) {
-			destroyedInsideConfirmation = true;
-			host.reset();
-		}
-	});
-	teardown.start(0);
-	QVERIFY(QMetaObject::invokeMethod(destinationPage, "requestAttachDestination",
-					  Q_ARG(QString, QStringLiteral("destination"))));
-	QVERIFY(destroyedInsideConfirmation);
-	QVERIFY(window.isNull());
 	QVERIFY(rig.mutations().isEmpty());
 }
 

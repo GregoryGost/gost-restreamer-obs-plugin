@@ -25,11 +25,7 @@ public:
 	void hideSecrets();
 	// Возвращает точный ID просматриваемого Destination, не ID рабочего Stream.
 	QString selectedDestinationId() const;
-	// Ограничивает прикрепление внешней проверкой текущей Session; сохранённость карточки проверяется отдельно.
-	void setAttachAvailable(bool available);
 signals:
-	// Передаёт точный ID назначения; родитель фиксирует Session и подтверждает прикрепление.
-	void requestAttachDestination(QString destinationId);
 	// Сообщает об изменении просматриваемой сущности, не меняя рабочую привязку OBS.
 	void selectionChanged();
 

@@ -377,10 +377,6 @@ private slots:
 	void lostStartRetryAfterSessionAppears();
 	// Противоречащая автопубликации команда 409 не порождает новый start или ложный собственный успех.
 	void conflictingStartDoesNotCreateAnotherIntent();
-	// Подтверждённая строка адресуется её исходным ID, а смена Session во время диалога отвергает действие.
-	void outputConfirmationKeepsIdentity_data();
-	// Выполняет смену строки или Session внутри модального подтверждения.
-	void outputConfirmationKeepsIdentity();
 	// Закрытие ManagementWindow не уничтожает общее ожидание принятой команды.
 	void closingManagementDoesNotCancelCommand();
 	// RETRYING с desired=true не считается остановленным; фиксированный пакет не расширяется новыми строками.
@@ -1170,69 +1166,6 @@ void RestreamOperationsTest::conflictingStartDoesNotCreateAnotherIntent()
 	QCOMPARE(rig.posts().size(), 1);
 }
 
-void RestreamOperationsTest::outputConfirmationKeepsIdentity_data()
-{
-	QTest::addColumn<bool>("changeSession");
-	QTest::newRow("selection-reused") << false;
-	QTest::newRow("session-changed") << true;
-}
-
-void RestreamOperationsTest::outputConfirmationKeepsIdentity()
-{
-	// changeSession выбирает смену Session вместо простого перевыбора строки внутри подтверждения.
-	QFETCH(bool, changeSession);
-	// rig предоставляет два настоящих Output с разными идентификаторами; window получает общий фасад.
-	OperationRig rig;
-	QVERIFY(rig.initialize());
-	// window отображает общий результат; переводчик возвращает ключ, позволяя проверять маршрутизацию без локализации.
-	ManagementWindow window(
-		rig.state, [](const char *key) { return QString::fromUtf8(key); }, nullptr, &rig.connection,
-		&rig.operations);
-	window.selectOutput(rig.context(), QStringLiteral("session"), QStringLiteral("two"));
-	window.show();
-	// button — явный restart выбранной второй строки, который открывает модальное подтверждение.
-	auto *button = window.findChild<QPushButton *>(QStringLiteral("outputRestartButton"));
-	QVERIFY(button);
-	QVERIFY(button->isEnabled());
-	// affirmativeClicked подтверждает реальное нажатие стандартной кнопки Yes, а не простое закрытие диалога.
-	bool affirmativeClicked = false;
-	// Диалог запускает вложенный цикл событий; callback меняет цель UI и подтверждает исходный вопрос.
-	QTimer::singleShot(0, &window, [&] {
-		if (changeSession) {
-			// metadata относится уже к следующему эфиру, хотя Output IDs могут совпадать.
-			auto metadata = rig.state.dockServer();
-			metadata.session =
-				DockSession{QStringLiteral("next-session"), QStringLiteral("RUNNING"), false};
-			rig.state.setDockServer(metadata);
-		} else {
-			window.selectOutput(rig.context(), QStringLiteral("session"), QStringLiteral("one"));
-		}
-		// widget проходит только окна отдельного тестового QApplication; box — открытое подтверждение.
-		for (auto *widget : QApplication::topLevelWidgets()) {
-			if (auto *box = qobject_cast<QMessageBox *>(widget)) {
-				// yes адресует настоящую стандартную кнопку подтверждения, которую использует question().
-				auto *yes = box->button(QMessageBox::Yes);
-				if (yes && yes->isEnabled()) {
-					affirmativeClicked = true;
-					yes->click();
-				} else {
-					box->reject();
-				}
-			}
-		}
-	});
-	button->click();
-	QVERIFY(affirmativeClicked);
-	if (changeSession) {
-		QCOMPARE(rig.posts().size(), 0);
-	} else {
-		QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
-		QCOMPARE(rig.posts().size(), 2);
-		QCOMPARE(rig.posts()[0].target, QByteArray("/api/v1/sessions/session/outputs/two/stop"));
-		QCOMPARE(rig.posts()[1].target, QByteArray("/api/v1/sessions/session/outputs/two/start"));
-	}
-}
-
 void RestreamOperationsTest::closingManagementDoesNotCancelCommand()
 {
 	// rig удерживает GET принятой квитанции до закрытия окна.
@@ -1246,7 +1179,7 @@ void RestreamOperationsTest::closingManagementDoesNotCancelCommand()
 		held = request;
 		return true;
 	};
-	// window отображает общий результат; переводчик возвращает ключ, позволяя проверять маршрутизацию без локализации.
+	// window закрывается во время ожидания команды; переводчик возвращает ключи без зависимости от локализации.
 	ManagementWindow window(
 		rig.state, [](const char *key) { return QString::fromUtf8(key); }, nullptr, &rig.connection,
 		&rig.operations);
