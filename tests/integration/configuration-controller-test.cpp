@@ -90,6 +90,10 @@ private slots:
 	void failedMutationsKeepIntentAndRequireReconciliation_data();
 	// Никакой неоднозначный исход не повторяется автоматически; сверка не превращает его в успех.
 	void failedMutationsKeepIntentAndRequireReconciliation();
+	// Задаёт позднее изменение, удаление и создание после неопределённого результата CRUD.
+	void unknownReconciliationRejectsLateDockCatalog_data();
+	// Настоящая сверка отзывает старый каталог; новое чтение не ждёт медленный fallback.
+	void unknownReconciliationRejectsLateDockCatalog();
 	// Задаёт потерю ответа и непроверенный успешный ответ создания без известного ID новой записи.
 	void unknownCreateRequiresCompleteCollectionReconciliation_data();
 	// Полный список разрешает лишь новое явное намерение; неполный список и сверка не доказывают прежний успех.
@@ -102,6 +106,8 @@ private slots:
 	void independentCollectionsKeepEachOthersResults();
 	// Серверные пути body.field привязываются к форме без вывода секретного value.
 	void fieldValidationMapsKnownBodyLocations();
+	// Локальный CBR-отказ сохраняет точную причину, вложенный путь и исходный максимум до явного исправления.
+	void cbrBitrateMismatchPreservesReasonAndDraftBeforeHttp();
 	// Сбои наблюдателя и завершение command-канала не отменяют принятый CRUD.
 	void configurationWriteSurvivesOtherChannelCancellation();
 	// Полная замена после конфликта не удаляет свежие explicit audio/encoding server-поля.
@@ -288,6 +294,192 @@ void ConfigurationControllerTest::failedMutationsKeepIntentAndRequireReconciliat
 		QCOMPARE(rig.mutations().size(), 1);
 	}
 }
+// Различает адресные GET 200/404 и полный список после создания с неизвестным новым ID.
+void ConfigurationControllerTest::unknownReconciliationRejectsLateDockCatalog_data()
+{
+	QTest::addColumn<bool>("removed");
+	QTest::addColumn<bool>("creating");
+	QTest::newRow("patch-observed-after-unknown") << false << false;
+	QTest::newRow("delete-confirmed-by-404") << true << false;
+	QTest::newRow("create-confirmed-by-complete-collection") << false << true;
+}
+
+// GET каталога, начатый после Unknown, но до завершения сверки, не подтверждает прежний состав.
+// Синхронное наблюдение обнаруживает даже краткую публикацию старой версии перед новым GET.
+void ConfigurationControllerTest::unknownReconciliationRejectsLateDockCatalog()
+{
+	// removed выбирает подтверждённое удаление, creating — создание с неизвестным клиенту новым ID.
+	QFETCH(bool, removed);
+	QFETCH(bool, creating);
+	// rig предоставляет реальные независимые контроллеры и локальный HTTP без внешних систем.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	// catalogReads и detailReads фиксируют реальное получение GET, а lateCatalog удерживает старый каталог.
+	int catalogReads = 0;
+	int detailReads = 0;
+	// collectionReads отличает полную сверку неизвестного создания от адресных запросов.
+	int collectionReads = 0;
+	HttpServer::Request lateCatalog;
+	// lateCatalogBody сохраняет серверный снимок до задержанной записи, slowFallback оставляет Dock batch открытым.
+	QByteArray lateCatalogBody;
+	HttpServer::Request slowFallback;
+	// holdCatalog включает удержание после исходного чтения; committed моделирует позднее применение CRUD на сервере.
+	bool holdCatalog = false;
+	bool committed = false;
+	// createdDestination существует на сервере лишь после задержанного POST и получает новый непрозрачный ID.
+	auto createdDestination = fixture::destination();
+	createdDestination.insert(QStringLiteral("id"), QStringLiteral("new-destination"));
+	createdDestination.insert(QStringLiteral("name"), QStringLiteral("После сверки"));
+	createdDestination.insert(QStringLiteral("enabled"), false);
+	// Перехватчик request обслуживает handshake, потерянный результат CRUD и независимые границы двух GET.
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.method == "PATCH" || request.method == "DELETE" || request.method == "POST") {
+			HttpServer::reply(request, "{}", 503);
+			return true;
+		}
+		if (request.target.startsWith("/api/v1/health/ready"))
+			HttpServer::reply(request, R"({"status":"ready","reason":""})");
+		else if (request.target.startsWith("/api/v1/system/capabilities"))
+			HttpServer::reply(request, fixture::capabilities());
+		else if (request.target.startsWith("/api/v1/events/snapshot"))
+			HttpServer::reply(request, R"({"cursor":"catalog-anchor","sessions":[],"gpu":null})");
+		else if (request.target.startsWith("/api/v1/events?"))
+			HttpServer::stream(request, ": heartbeat\n\n");
+		else if (request.target.startsWith("/api/v1/streams/stream/destinations")) {
+			++catalogReads;
+			if (holdCatalog && !lateCatalog.socket) {
+				lateCatalog = request;
+				lateCatalogBody = fixture::page({rig.destination});
+			} else {
+				HttpServer::reply(
+					request, fixture::page(committed && removed ? QJsonArray{}
+							       : committed && creating
+								       ? QJsonArray{rig.destination, createdDestination}
+								       : QJsonArray{rig.destination}));
+			}
+		} else if (request.target.startsWith("/api/v1/destinations?")) {
+			++collectionReads;
+			HttpServer::reply(request, fixture::page(committed && creating ? QJsonArray{rig.destination,
+												    createdDestination}
+										       : QJsonArray{rig.destination}));
+		} else if (request.target == "/api/v1/destinations/destination") {
+			++detailReads;
+			if (committed && removed)
+				HttpServer::reply(request, "{}", 404);
+			else
+				HttpServer::reply(request, fixture::bytes(rig.destination));
+		} else if (request.target.startsWith("/api/v1/streams/stream/fallback-policy"))
+			slowFallback = request;
+		else
+			return false;
+		return true;
+	};
+	// descriptor подтверждает отдельный профиль OBS, затем settings сохраняет Stream для его настоящего UUID.
+	const ProfileDescriptor descriptor{QStringLiteral("Catalog"),
+					   QStringLiteral("profiles/Catalog"),
+					   {QStringLiteral("Catalog")},
+					   true};
+	rig.connection.observeProfile(FrontendEvent::FinishedLoading, descriptor);
+	QVERIFY(rig.settings.setSelectedStream(rig.server.origin().toString(), rig.settings.profileUuid(),
+					       QStringLiteral("stream")));
+	rig.connection.connectToServer(rig.server.origin().toString());
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.connectionStatus() == ConnectionStatus::Connected &&
+					 rig.state.dockServer().destinationsStatus.complete &&
+					 rig.state.dockServer().sessionStatus.complete && slowFallback.socket,
+				 3000);
+	QCOMPARE(catalogReads, 1);
+	QCOMPARE(rig.state.dockServer().destinations.value(QStringLiteral("destination")).name,
+		 QStringLiteral("Назначение"));
+	if (creating) {
+		QVERIFY(rig.configuration.beginCreate(ConfigurationKind::Destination));
+	} else {
+		QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
+		QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 2000);
+	}
+	QCOMPARE(detailReads, creating ? 0 : 1);
+	// draft хранит явное новое имя; для создания пользователь заполняет также обязательные поля назначения.
+	auto draft = std::get<Destination>(*rig.state.configurationEditor().draft);
+	draft.name = QStringLiteral("После сверки");
+	if (creating) {
+		draft.groupId = QStringLiteral("group");
+		draft.platform = QStringLiteral("custom");
+		draft.endpoint = {FieldState::Value, fixture::endpoint()};
+		draft.streamKey = {FieldState::Value, QStringLiteral("explicit-test-key")};
+	}
+	holdCatalog = true;
+	if (removed) {
+		QVERIFY(rig.configuration.remove());
+	} else {
+		QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("name")}));
+		QVERIFY(rig.configuration.save());
+	}
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown, 2000);
+	QVERIFY(rig.state.configurationEditor().reconciliationRequired);
+	QTRY_VERIFY_WITH_TIMEOUT(lateCatalog.socket, 2000);
+	QCOMPARE(catalogReads, 2);
+	QVERIFY(!rig.configuration.save());
+	committed = true;
+	if (!removed && !creating) {
+		rig.destination.insert(QStringLiteral("revision"), QStringLiteral("2"));
+		rig.destination.insert(QStringLiteral("name"), draft.name);
+	}
+	// publishedOld отмечает запрещённое подтверждение прежнего состава после начала сверки.
+	bool publishedOld = false;
+	// catalogObserver отключает callback до уничтожения захваченных локальных значений и зависимостей rig.
+	QObject catalogObserver;
+	// Обработчик проверяет содержимое каждой свежей публикации, включая промежуточные результаты старого GET.
+	connect(&rig.state, &StateStore::serverStateChanged, &catalogObserver, [&] {
+		publishedOld |=
+			rig.state.dockServer().destinationsStatus.availability == RuntimeAvailability::Fresh &&
+			(creating ? !rig.state.dockServer().destinations.contains(QStringLiteral("new-destination"))
+				  : rig.state.dockServer().destinations.value(QStringLiteral("destination")).name ==
+					    QStringLiteral("Назначение"));
+	});
+	QVERIFY(rig.configuration.reload());
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading &&
+					 !rig.state.configurationEditor().reconciliationRequired,
+				 2000);
+	QCOMPARE(detailReads, creating ? 0 : 2);
+	QCOMPARE(collectionReads, creating ? 1 : 0);
+	if (creating) {
+		QVERIFY(rig.state.configurationEditor().id.isEmpty());
+		QVERIFY(rig.state.configuration().destinationsStatus.complete);
+		QCOMPARE(rig.state.configuration().destinations.value(QStringLiteral("new-destination")).name,
+			 draft.name);
+	}
+	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown);
+	QVERIFY(rig.state.dockServer().destinationsStatus.availability != RuntimeAvailability::Fresh);
+	holdCatalog = false;
+	HttpServer::reply(lateCatalog, lateCatalogBody);
+	QTRY_VERIFY_WITH_TIMEOUT(catalogReads >= 3 &&
+					 rig.state.dockServer().destinationsStatus.availability ==
+						 RuntimeAvailability::Fresh &&
+					 rig.state.dockServer().destinationsStatus.complete,
+				 3000);
+	QVERIFY(!publishedOld);
+	QCOMPARE(catalogReads, 3);
+	QCOMPARE(rig.state.dockServer().destinations.size(), removed ? 0 : creating ? 2 : 1);
+	if (!removed)
+		QCOMPARE(rig.state.dockServer()
+				 .destinations
+				 .value(creating ? QStringLiteral("new-destination") : QStringLiteral("destination"))
+				 .name,
+			 draft.name);
+	if (creating)
+		QCOMPARE(rig.state.dockServer().destinations.value(QStringLiteral("destination")).name,
+			 QStringLiteral("Назначение"));
+	QVERIFY(slowFallback.socket);
+	QVERIFY(rig.state.dockServer().fallback.availability != RuntimeAvailability::Fresh);
+	QCOMPARE(rig.mutations().size(), 1);
+	QCOMPARE(rig.mutations().front().method, removed    ? QByteArray("DELETE")
+						 : creating ? QByteArray("POST")
+							    : QByteArray("PATCH"));
+	QCOMPARE(rig.mutations().front().target,
+		 removed    ? QByteArray("/api/v1/destinations/destination?expected_revision=1")
+		 : creating ? QByteArray("/api/v1/destinations")
+			    : QByteArray("/api/v1/destinations/destination"));
+}
+
 void ConfigurationControllerTest::unknownCreateRequiresCompleteCollectionReconciliation_data()
 {
 	QTest::addColumn<bool>("responseLost");
@@ -444,17 +636,20 @@ void ConfigurationControllerTest::independentCollectionsKeepEachOthersResults()
 	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configuration().groups.contains(QStringLiteral("group")), 1000);
 	QVERIFY(rig.state.configuration().profiles.contains(QStringLiteral("profile")));
 }
+// Проверяет раздельное хранение серверной причины и недоверенного value без подмены причины ключом перевода.
 void ConfigurationControllerTest::fieldValidationMapsKnownBodyLocations()
 {
 	// rig возвращает стандартный Huma location body.name и потенциально секретное value.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
+	// Перехватчик request отклоняет PATCH, сохраняя чтение карточки в обычной петлевой фикстуре.
 	rig.intercept = [](const HttpServer::Request &request) {
 		if (request.method != "PATCH")
 			return false;
 		HttpServer::reply(
 			request,
-			R"({"status":422,"title":"Validation","errors":[{"location":"body.name","message":"Required","value":"synthetic-secret"}]})",
+			R"({"status":422,"title":"Validation","errors":[{"location":"body.name","message":"Required",)"
+			R"("value":"synthetic-secret","messageKey":"Configuration.Saved"}]})",
 			422, "application/problem+json");
 		return true;
 	};
@@ -467,11 +662,66 @@ void ConfigurationControllerTest::fieldValidationMapsKnownBodyLocations()
 	QVERIFY(rig.configuration.save());
 	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 1000);
 	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected);
-	QVERIFY(!rig.state.configurationEditor().fieldIssues.isEmpty());
-	QVERIFY(!rig.state.configurationEditor()
-			 .fieldIssues.values()
-			 .join(QLatin1Char(' '))
-			 .contains(QStringLiteral("synthetic-secret")));
+	QCOMPARE(rig.state.configurationEditor().fieldIssues.size(), 1);
+	QVERIFY(rig.state.configurationEditor().fieldIssues.contains(QStringLiteral("name")));
+	// issue содержит только доверенный локальный ключ либо обычную серверную причину, без отдельного value.
+	const auto issue = rig.state.configurationEditor().fieldIssues.value(QStringLiteral("name"));
+	QVERIFY(issue.messageKey.isEmpty());
+	QCOMPARE(issue.detail, QStringLiteral("Required"));
+	QVERIFY(!issue.detail.contains(QStringLiteral("synthetic-secret")));
+}
+
+// Меняет лишь основной битрейт современного CBR-профиля; отказ не отправляет HTTP и не исправляет максимум.
+void ConfigurationControllerTest::cbrBitrateMismatchPreservesReasonAndDraftBeforeHttp()
+{
+	// rig предоставляет независимый серверный профиль с согласованными CBR-битрейтами 12 Мбит/с.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	// profile и encoding задают полный современный рецепт, video содержит серверные битрейты до редактирования.
+	auto profile = fixture::groupProfile();
+	auto encoding = fixture::encoding();
+	encoding.insert(QStringLiteral("rate_control"), QStringLiteral("cbr"));
+	profile.insert(QStringLiteral("encoding"), encoding);
+	profile.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
+	auto video = profile.value(QStringLiteral("video_encoding")).toObject();
+	video.insert(QStringLiteral("target_bitrate_bps"), QStringLiteral("12000000"));
+	video.insert(QStringLiteral("max_bitrate_bps"), QStringLiteral("12000000"));
+	profile.insert(QStringLiteral("video_encoding"), video);
+	rig.profile.insert(QStringLiteral("profile"), profile);
+	QVERIFY(rig.configuration.open(ConfigurationKind::Profile, QStringLiteral("profile")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// draft отличается только основным битрейтом: скрытый максимум остаётся пользовательским значением.
+	auto draft = std::get<Profile>(*rig.state.configurationEditor().draft);
+	draft.profile.videoEncoding.targetBitrateBps = 10000000;
+	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("profile")}));
+	QVERIFY(!rig.configuration.save());
+	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected);
+	QVERIFY(!rig.state.configurationEditor().reconciliationRequired);
+	QVERIFY(!rig.state.configurationEditor().writing);
+	QCOMPARE(rig.state.configurationEditor().fieldIssues.size(), 1);
+	QVERIFY(rig.state.configurationEditor().fieldIssues.contains(
+		QStringLiteral("profile.video_encoding.max_bitrate_bps")));
+	// issue фиксирует точную локальную причину вместо общего сообщения о profile.
+	const auto issue = rig.state.configurationEditor().fieldIssues.value(
+		QStringLiteral("profile.video_encoding.max_bitrate_bps"));
+	QCOMPARE(issue.messageKey, QStringLiteral("Validation.CbrBitrateMismatch"));
+	QVERIFY(issue.detail.isEmpty());
+	QCOMPARE(std::get<Profile>(*rig.state.configurationEditor().draft).profile.videoEncoding.targetBitrateBps,
+		 quint64(10000000));
+	QCOMPARE(std::get<Profile>(*rig.state.configurationEditor().draft).profile.videoEncoding.maxBitrateBps,
+		 quint64(12000000));
+	QCOMPARE(std::get<Profile>(*rig.state.configurationEditor().base).profile.videoEncoding.targetBitrateBps,
+		 quint64(12000000));
+	QVERIFY(rig.mutations().isEmpty());
+	draft.profile.videoEncoding.targetBitrateBps = 12000000;
+	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("profile")}));
+	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
+	QVERIFY(rig.configuration.save());
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Saved, 1000);
+	QCOMPARE(rig.mutations().size(), 1);
+	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
+	QCOMPARE(std::get<Profile>(*rig.state.configurationEditor().base).profile.videoEncoding.maxBitrateBps,
+		 quint64(12000000));
 }
 void ConfigurationControllerTest::configurationWriteSurvivesOtherChannelCancellation()
 {

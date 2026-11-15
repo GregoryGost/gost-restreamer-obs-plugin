@@ -52,6 +52,8 @@ struct FieldError {
 	QString location;
 	// Полученный текст пояснения для plain-text UI, никогда для журнала.
 	QString message;
+	// Доверенный локальный ключ перевода; JSON-декодер не принимает его от сервера.
+	QString messageKey;
 };
 // Структурированное тело application/problem+json. detail и instance — данные сервера;
 // их наличие не разрешает автоматически выводить тело целиком в клиентский журнал.

@@ -397,6 +397,21 @@ void SettingsStore::setDetailedLogging(bool detailed)
 	}
 }
 
+// Проверяет весь набор до изменения RAM и публикует результат единственной атомарной записи.
+// retries задаёт бюджет SSE, seconds — срок REST, detailed — режим журнала; прежние поля и привязки
+// сохраняются. false означает неверный ввод либо отказ записи с сохранением новых рабочих значений.
+bool SettingsStore::saveAdvancedPreferences(int retries, int seconds, bool detailed)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (retries < UnlimitedSseRejectionRetries || seconds < MinHttpTimeoutSeconds ||
+	    seconds > MaxHttpTimeoutSeconds)
+		return false;
+	sseRejectionRetries_ = retries;
+	httpTimeoutSeconds_ = seconds;
+	detailedLogging_ = detailed;
+	return save();
+}
+
 bool SettingsStore::setSelectedStream(const QString &origin, const QString &uuid, const QString &streamId)
 {
 	if (canonicalOrigin(origin) != std::optional<QString>(origin) || !profiles_.contains(uuid) ||

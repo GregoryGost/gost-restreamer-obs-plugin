@@ -3,10 +3,13 @@
 #include "core/state-store.hpp"
 #include "core/stats-baseline.hpp"
 #include "core/restream-controller.hpp"
+#include "core/connection-controller.hpp"
 #include "ui/status-label.hpp"
 #include "ui/confirmation-dialog.hpp"
 
 #include <QFormLayout>
+#include <QFontMetrics>
+#include <QComboBox>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -14,18 +17,20 @@
 #include <QLocale>
 #include <QMenu>
 #include <QMessageBox>
-#include <QCursor>
+#include <QStyle>
 #include <QAction>
 #include <QPalette>
 #include <QPainter>
 #include <QPushButton>
 #include <QPointer>
 #include <QSet>
+#include <QSignalBlocker>
 #include <QStandardItemModel>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QResizeEvent>
 #include <QTimer>
+#include <QTextBoundaryFinder>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -89,24 +94,42 @@ protected:
 	}
 };
 
-QVBoxLayout *card(QVBoxLayout *parent, const char *name, const QString &title)
+// Добавляет карточку name с заголовком title в parent. При запросе headingLayout возвращает
+// горизонтальную шапку для расположенных рядом с заголовком команд.
+QVBoxLayout *card(QVBoxLayout *parent, const char *name, const QString &title, QHBoxLayout **headingLayout = nullptr)
 {
+	// widget рисует фон карточки текущей темой и передаётся в компоновку parent.
 	auto *widget = new DockCard;
 	widget->setObjectName(QString::fromLatin1(name));
+	// layout располагает шапку и содержимое внутри widget.
 	auto *layout = new QVBoxLayout(widget);
 	layout->setContentsMargins(10, 10, 10, 10);
 	layout->setSpacing(8);
+	// heading показывает название карточки обычным полужирным текстом.
 	auto *heading = valueLabel(widget, "cardTitle");
 	heading->setText(title);
 	bold(heading);
-	layout->addWidget(heading);
+	if (headingLayout) {
+		*headingLayout = new QHBoxLayout;
+		(*headingLayout)->setSpacing(4);
+		(*headingLayout)->addWidget(heading, 1);
+		layout->addLayout(*headingLayout);
+	} else {
+		layout->addWidget(heading);
+	}
 	parent->addWidget(widget);
 	return layout;
 }
 
-QString tableRow(const QString &label, const QString &value, bool emphasis = false)
+// Формирует экранированную строку: label подписывает value, emphasis выделяет значение.
+// stacked переносит значение под подпись в узкой колонке, сохраняя полный текст.
+QString tableRow(const QString &label, const QString &value, bool emphasis = false, bool stacked = false)
 {
+	// formatted содержит значение без возможности вставить серверную строку как HTML.
 	const auto formatted = value.toHtmlEscaped();
+	if (stacked)
+		return QStringLiteral("<tr><td valign='top'>%1<br>%2</td></tr>\n")
+			.arg(label.toHtmlEscaped(), emphasis ? QStringLiteral("<b>%1</b>").arg(formatted) : formatted);
 	return QStringLiteral("<tr><td valign='top'>%1</td><td valign='top'>%2</td></tr>\n")
 		.arg(label.toHtmlEscaped(), emphasis ? QStringLiteral("<b>%1</b>").arg(formatted) : formatted);
 }
@@ -114,6 +137,48 @@ QString tableRow(const QString &label, const QString &value, bool emphasis = fal
 QString table(const QString &rows)
 {
 	return QStringLiteral("<table width='100%' cellspacing='0' cellpadding='2'>%1</table>").arg(rows);
+}
+
+// Экранирует value для колонки шириной columnWidth с метриками её шрифта metrics.
+// Короткие слова сохраняют обычный перенос. В слишком широких фрагментах между пробелами
+// добавляет возможности переноса U+200B только между целыми графемами: QLabel использует WordWrap
+// и иначе расширяет таблицу до ширины непрерывного слова. Исходные данные не изменяются.
+QString statisticText(const QString &value, const QFontMetrics &metrics, int columnWidth)
+{
+	// fragments сохраняет обычные пробелы, включая повторные, при обратном соединении.
+	const auto fragments = value.split(QLatin1Char(' '), Qt::KeepEmptyParts);
+	// escapedFragments содержит безопасный HTML каждого исходного фрагмента в прежнем порядке.
+	QStringList escapedFragments;
+	// fragment содержит очередное слово или пустой промежуток между исходными пробелами.
+	for (const auto &fragment : fragments) {
+		if (metrics.horizontalAdvance(fragment) <= columnWidth) {
+			escapedFragments.append(fragment.toHtmlEscaped());
+			continue;
+		}
+		// escaped собирает текст длинного фрагмента; только вставляемая сущность является разметкой.
+		QString escaped;
+		// boundaries находит целые графемы, не разделяя суррогатные пары и составные символы.
+		QTextBoundaryFinder boundaries(QTextBoundaryFinder::Grapheme, fragment);
+		// start указывает на начало ещё не добавленной графемы исходной строки.
+		qsizetype start = 0;
+		// end отмечает границу после очередной графемы в исходном UTF-16.
+		for (qsizetype end = boundaries.toNextBoundary(); end >= 0; end = boundaries.toNextBoundary()) {
+			escaped.append(fragment.mid(start, end - start).toHtmlEscaped());
+			if (end < fragment.size())
+				escaped.append(QStringLiteral("&#8203;"));
+			start = end;
+		}
+		escapedFragments.append(escaped);
+	}
+	return escapedFragments.join(QLatin1Char(' '));
+}
+
+// Формирует одну из трёх колонок статистики: label находится над уже оформленным value.
+// metrics и columnWidth задают перенос обеих экранированных строк по текущему шрифту и ширине.
+QString statisticColumn(const QString &label, const QString &value, const QFontMetrics &metrics, int columnWidth)
+{
+	return QStringLiteral("<td width='33%' valign='top'>%1<br>%2</td>")
+		.arg(statisticText(label, metrics, columnWidth), statisticText(value, metrics, columnWidth));
 }
 
 // Создаёт компактную кнопку намерения; её доступность обновляет представление по общему состоянию.
@@ -128,72 +193,117 @@ QPushButton *commandButton(QWidget *parent, const TextLookup &text, const char *
 	return button;
 }
 
-// Отражает одну строку телеметрии и сообщает об открытии её меню без хранения индекса модели.
+// Показывает имя, состояние и битрейт в одну строку. Полный текст остаётся у QLabel,
+// в подсказках и средствах доступности; сокращается только рисуемая строка.
 class OutputRow final : public QWidget {
 public:
-	// Создаёт строку; text переводит подписи, parent получает владение виджетами и соединениями Qt.
+	// Создаёт однострочное представление; text переводит меню, parent получает владение виджетами.
 	explicit OutputRow(const TextLookup &text, QWidget *parent) : QWidget(parent)
 	{
 		setAutoFillBackground(true);
 		setBackgroundRole(QPalette::Window);
-		// layout раскладывает имя, независимые наблюдения и доступное с клавиатуры меню строки.
-		auto *layout = new QGridLayout(this);
-		layout->setContentsMargins(4, 8, 4, 8);
-		layout->setHorizontalSpacing(8);
-		layout->setVerticalSpacing(4);
+		// layout распределяет три поля с равными долями ширины и оставляет меню справа.
+		auto *layout = new QHBoxLayout(this);
+		layout->setContentsMargins(4, 4, 4, 4);
+		layout->setSpacing(6);
 		name = valueLabel(this, "outputName");
 		bold(name);
 		status = new StatusLabel(this);
 		status->setObjectName(QStringLiteral("outputStatus"));
-		// statusPolicy допускает сжатие длинного переведённого статуса в узком доке.
-		auto statusPolicy = status->sizePolicy();
-		statusPolicy.setHorizontalPolicy(QSizePolicy::Ignored);
-		status->setSizePolicy(statusPolicy);
 		rate = valueLabel(this, "outputBitrate");
-		rate->setAlignment(Qt::AlignRight | Qt::AlignTop);
-		details = valueLabel(this, "outputDetails");
+		rate->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		// label проходит три поля, которые сжимаются без переноса и сохраняют исходный текст.
+		for (auto *label : {name, static_cast<QLabel *>(status), rate}) {
+			label->setWordWrap(false);
+			label->setFixedHeight(label->fontMetrics().height());
+			label->setMinimumWidth(0);
+			label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+			label->installEventFilter(this);
+			layout->addWidget(label, 1);
+		}
+		status->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 		action = new QToolButton(this);
 		action->setObjectName(QStringLiteral("outputActionsButton"));
 		action->setText(QString::fromUtf8("…"));
 		action->setEnabled(false);
 		action->setToolTip(text("Dock.OutputActions"));
 		action->setAccessibleName(text("Dock.OutputActions"));
-		layout->addWidget(name, 0, 0, 1, 2);
-		layout->addWidget(action, 0, 2);
-		layout->addWidget(status, 1, 0);
-		layout->addWidget(rate, 1, 1, 1, 2);
-		layout->addWidget(details, 2, 0, 1, 3);
-		layout->setColumnStretch(0, 1);
-		layout->setColumnStretch(1, 1);
+		layout->addWidget(action);
 	}
 
-	// name, status, rate и details представляют имя, состояние, скорость и отдельные счётчики выхода.
+	// name содержит имя снимка Output либо назначения каталога; имя не адресует команды.
 	QLabel *name;
+	// status хранит полное наблюдаемое состояние и его смысловой цвет.
 	StatusLabel *status;
+	// rate содержит текущий либо явно устаревший битрейт без выдуманных нулей.
 	QLabel *rate;
-	QLabel *details;
-	// action открывает меню; outputId обновляется при повторном использовании строки и копируется при нажатии.
+	// action открывает меню точного Output либо выбранного назначения каталога.
 	QToolButton *action;
+	// outputId адресует точный Output; пустая строка обозначает назначение без текущего Output.
 	QString outputId;
-	// context и sessionId принадлежат отображаемой строке; обновление StateStore не перенаправляет её нажатие.
+	// destinationId адресует назначение отдельно от Output; неизвестная runtime-связь остаётся пустой.
+	QString destinationId;
+	// context сохраняет сервер, UUID профиля и Stream, которым принадлежит показанная строка.
 	DockContext context;
+	// sessionId фиксирует Session строки независимо от последующего обновления состояния.
 	QString sessionId;
+
+protected:
+	// При Paint рисует полное значение watched с сокращением по доступной ширине.
+	// FontChange сохраняет высоту одной строки, даже если имя содержит переносы. Остальные event
+	// передаются QWidget. Точка StatusLabel сохраняет цвет и место рядом с текстом.
+	bool eventFilter(QObject *watched, QEvent *event) override
+	{
+		// label указывает на одно из трёх полей с установленным этим объектом фильтром.
+		auto *label = qobject_cast<QLabel *>(watched);
+		if (!label)
+			return QWidget::eventFilter(watched, event);
+		if (event->type() == QEvent::FontChange)
+			label->setFixedHeight(label->fontMetrics().height());
+		if (event->type() != QEvent::Paint)
+			return QWidget::eventFilter(watched, event);
+		// painter рисует только поле; полный QLabel::text остаётся доступным без сокращения.
+		QPainter painter(label);
+		painter.setFont(label->font());
+		// bounds учитывает отступ точки StatusLabel и внутренние поля QLabel.
+		const auto bounds = label->contentsRect().adjusted(label->margin(), label->margin(), -label->margin(),
+								   -label->margin());
+		// visibleText заменяет переносы пробелами и сокращает только рисуемое представление.
+		const auto visibleText = label->fontMetrics().elidedText(label->text().simplified(), Qt::ElideRight,
+									 qMax(0, bounds.width()));
+		label->style()->drawItemText(&painter, bounds,
+					     static_cast<int>(label->alignment()) | Qt::TextSingleLine,
+					     label->palette(), label->isEnabled(), visibleText, QPalette::WindowText);
+		if (label == status) {
+			painter.setRenderHint(QPainter::Antialiasing);
+			painter.setPen(Qt::NoPen);
+			painter.setBrush(label->palette().color(QPalette::WindowText));
+			painter.drawEllipse(QRectF(1, (label->height() - 6) / 2.0, 6, 6));
+		}
+		return true;
+	}
 };
 
+// Сохраняет модель, виджеты и прокрутку при телеметрии, ограничивая высоту списка выходов.
 class OutputList final : public QListView {
 public:
+	// Использует стандартные конструкторы QListView с обычным владением родительским QWidget.
 	using QListView::QListView;
 
+	// Обновляет только изменившиеся высоты строк; общий предел оставляет длинный список прокручиваемым.
 	void updateHeights()
 	{
-		// Сохраняем модель и виджеты при телеметрии. Меняется только высота действительно изменившейся
-		// строки; положение прокрутки не сбрасывается при поступлении очередного измерения.
+		// total суммирует высоты строк для списка, который ещё не достиг предела.
 		int total = 0;
+		// row адресует очередной виджет модели, не идентичность Output.
 		for (int row = 0; row < model()->rowCount(); ++row) {
+			// index выбирает размер и виджет одной существующей строки.
 			const auto index = model()->index(row, 0);
+			// widget заимствован у viewport; отсутствие означает обычную строку «Нет данных».
 			auto *widget = indexWidget(index);
-			const int height = widget ? widget->heightForWidth(viewport()->width())
-						  : fontMetrics().height() + 4;
+			// height учитывает высоту меню и однострочных полей без зависимости от длины текста.
+			const int height = widget ? widget->sizeHint().height() : fontMetrics().height() + 4;
+			// hint закрепляет текущую ширину viewport и достаточную высоту одной строки.
 			const QSize hint(qMax(1, viewport()->width()), qMax(fontMetrics().height() + 4, height));
 			if (index.data(Qt::SizeHintRole).toSize() != hint)
 				model()->setData(index, hint, Qt::SizeHintRole);
@@ -203,12 +313,21 @@ public:
 	}
 
 protected:
+	// После штатного resize event согласует размеры строк с новой шириной viewport.
 	void resizeEvent(QResizeEvent *event) override
 	{
 		QListView::resizeEvent(event);
 		updateHeights();
 	}
 };
+
+// Экранирует полный text для подсказки Qt, сохраняя переносы. Серверное имя с '<...>'
+// показывается буквально, а не становится разметкой подсказки.
+QString outputToolTip(const QString &text)
+{
+	return QStringLiteral("<qt>%1</qt>")
+		.arg(text.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+}
 
 const char *sessionKey(const QString &state)
 {
@@ -401,7 +520,8 @@ void updateRows(QStandardItemModel &model, const QStringList &rows)
 
 } // namespace
 
-// Форматирует известные коды и локальные подписи; ID и текст отказа не выводятся, код причины показывается отдельно.
+// Форматирует operations с текущим и прерванным результатом, используя переводы text.
+// Квитанции, части строк и наблюдаемое состояние не смешиваются; ID и сырой текст отказа не выводятся.
 QString formatOperations(const OperationsState &operations, const TextLookup &text)
 {
 	// outcomeText переводит итог шага или части Stop All, сохраняя неизвестный результат явно.
@@ -437,6 +557,8 @@ QString formatOperations(const OperationsState &operations, const TextLookup &te
 			return text("Dock.Resume");
 		case OperationAction::StopAll:
 			return text("Dock.Stop");
+		case OperationAction::StartDestination:
+			return text("Operation.StartDestination");
 		case OperationAction::StartOutput:
 			return text("Operation.StartOutput");
 		case OperationAction::StopOutput:
@@ -446,8 +568,12 @@ QString formatOperations(const OperationsState &operations, const TextLookup &te
 		case OperationAction::DetachOutput:
 			return text("Operation.DetachOutput");
 		case OperationAction::StartStopped:
+		case OperationAction::StartAllOutputs:
 			return text("Dock.StartOutputs");
+		case OperationAction::StopAllOutputs:
+			return text("Dock.StopOutputs");
 		case OperationAction::RestartAll:
+		case OperationAction::RestartAllOutputs:
 			return text("Dock.RestartOutputs");
 		case OperationAction::None:
 			return text("Operation.NoResult");
@@ -474,7 +600,7 @@ QString formatOperations(const OperationsState &operations, const TextLookup &te
 		}
 		return text("Operation.Unknown");
 	};
-	// describe составляет одно представление workflow; callbacks вызываются только синхронно в этом методе.
+	// describe составляет одно представление workflow; вложенные обработчики вызываются синхронно.
 	const auto describe = [&](const WorkflowResult &workflow) {
 		// lines сохраняет раздельные результаты квитанции, состояния и каждого выхода пакета.
 		QStringList lines;
@@ -509,11 +635,25 @@ QString formatOperations(const OperationsState &operations, const TextLookup &te
 			    workflow.obsOutcome != OperationOutcome::Completed)
 				lines.append(text("Operation.ObsStopUnconfirmed"));
 		}
-		// output — элемент исходного фиксированного пакета; имя используется только в безопасном plain text.
-		for (const auto &output : workflow.outputs)
-			lines.append(text("Operation.OutputResult")
-					     .arg(output.name.isEmpty() ? text("Dock.UnnamedOutput") : output.name,
-						  outcomeText(output.outcome)));
+		// output — элемент исходного фиксированного пакета; имя показывается только обычным текстом.
+		for (const auto &output : workflow.outputs) {
+			// name обозначает исходную строку; ни имя, ни оформленный итог не адресуют команды.
+			const auto name = output.name.isEmpty() ? text("Dock.UnnamedOutput") : output.name;
+			lines.append(text("Operation.OutputResult").arg(name, outcomeText(output.outcome)));
+			if (output.stopOutcome != OperationOutcome::None)
+				lines.append(
+					text("Operation.OutputStopPart").arg(name, outcomeText(output.stopOutcome)));
+			if (output.startOutcome != OperationOutcome::None)
+				lines.append(
+					text("Operation.OutputStartPart").arg(name, outcomeText(output.startOutcome)));
+			if (output.noOp)
+				lines.append(text("Operation.OutputNoOp").arg(name));
+			if (!output.messageKey.isEmpty())
+				lines.append(text("Operation.OutputReason")
+						     .arg(name, text(output.messageKey.toUtf8().constData())));
+		}
+		if (workflow.retryAvailable && !workflow.retryTargetName.isEmpty())
+			lines.append(text("Operation.RetryTarget").arg(workflow.retryTargetName));
 		if (workflow.remainingStopped)
 			lines.append(text("Operation.RemainingStopped"));
 		if (workflow.phase == OperationPhase::Finished && workflow.outcome != OperationOutcome::Completed &&
@@ -561,13 +701,16 @@ struct RestreamDock::Statistics {
 	}
 };
 
-// Создаёт представление общих наблюдений и передаёт пользовательские намерения restream в GUI-потоке.
+// Создаёт представление stateStore в GUI-потоке с переводами text и версией version внизу.
+// parent получает Dock; restream принимает команды эфира, connection — явный выбор рабочего Stream.
+// Оба контроллера необязательны и заимствованы; их отсутствие отключает соответствующие действия.
 RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *parent, QString version,
-			   RestreamController *restream)
+			   RestreamController *restream, ConnectionController *connection)
 	: QWidget(parent),
 	  stateStore_(stateStore),
 	  text_(std::move(text)),
 	  restream_(restream),
+	  connection_(connection),
 	  statistics_(std::make_unique<Statistics>())
 {
 	// Сигналы подключаются с контекстом виджета: его удаление OBS отменяет отложенные обновления.
@@ -578,13 +721,20 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	auto *layout = new QVBoxLayout(this);
 	layout->setContentsMargins(10, 10, 10, 10);
 	layout->setSpacing(8);
-	// header располагает название и единственную кнопку открытия управления.
+	// header располагает рабочий Stream, подключение и единственную кнопку открытия управления.
 	auto *header = new QHBoxLayout;
-	// title показывает название продукта обычным текстом.
-	auto *title = valueLabel(this, "dockTitle");
-	title->setText(text_("Plugin.Name"));
-	bold(title);
-	header->addWidget(title, 1);
+	streams_ = new QComboBox(this);
+	streams_->setObjectName(QStringLiteral("streamSelector"));
+	streams_->setAccessibleName(text_("Settings.Stream"));
+	streams_->setMinimumWidth(0);
+	streams_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+	bold(streams_);
+	header->addWidget(streams_, 1);
+	server_ = new StatusLabel(this, false);
+	server_->setObjectName(QStringLiteral("serverObservation"));
+	server_->setMinimumWidth(0);
+	server_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+	header->addWidget(server_, 1);
 	// gear открывает существующее расширенное окно и доступна с клавиатуры.
 	auto *gear = new QToolButton(this);
 	gear->setObjectName(QStringLiteral("managementButton"));
@@ -593,41 +743,46 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	gear->setAccessibleName(text_("Management.Open"));
 	header->addWidget(gear);
 	layout->addLayout(header);
-	server_ = new StatusLabel(this);
-	server_->setObjectName(QStringLiteral("serverObservation"));
-	layout->addWidget(server_);
-	stream_ = valueLabel(this, "streamObservation");
-	bold(stream_);
-	layout->addWidget(stream_);
-	profile_ = valueLabel(this, "obsProfile");
-	layout->addWidget(profile_);
 
 	// state содержит независимые оси OBS, входа, Session, групп и заглушки.
 	auto *state = card(layout, "stateCard", text_("Dock.State"));
-	// observations выравнивает подписи состояний с переносом длинных строк.
-	auto *observations = new QFormLayout;
-	observations->setContentsMargins(0, 0, 0, 0);
-	observations->setSpacing(4);
-	observations->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-	observations->setRowWrapPolicy(QFormLayout::WrapLongRows);
-	// axis создаёт индикатор для name и переведённой подписи key; callback возвращает дочерний виджет.
-	const auto axis = [&](const char *name, const char *key) {
+	// stateColumns даёт обеим группам состояний равную долю доступной ширины.
+	auto *stateColumns = new QHBoxLayout;
+	stateColumns->setSpacing(8);
+	// localState выравнивает OBS, вход и Session; serverState — группы и заглушку.
+	auto *localState = new QFormLayout;
+	auto *serverState = new QFormLayout;
+	// observations обозначает очередную форму; перенос сохраняет читаемость при узком Dock.
+	for (auto *observations : {localState, serverState}) {
+		observations->setContentsMargins(0, 0, 0, 0);
+		observations->setSpacing(4);
+		observations->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+		observations->setRowWrapPolicy(QFormLayout::WrapLongRows);
+	}
+	// axis добавляет в column подпись key и отдельный статус name, не объединяя смысл осей.
+	const auto axis = [&](QFormLayout *column, const char *name, const char *key) {
 		// label принадлежит доку и отражает одну независимую ось состояния.
 		auto *label = new StatusLabel(this);
 		label->setObjectName(QString::fromLatin1(name));
 		// policy позволяет индикатору сжиматься при небольшой ширине дока.
 		auto policy = label->sizePolicy();
-		policy.setHorizontalPolicy(QSizePolicy::Ignored);
+		policy.setHorizontalPolicy(QSizePolicy::Preferred);
 		label->setSizePolicy(policy);
-		observations->addRow(text_(key), label);
+		// caption переносит переведённую подпись, не задавая жёсткую минимальную ширину колонки.
+		auto *caption = valueLabel(this, "stateCaption");
+		caption->setText(text_(key));
+		caption->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+		column->addRow(caption, label);
 		return label;
 	};
-	streaming_ = axis("obsStreaming", "Dock.Obs");
-	input_ = axis("inputObservation", "Dock.InputLabel");
-	session_ = axis("sessionObservation", "Dock.SessionLabel");
-	groups_ = axis("groupObservation", "Dock.GroupsLabel");
-	fallback_ = axis("fallbackObservation", "Dock.FallbackLabel");
-	state->addLayout(observations);
+	streaming_ = axis(localState, "obsStreaming", "Dock.Obs");
+	input_ = axis(localState, "inputObservation", "Dock.InputLabel");
+	session_ = axis(localState, "sessionObservation", "Dock.SessionLabel");
+	groups_ = axis(serverState, "groupObservation", "Dock.GroupsLabel");
+	fallback_ = axis(serverState, "fallbackObservation", "Dock.FallbackLabel");
+	stateColumns->addLayout(localState, 1);
+	stateColumns->addLayout(serverState, 1);
+	state->addLayout(stateColumns);
 
 	// Шапка, независимые состояния и основные действия остаются снаружи прокрутки.
 	// На небольшой высоте подробные метрики доступны без увеличения минимальной высоты Dock.
@@ -650,23 +805,53 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	details->addWidget(serverDataNotice_);
 	// localCard отделяет локальные метрики OBS от серверного входа и выходов.
 	auto *localCard = card(details, "obsStatisticsCard", text_("Dock.StatisticsTitle"));
+	// localColumns размещает текущие измерения и накопления OBS рядом с равными долями ширины.
+	auto *localColumns = new QHBoxLayout;
+	localColumns->setSpacing(8);
 	localStats_ = valueLabel(content, "obsStatistics");
 	localStats_->setTextFormat(Qt::RichText);
-	localCard->addWidget(localStats_);
+	localStats_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+	localColumns->addWidget(localStats_, 1);
+	localDrops_ = valueLabel(content, "obsDropStatistics");
+	localDrops_->setTextFormat(Qt::RichText);
+	localDrops_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+	localColumns->addWidget(localDrops_, 1);
+	localCard->addLayout(localColumns);
+	localPeriod_ = valueLabel(content, "obsStatisticsPeriod");
+	localCard->addWidget(localPeriod_);
 	// inputCard содержит формат и скорости серверного входа.
 	auto *inputCard = card(details, "inputCard", text_("Dock.InputTitle"));
 	ingest_ = valueLabel(content, "ingestStatistics");
 	ingest_->setTextFormat(Qt::RichText);
 	inputCard->addWidget(ingest_);
-	// outputCard содержит наблюдаемые выходы и фиксированные пакетные действия.
-	auto *outputCard = card(details, "outputsCard", text_("Dock.OutputsTitle"));
+	// outputHeading располагает пакетные команды сразу справа от заголовка карточки.
+	QHBoxLayout *outputHeading = nullptr;
+	// outputCard содержит текущие Outputs и ещё не представленные назначения выбранного Stream.
+	auto *outputCard = card(details, "outputsCard", text_("Dock.OutputsTitle"), &outputHeading);
+	// outputCommand создаёт только иконку icon; key задаёт локализованные подсказку и доступное имя,
+	// name сохраняет адрес виджета. Родитель карточки владеет кнопкой, обработчик подключается ниже.
+	const auto outputCommand = [&](const char *key, const char *name, QStyle::StandardPixmap icon) {
+		// button принадлежит карточке и не выполняет команд без доступного обработчика.
+		auto *button = new QToolButton(outputHeading->parentWidget());
+		button->setObjectName(QString::fromLatin1(name));
+		button->setIcon(style()->standardIcon(icon));
+		button->setToolButtonStyle(Qt::ToolButtonIconOnly);
+		button->setToolTip(text_(key));
+		button->setAccessibleName(text_(key));
+		button->setEnabled(false);
+		outputHeading->addWidget(button);
+		return button;
+	};
+	startOutputs_ = outputCommand("Dock.StartOutputs", "outputsStartButton", QStyle::SP_MediaPlay);
+	stopOutputs_ = outputCommand("Dock.StopOutputs", "outputsStopButton", QStyle::SP_MediaStop);
+	restartOutputs_ = outputCommand("Dock.RestartOutputs", "outputsRestartButton", QStyle::SP_BrowserReload);
 	outputSummary_ = valueLabel(content, "outputSummary");
 	outputCard->addWidget(outputSummary_);
 	// outputList сохраняет строки виджетов и их положение при обновлении телеметрии.
 	auto *outputList = new OutputList(content);
 	outputList_ = outputList;
 	outputList->setObjectName(QStringLiteral("outputList"));
-	outputList->setAccessibleName(text_("Dock.Outputs"));
+	outputList->setAccessibleName(text_("Dock.OutputsTitle"));
 	outputList->setEditTriggers(QAbstractItemView::NoEditTriggers);
 	outputList->setFrameShape(QFrame::NoFrame);
 	outputList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -677,14 +862,6 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	outputs_ = new QStandardItemModel(0, 1, outputList);
 	outputList->setModel(outputs_);
 	outputCard->addWidget(outputList);
-	// batch располагает две команды для фиксированного состава выходов.
-	auto *batch = new QVBoxLayout;
-	batch->setSpacing(4);
-	startOutputs_ = commandButton(content, text_, "Dock.StartOutputs", "outputsStartButton");
-	restartOutputs_ = commandButton(content, text_, "Dock.RestartOutputs", "outputsRestartButton");
-	batch->addWidget(startOutputs_);
-	batch->addWidget(restartOutputs_);
-	outputCard->addLayout(batch);
 	operationStatus_ = valueLabel(content, "operationStatus");
 	details->addWidget(operationStatus_);
 	retry_ = commandButton(content, text_, "Operation.Retry", "operationRetryButton");
@@ -725,14 +902,26 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	layout->addLayout(footer);
 	connect(gear, &QToolButton::clicked, this, &RestreamDock::managementRequested);
 	connect(reset_, &QPushButton::clicked, this, &RestreamDock::resetStatistics);
-	// Обработчики фиксируют точные цели до подтверждения и передают только намерения фасаду.
+	// activated передаёт только пользовательский выбор; index адресует точный itemData, а не имя Stream.
+	connect(streams_, &QComboBox::activated, this, [this](int index) {
+		if (connection_)
+			connection_->selectStream(streams_->itemData(index).toString());
+	});
+	// Обработчик Pause передаёт намерение паузы точной Session без остановки OBS.
 	connect(pause_, &QPushButton::clicked, this, [this] { dispatchSessionAction(OperationAction::Pause); });
+	// Обработчик Resume снимает паузу исходной Session.
 	connect(resume_, &QPushButton::clicked, this, [this] { dispatchSessionAction(OperationAction::Resume); });
+	// Обработчик завершения эфира отдельно подтверждает остановку OBS и исходной Session.
 	connect(stop_, &QPushButton::clicked, this, [this] { dispatchSessionAction(OperationAction::StopAll); });
-	connect(startOutputs_, &QPushButton::clicked, this,
-		[this] { dispatchSessionAction(OperationAction::StartStopped); });
-	connect(restartOutputs_, &QPushButton::clicked, this,
-		[this] { dispatchSessionAction(OperationAction::RestartAll); });
+	// Нажатие Start копирует показанный состав без дополнительного диалога.
+	connect(startOutputs_, &QToolButton::clicked, this,
+		[this] { dispatchOutputAction(OperationAction::StartAllOutputs); });
+	// Нажатие Stop подтверждает остановку только показанных выходов.
+	connect(stopOutputs_, &QToolButton::clicked, this,
+		[this] { dispatchOutputAction(OperationAction::StopAllOutputs); });
+	// Нажатие Restart подтверждает прерывание и запуск всех исходных строк.
+	connect(restartOutputs_, &QToolButton::clicked, this,
+		[this] { dispatchOutputAction(OperationAction::RestartAllOutputs); });
 	// Повтор использует сохранённое намерение контроллера; UI не создаёт новый идентификатор команды.
 	connect(retry_, &QPushButton::clicked, this, [this] {
 		if (restream_)
@@ -748,10 +937,20 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	connect(&stateStore_, &StateStore::runtimeStateChanged, this, &RestreamDock::scheduleRefresh);
 	connect(&stateStore_, &StateStore::runtimeAboutToBecomeStale, this, &RestreamDock::refreshServer);
 	connect(&stateStore_, &StateStore::obsStatisticsChanged, this, &RestreamDock::scheduleRefresh);
+	connect(&stateStore_, &StateStore::streamsChanged, this, &RestreamDock::refreshStreams);
+	refreshStreams();
 	refresh();
 }
 
 RestreamDock::~RestreamDock() = default;
+
+// Пересчитывает переносы колонок при смене ширины event; изменение высоты не запускает новый цикл.
+void RestreamDock::resizeEvent(QResizeEvent *event)
+{
+	QWidget::resizeEvent(event);
+	if (event->size().width() != event->oldSize().width())
+		scheduleRefresh();
+}
 
 void RestreamDock::scheduleRefresh()
 {
@@ -765,14 +964,20 @@ void RestreamDock::scheduleRefresh()
 	});
 }
 
+// Принимает последнюю статистику OBS, независимо обновляет накопления и форматирует обе колонки.
 void RestreamDock::refresh()
 {
 	refreshObservations();
+	// sample содержит одну согласованную выборку локальных измерений OBS.
 	const auto &sample = stateStore_.obsStatistics();
+	// video привязывает render/encode к исполнению видео; output — network/sent к штатному output.
 	const StatsBaseline::Identity video{QStringLiteral("video"), sample.videoEpoch};
 	const StatsBaseline::Identity output{QStringLiteral("output"), sample.outputEpoch};
+	// stats сохраняет независимые точки отсчёта и серверный кеш этого представления.
 	auto &stats = *statistics_;
+	// limitedPair определяет насыщение любого счётчика пары pair, при котором точный прирост недоступен.
 	const auto limitedPair = [](const std::optional<FrameCounters> &pair) {
+		// limit совпадает с предельным значением нативных накопительных счётчиков.
 		constexpr auto limit = std::numeric_limits<quint64>::max();
 		return pair && (pair->skipped == limit || pair->total == limit);
 	};
@@ -782,23 +987,32 @@ void RestreamDock::refresh()
 			      sample.networkLimited || limitedPair(sample.network));
 	stats.sent.observe(output, count(sample.sentBytes), true,
 			   sample.sentBytes == std::numeric_limits<quint64>::max());
+	// locale задаёт десятичный разделитель и формат чисел для текущей локали OBS.
 	const QLocale locale(text_("Dock.NumberLocale"));
+	// noData сохраняет отсутствие наблюдения отдельно от измеренного нуля.
 	const auto noData = text_("Observation.NoData");
+	// fps представляет текущую локальную частоту кадров без изменения baseline.
 	const auto fps = sample.fps ? locale.toString(*sample.fps, 'f', 2) : noData;
+	// renderTime переводит наблюдаемое среднее время рендера из наносекунд в миллисекунды.
 	const auto renderTime =
 		sample.renderTimeNs
 			? text_("Dock.Milliseconds")
 				  .arg(locale.toString(static_cast<double>(*sample.renderTimeNs) / 1e6, 'f', 2))
 			: noData;
+	// bitrateStatus объясняет отсутствие скорости: замер, остановленный output либо отсутствие данных.
 	const char *bitrateStatus = "Observation.NoData";
 	if (sample.bitrateWarming)
 		bitrateStatus = "Dock.Measuring";
 	else if (sample.phase == ObsStreamingPhase::Stopped)
 		bitrateStatus = "Dock.ObsNotStreaming";
+	// bitRate показывает текущий локальный битрейт либо точную причину его недоступности.
 	const auto bitRate = sample.bitrate ? bitrate(locale, text_, *sample.bitrate) : text_(bitrateStatus);
+	// commonPeriod запоминает период доступного накопления, differentPeriods отмечает несовпадение периодов.
 	std::optional<StatsBaseline::Period> commonPeriod;
 	bool differentPeriods = false;
+	// baseline проходит четыре независимых накопления OBS; недоступное чтение не задаёт общий период.
 	for (const auto *baseline : {&stats.render, &stats.encode, &stats.network, &stats.sent}) {
+		// reading содержит уже вычисленную дельту и период одной точки отсчёта.
 		const auto reading = baseline->reading();
 		if (!reading.counters)
 			continue;
@@ -806,26 +1020,62 @@ void RestreamDock::refresh()
 			differentPeriods = true;
 		commonPeriod = reading.period;
 	}
+	// perCounterPeriod оставляет собственный период у каждого значения при расхождении источников.
 	const bool perCounterPeriod = differentPeriods;
-	const auto localRows =
-		tableRow(text_("Dock.FpsLabel"), fps, true) + tableRow(text_("Dock.BitrateLabel"), bitRate, true) +
-		tableRow(text_("Dock.RenderLabel"), renderTime) +
-		tableRow(text_("Dock.RenderDropsLabel"), counterText(locale, text_, stats.render, perCounterPeriod)) +
-		tableRow(text_("Dock.EncodeDropsLabel"), counterText(locale, text_, stats.encode, perCounterPeriod)) +
-		tableRow(text_("Dock.NetworkDropsLabel"), counterText(locale, text_, stats.network, perCounterPeriod)) +
-		tableRow(text_("Dock.SentLabel"), bytesText(locale, text_, stats.sent, perCounterPeriod));
-	localStats_->setText(table(localRows) +
-			     (commonPeriod && !differentPeriods
-				      ? QStringLiteral("<p>%1</p>").arg(text_(periodKey(*commonPeriod)).toHtmlEscaped())
-				      : QString{}));
+	// stackedStatistics оставляет подписи и значения на отдельных строках в двух узких колонках Dock.
+	const bool stackedStatistics = width() < 600;
+	// localRows содержит только текущие измерения; dropRows — накопления с прежним форматированием.
+	const auto localRows = tableRow(text_("Dock.FpsLabel"), fps, true, stackedStatistics) +
+			       tableRow(text_("Dock.BitrateLabel"), bitRate, true, stackedStatistics) +
+			       tableRow(text_("Dock.RenderLabel"), renderTime, false, stackedStatistics);
+	const auto dropRows =
+		tableRow(text_("Dock.RenderDropsLabel"), counterText(locale, text_, stats.render, perCounterPeriod),
+			 false, stackedStatistics) +
+		tableRow(text_("Dock.EncodeDropsLabel"), counterText(locale, text_, stats.encode, perCounterPeriod),
+			 false, stackedStatistics) +
+		tableRow(text_("Dock.NetworkDropsLabel"), counterText(locale, text_, stats.network, perCounterPeriod),
+			 false, stackedStatistics) +
+		tableRow(text_("Dock.SentLabel"), bytesText(locale, text_, stats.sent, perCounterPeriod), false,
+			 stackedStatistics);
+	localStats_->setText(table(localRows));
+	localDrops_->setText(table(dropRows));
+	localPeriod_->setText(commonPeriod && !differentPeriods ? text_(periodKey(*commonPeriod)) : QString{});
+	localPeriod_->setVisible(!localPeriod_->text().isEmpty());
 	localStats_->setToolTip(text_("Dock.CounterHint"));
+	localDrops_->setToolTip(text_("Dock.CounterHint"));
 	refreshServer();
+	// serverCanReset разрешает локальный сброс при наличии пригодного накопления хотя бы одного Output.
+	// Предикат entry проверяет только доступность baseline, не выполняя команд или изменения счётчиков.
 	const bool serverCanReset = std::any_of(stats.outputs.cbegin(), stats.outputs.cend(),
 						[](const auto &entry) { return entry.canReset(); });
 	reset_->setEnabled(stats.render.canReset() || stats.encode.canReset() || stats.network.canReset() ||
 			   stats.sent.canReset() || serverCanReset);
 }
 
+// Пересоздаёт варианты только после изменения списка или выбранного ID, не сохраняя отражение обратно.
+void RestreamDock::refreshStreams()
+{
+	// blockStreams исключает сигналы выбора при отражении; запись разрешена только из activated.
+	const QSignalBlocker blockStreams(streams_);
+	streams_->clear();
+	streams_->addItem(text_("Stream.Choose"), QString{});
+	// stream содержит полученное имя для показа и точный ID для адресации выбора.
+	for (const auto &stream : stateStore_.streams())
+		streams_->addItem(stream.name, stream.id);
+	displayedSelectionId_ = stateStore_.selectedStreamId();
+	// selected адресует сохранённый ID; синтетический пункт не подтверждает его наличие на сервере.
+	int selected = streams_->findData(displayedSelectionId_);
+	if (selected < 0 && !displayedSelectionId_.isEmpty()) {
+		// Неполный список не доказывает удаления: привязка сохраняется до явного выбора пользователя.
+		streams_->addItem(text_(stateStore_.streamsComplete() ? "Stream.Unavailable" : "Stream.Unconfirmed")
+					  .arg(displayedSelectionId_),
+				  displayedSelectionId_);
+		selected = streams_->count() - 1;
+	}
+	streams_->setCurrentIndex(selected < 0 ? 0 : selected);
+}
+
+// Обновляет подключение, разрешение выбора и безопасные сообщения; телеметрия не пересоздаёт список.
 void RestreamDock::refreshObservations()
 {
 	// connection содержит нынешнее состояние общего канала наблюдения.
@@ -833,10 +1083,14 @@ void RestreamDock::refreshObservations()
 	// observedConnection оставляет отсутствие сервера отдельным от состояния отключения.
 	const auto observedConnection = stateStore_.serverOrigin().isEmpty() ? std::nullopt : std::optional{connection};
 	server_->setConnectionStatus(text_, observedConnection);
-	// streamName содержит отображаемое имя выбранного Stream, если оно доступно.
-	const auto streamName = stateStore_.selectedStreamName();
-	stream_->setText(
-		text_("Dock.SelectedStream").arg(streamName.isEmpty() ? text_("Observation.NoData") : streamName));
+	if (displayedSelectionId_ != stateStore_.selectedStreamId())
+		refreshStreams();
+	// streamsComplete различает полное чтение и полученную часть конфигурационного списка.
+	const bool streamsComplete = stateStore_.streamsComplete();
+	// canChooseStream сохраняет доступность полученных вариантов до подтверждения SSE при неполном списке.
+	const bool canChooseStream = streamsComplete ? connection == ConnectionStatus::Connected
+						     : !stateStore_.streams().isEmpty();
+	streams_->setEnabled(connection_ && stateStore_.profileResolved() && canChooseStream);
 	// notices собирает только безопасные локализованные предупреждения.
 	QStringList notices;
 	if (connection != ConnectionStatus::Connected) {
@@ -848,12 +1102,16 @@ void RestreamDock::refreshObservations()
 	if (!stateStore_.selectedStreamId().isEmpty() && !stateStore_.selectionAvailable()) {
 		notices.append(text_("Stream.SelectionUnavailable"));
 	}
+	if (!streamsComplete &&
+	    stateStore_.configuration().streamsStatus.availability != RuntimeAvailability::Unknown) {
+		notices.append(text_("Stream.ListIncomplete"));
+	}
+	if (!stateStore_.profileNoticeKey().isEmpty())
+		notices.append(text_(stateStore_.profileNoticeKey().toUtf8().constData()));
+	if (stateStore_.settingsUnsaved())
+		notices.append(text_("Settings.Unsaved"));
 	notice_->setText(notices.join(QLatin1Char('\n')));
 	notice_->setVisible(!notices.isEmpty());
-	// profile содержит последнее доступное имя профиля OBS.
-	const auto &profile = stateStore_.profileName();
-	profile_->setText(
-		text_("Dock.ProfileValue").arg(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData")));
 	// statistics даёт подтверждённую фазу штатной трансляции независимо от сервера.
 	const auto &statistics = stateStore_.obsStatistics();
 	if (statistics.observed)
@@ -863,6 +1121,8 @@ void RestreamDock::refreshObservations()
 	refreshOperations();
 }
 
+// Отражает независимые серверные наблюдения и объединяет Outputs с безопасным каталогом назначений.
+// Сохраняет кеш только внутри прежнего контекста и исполнения; неполные сведения не становятся сводкой N/M.
 void RestreamDock::refreshServer()
 {
 	// Сначала очищаем кеш прежнего выбора или Session, чтобы их статистика не появилась у нового выбора.
@@ -887,6 +1147,13 @@ void RestreamDock::refreshServer()
 	}
 	// connected показывает подтверждённую доступность общего канала наблюдения.
 	const bool connected = stateStore_.connectionStatus() == ConnectionStatus::Connected;
+	// Полное свежее отсутствие Session отзывает прежнее исполнение и его строки.
+	// Неизвестный или устаревший поиск сохраняет кеш; каталог назначений хранится отдельно.
+	if (connected && !server.session && fresh(server.sessionStatus.availability) && server.sessionStatus.complete &&
+	    !stats.sessionId.isEmpty()) {
+		stats.sessionId.clear();
+		stats.clearServer();
+	}
 	// sessionCurrent разрешает показывать сохранённое состояние Session как актуальное.
 	const bool sessionCurrent = connected && server.session && fresh(server.sessionStatus.availability);
 	// locale форматирует числа выбранной локали интерфейса.
@@ -1019,10 +1286,19 @@ void RestreamDock::refreshServer()
 	const auto ingestBitrate =
 		stats.inputBitrate.display(inputMetrics ? &inputMetrics->media.rates.payloadBitrate : nullptr,
 					   inputMetricsCurrent, true, locale, text_);
-	ingest_->setText(table(tableRow(text_("Dock.FormatLabel"),
-					inputFormat.isEmpty() ? noData : inputFormat.join(QLatin1Char(' '))) +
-			       tableRow(text_("Dock.FpsLabel"), ingestFps) +
-			       tableRow(text_("Dock.BitrateLabel"), ingestBitrate)));
+	// ingestMetrics измеряет подписи и значения тем же шрифтом, которым их рисует QLabel.
+	const auto ingestMetrics = ingest_->fontMetrics();
+	// ingestColumnWidth учитывает width=33% ячейки и cellpadding=2 с обеих сторон.
+	// До первой компоновки малая ширина разрешает перенос между всеми графемами; resize обновит текст.
+	const int ingestColumnWidth = qMax(1, (ingest_->contentsRect().width() - 2 * ingest_->margin()) * 33 / 100 - 4);
+	ingest_->setText(
+		table(QStringLiteral("<tr>%1%2%3</tr>")
+			      .arg(statisticColumn(text_("Dock.FormatLabel"),
+						   inputFormat.isEmpty() ? noData : inputFormat.join(QLatin1Char(' ')),
+						   ingestMetrics, ingestColumnWidth),
+				   statisticColumn(text_("Dock.FpsLabel"), ingestFps, ingestMetrics, ingestColumnWidth),
+				   statisticColumn(text_("Dock.BitrateLabel"), ingestBitrate, ingestMetrics,
+						   ingestColumnWidth))));
 	// retained отмечает наличие показанных старых измерений для общей подписи.
 	bool retained = (stats.inputFps.stale && stats.inputFps.last) ||
 			(stats.inputBitrate.stale && stats.inputBitrate.last);
@@ -1053,8 +1329,12 @@ void RestreamDock::refreshServer()
 	if (!runtimeCurrent) {
 		// При потере связи сохраняем последние строки; прежние измерения будут подписаны как устаревшие.
 		// it проходит текущую карту выходов; её ключи остаются точными ID при объединении и удалении строк.
-		for (auto it = stats.outputs.cbegin(); it != stats.outputs.cend(); ++it)
-			rows.insert(it.key());
+		for (auto it = stats.outputs.cbegin(); it != stats.outputs.cend(); ++it) {
+			// metadata не позволяет вернуть из кеша явно отсоединённый Output при потере runtime.
+			const auto metadata = server.outputs.constFind(it.key());
+			if (metadata == server.outputs.cend() || metadata->attached)
+				rows.insert(it.key());
+		}
 	}
 	// it проходит текущую карту выходов; её ключи остаются точными ID при объединении и удалении строк.
 	for (auto it = stats.outputs.begin(); it != stats.outputs.end();) {
@@ -1063,20 +1343,28 @@ void RestreamDock::refreshServer()
 		else
 			++it;
 	}
+	// representedDestinations содержит только точные связи прикреплённых REST Outputs с каталогом.
+	// Runtime без такой связи остаётся отдельной строкой, даже если его имя совпадает с назначением.
+	QSet<QString> representedDestinations;
+	// output проходит долговечные метаданные; отсоединённый Output больше не представляет назначение.
+	for (const auto &output : server.outputs) {
+		if (output.attached && !output.destinationId.isEmpty())
+			representedDestinations.insert(output.destinationId);
+	}
 	// outputRows содержит доступное текстовое описание строк для модели и средств доступности.
 	QStringList outputRows;
-	// RowValues содержит отображение строки и точный ID; имя не используется как адрес команды.
+	// RowValues хранит отображение и раздельные IDs Output/назначения; имя не адресует команды.
 	struct RowValues {
-		// id адресует точный Output при открытии меню.
+		// id адресует точный Output; каталоговая строка не выдаёт Destination ID за Output ID.
 		QString id;
+		// destinationId сохраняет точную связь с каталогом; runtime без метаданных её не выдумывает.
+		QString destinationId;
 		// name содержит безопасное отображаемое имя без влияния на адресацию команды.
 		QString name;
 		// status содержит переведённое runtime-состояние выхода или отсутствие данных.
 		QString status;
 		// rate содержит оформленный текущий или явно устаревший битрейт выхода.
 		QString rate;
-		// details содержит отдельные счётчики переподключений, очереди и доставки.
-		QString details;
 		// tone задаёт цвет только наблюдаемого состояния выхода.
 		Tone tone;
 	};
@@ -1085,7 +1373,9 @@ void RestreamDock::refreshServer()
 	// streaming считает только свежие наблюдения PUBLISHING, независимо от квитанций.
 	int streaming = 0;
 	// complete разрешает сводку количества только при полном составе и известных состояниях.
-	bool complete = sessionCurrent && fresh(server.outputsStatus.availability) && server.outputsStatus.complete;
+	bool complete = sessionCurrent && server.sessionStatus.complete && fresh(server.outputsStatus.availability) &&
+			server.outputsStatus.complete && fresh(server.destinationsStatus.availability) &&
+			server.destinationsStatus.complete;
 	// Сводка «N из M» допустима только при полном составе и известном состоянии каждой строки.
 	// Наличие bitrate, единичного PUBLISHING или пустой карты не подтверждает общий итог.
 	// id обозначает точный Output в наборе строк или кеше, независимо от имени.
@@ -1148,7 +1438,7 @@ void RestreamDock::refreshServer()
 		// currentBitrate отображает скорость выбранного исполнения с учётом свежести.
 		const auto currentBitrate = cache.bitrate.display(
 			metrics ? &metrics->media.rates.writtenBitrate : nullptr, metricsCurrent, true, locale, text_);
-		// last форматирует baseline; callback помечает retained, когда показывает прежнее измерение.
+		// last форматирует baseline; обработчик помечает retained, когда показывает прежнее измерение.
 		const auto last = [&](const StatsBaseline &baseline) {
 			// value содержит оформленное значение одного baseline до добавления признака устаревания.
 			const auto value = counterText(locale, text_, baseline);
@@ -1164,7 +1454,7 @@ void RestreamDock::refreshServer()
 				   : metricsCurrent      ? cache.queue
 							 : text_("Dock.LastValue").arg(cache.queue);
 		// name содержит безопасное отображаемое имя без влияния на адресацию команды.
-		const auto name = cache.name.isEmpty() ? text_("Dock.UnnamedOutput") : cache.name.simplified();
+		const auto name = cache.name.isEmpty() ? text_("Dock.UnnamedOutput") : cache.name;
 		outputRows.append(text_("Dock.OutputRow")
 					  .arg(name, label, currentBitrate, last(cache.reconnects), queue,
 					       last(cache.queueDrops), last(cache.deliveryDrops)));
@@ -1176,15 +1466,40 @@ void RestreamDock::refreshServer()
 					  ? Tone::Pending
 				  : output->state == QStringLiteral("FAILED") ? Tone::Error
 									      : Tone::Neutral;
-		rowValues.append(
-			{id, name, label, currentBitrate,
-			 text_("Dock.OutputDetails")
-				 .arg(last(cache.reconnects), queue, last(cache.queueDrops), last(cache.deliveryDrops)),
-			 tone});
+		rowValues.append({id, metadata != server.outputs.cend() ? metadata->destinationId : QString{}, name,
+				  label, currentBitrate, tone});
+	}
+	// destination проходит безопасный каталог выбранного Stream, включая назначения будущего эфира.
+	for (auto destination = server.destinations.cbegin(); destination != server.destinations.cend();
+	     ++destination) {
+		if (representedDestinations.contains(destination.key()))
+			continue;
+		// name сохраняет полное имя назначения для подсказки и средств доступности.
+		const auto name = destination->name.isEmpty() ? text_("Dock.UnnamedOutput") : destination->name;
+		outputRows.append(text_("Dock.OutputRow").arg(name, noData, noData, noData, noData, noData, noData));
+		rowValues.append({{}, destination.key(), name, noData, noData, Tone::Neutral});
+		complete = false;
 	}
 	if (outputRows.isEmpty())
 		outputRows.append(noData);
 	updateRows(*outputs_, outputRows);
+	// shown фиксирует адресацию вместе с установленной моделью, включая строки за прокруткой.
+	OutputBatchRequest shown;
+	shown.context = context;
+	// sourceSessionId сохраняет также завершённую Session, не адресуя ею создание нового эфира.
+	const auto sourceSessionId = server.session ? server.session->id : QString{};
+	shown.noActiveSession = connected && fresh(server.sessionStatus.availability) &&
+				server.sessionStatus.complete &&
+				(!server.session || server.session->state == QStringLiteral("STOPPED") ||
+				 server.session->state == QStringLiteral("FAILED") ||
+				 server.session->state == QStringLiteral("INTERRUPTED"));
+	shown.sessionId = shown.noActiveSession ? QString{} : sourceSessionId;
+	shown.configurationGeneration = stateStore_.configurationGeneration();
+	// values переносит только адресацию и имя показанной строки, без секретной конфигурации.
+	for (const auto &values : rowValues)
+		shown.targets.append({values.id, values.destinationId, values.name});
+	shownOutputs_ = std::move(shown);
+	shownSessionId_ = sourceSessionId;
 	// row обозначает позицию виджета в существующей модели, но не идентичность цели.
 	for (int row = 0; row < outputs_->rowCount(); ++row) {
 		// index выбирает текущий виджет строки в QListView.
@@ -1200,28 +1515,44 @@ void RestreamDock::refreshServer()
 			widget = new OutputRow(text_, outputList_->viewport());
 			outputList_->setIndexWidget(index, widget);
 			// При активации читается ID нынешней строки, затем outputActions фиксирует весь контекст.
-			// Повторное использование indexWidget не оставляет в callback ID прежнего выхода.
+			// Повторное использование indexWidget не оставляет в обработчике ID прежнего выхода.
 			connect(widget->action, &QToolButton::clicked, this, [this, widget] {
-				outputActions(widget->context, widget->sessionId, widget->outputId);
+				outputActions(widget->context, widget->sessionId, widget->outputId,
+					      widget->destinationId, widget->action);
 			});
 		}
 		// values содержит значения именно нынешней строки, включая точный ID.
 		const auto &values = rowValues.at(row);
 		widget->outputId = values.id;
+		widget->destinationId = values.destinationId;
 		widget->context = context;
 		widget->sessionId = server.session ? server.session->id : QString{};
-		widget->action->setEnabled(restream_ && sessionCurrent && fresh(server.outputsStatus.availability));
+		// metadata даёт доступ к прежним Output-командам; известный Destination отдельно разрешает Details.
+		const auto metadata = server.outputs.constFind(values.id);
+		widget->action->setEnabled(
+			context.valid() &&
+			(!values.destinationId.isEmpty() ||
+			 (restream_ && server.session && metadata != server.outputs.cend() && metadata->attached)));
 		widget->name->setText(values.name);
 		widget->status->setStatus(values.status, values.tone);
 		widget->rate->setText(values.rate);
-		widget->details->setText(values.details);
-		widget->setAccessibleName(outputRows.at(row));
+		widget->name->setToolTip(outputToolTip(outputRows.at(row)));
+		widget->name->setAccessibleName(values.name);
+		widget->status->setToolTip(outputToolTip(outputRows.at(row)));
+		widget->status->setAccessibleName(values.status);
+		widget->rate->setToolTip(outputToolTip(outputRows.at(row)));
+		widget->rate->setAccessibleName(values.rate);
+		widget->setToolTip(outputToolTip(outputRows.at(row)));
+		widget->setAccessibleName(values.name);
+		widget->setAccessibleDescription(outputRows.at(row));
+		widget->action->setAccessibleDescription(outputRows.at(row));
 	}
 	static_cast<OutputList *>(outputList_)->updateHeights();
 	outputSummary_->setText(
 		complete && !rows.isEmpty()
 			? text_("Dock.OutputCount").arg(locale.toString(streaming), locale.toString(rows.size()))
-			: text_("Dock.Outputs"));
+			: QString{});
+	outputSummary_->setVisible(!outputSummary_->text().isEmpty());
 	// dataNotice объясняет недоступность сервера и сохранённые прежние измерения.
 	QString dataNotice;
 	if (context.valid() && (!connected || retained)) {
@@ -1279,19 +1610,6 @@ void RestreamDock::refreshOperations()
 	resume_->setEnabled(running && !busy && server.session->desiredPaused);
 	stop_->setEnabled(active &&
 			  (!operations.current || operations.current->action != OperationAction::StopAll || !busy));
-	// outputsKnown предотвращает выбор пакета из частичного или устаревшего состава.
-	const bool outputsKnown = running && !busy && fresh(server.outputsStatus.availability) &&
-				  server.outputsStatus.complete;
-	// attached и stopped обозначают наличие подходящих прикреплённых выходов, а не runtime RETRYING.
-	bool attached = false;
-	bool stopped = false;
-	// output — текущие долговечные намерения выхода.
-	for (const auto &output : server.outputs) {
-		attached = attached || output.attached;
-		stopped = stopped || (output.attached && !output.desiredRunning);
-	}
-	startOutputs_->setEnabled(outputsKnown && stopped);
-	restartOutputs_->setEnabled(outputsKnown && attached);
 	// sessionReadComplete требует полного свежего чтения для действующего контекста и подключения.
 	const bool sessionReadComplete = stateStore_.connectionStatus() == ConnectionStatus::Connected &&
 					 stateStore_.dockContext().valid() &&
@@ -1301,21 +1619,43 @@ void RestreamDock::refreshOperations()
 				   (!server.session || server.session->state == QStringLiteral("STOPPED") ||
 				    server.session->state == QStringLiteral("FAILED") ||
 				    server.session->state == QStringLiteral("INTERRUPTED"));
+	// shownCurrent связывает доступность с уже показанной проекцией, а не новым составом каталога.
+	const bool shownCurrent = shownOutputs_.context == stateStore_.dockContext() &&
+				  shownSessionId_ == (server.session ? server.session->id : QString{}) &&
+				  shownOutputs_.noActiveSession == knownNoActive;
+	// batchAvailable исключает переходную/неизвестную Session и несовместимый workflow.
+	// Проверки отдельных строк и эпохи новых снимков остаются у контроллера: отказ каталога
+	// не должен блокировать исторические прикреплённые выходы всего показанного пакета.
+	const bool batchAvailable = restream_ && !busy && shownCurrent && sessionReadComplete &&
+				    !shownOutputs_.targets.isEmpty() && shownOutputs_.targets.size() <= 10000 &&
+				    (running || knownNoActive);
+	startOutputs_->setEnabled(batchAvailable);
+	stopOutputs_->setEnabled(batchAvailable);
+	restartOutputs_->setEnabled(batchAvailable);
 	// operationText совмещает штатный результат и отдельный риск следующей публикации.
 	QString operationText = formatOperations(operations, text_);
 	if (knownNoActive && obsActive)
 		operationText.append(operationText.isEmpty() ? QString{} : QStringLiteral("\n\n"))
 			.append(text_("Operation.ObsStillActive"));
 	operationStatus_->setText(operationText);
+	operationStatus_->setToolTip(outputToolTip(operationText));
+	operationStatus_->setAccessibleDescription(operationText);
 	operationStatus_->setVisible(!operationStatus_->text().isEmpty());
 	// Подсказка штатного запуска нужна лишь при отсутствии серверного эфира и активной фазы OBS.
 	nativeStart_->setVisible(knownNoActive && !obsActive);
+	// retryHint указывает выбранную контроллером первую Unknown-цель, не меняя её по имени.
+	const auto retryHint = operations.current && !operations.current->retryTargetName.isEmpty()
+				       ? text_("Operation.RetryTarget").arg(operations.current->retryTargetName)
+				       : text_("Operation.Retry");
+	retry_->setToolTip(outputToolTip(retryHint));
+	retry_->setAccessibleDescription(retryHint);
 	retry_->setVisible(operations.current && operations.current->retryAvailable);
 	retry_->setEnabled(restream_ && operations.current && operations.current->retryAvailable &&
 			   operations.current->context == stateStore_.dockContext());
 }
 
-// Фиксирует контекст, Session и весь состав пакета до модального подтверждения, затем передаёт исходную цель.
+// Передаёт action Pause/Resume/StopAll исходной Session. Завершение эфира требует подтверждения;
+// состав выходов здесь не выбирается.
 void RestreamDock::dispatchSessionAction(OperationAction action)
 {
 	if (!restream_ || !stateStore_.dockServer().session)
@@ -1323,26 +1663,16 @@ void RestreamDock::dispatchSessionAction(OperationAction action)
 	// context и sessionId сохраняют цель до вложенного event loop диалога.
 	const auto context = stateStore_.dockContext();
 	const auto sessionId = stateStore_.dockServer().session->id;
-	// outputIds фиксирует состав только один раз; телеметрия во время подтверждения его не расширяет.
-	QStringList outputIds;
-	// output проходит исходные долговечные состояния, id обозначает точный Output.
-	for (auto output = stateStore_.dockServer().outputs.cbegin(); output != stateStore_.dockServer().outputs.cend();
-	     ++output) {
-		if (output->attached && (action != OperationAction::StartStopped || !output->desiredRunning))
-			outputIds.append(output.key());
-	}
-	if (action == OperationAction::StopAll || action == OperationAction::RestartAll) {
+	if (action == OperationAction::StopAll) {
 		// alive запрещает доступ к доку после завершения OBS во вложенном цикле диалога.
 		const QPointer<RestreamDock> alive(this);
 		// confirmation принадлежит доку; QPointer замечает удаление вместе с родителем.
 		const QPointer<QMessageBox> confirmation =
 			new QMessageBox(QMessageBox::Question, text_("Operation.ConfirmTitle"),
-					text_(action == OperationAction::StopAll ? "Operation.ConfirmStopAll"
-										 : "Operation.ConfirmRestartAll"),
-					QMessageBox::Yes | QMessageBox::No, this);
+					text_("Operation.ConfirmStopAll"), QMessageBox::Yes | QMessageBox::No, this);
 		confirmation->setDefaultButton(QMessageBox::No);
 		localizeConfirmation(*confirmation, text_);
-		// choice относится только к исходной цели, которую контроллер повторно проверит после диалога.
+		// choice относится только к исходной цели, которую контроллер проверяет повторно.
 		const auto choice = confirmation->exec();
 		if (confirmation)
 			delete confirmation;
@@ -1359,74 +1689,226 @@ void RestreamDock::dispatchSessionAction(OperationAction action)
 	case OperationAction::StopAll:
 		restream_->stopAll(context, sessionId);
 		break;
-	case OperationAction::StartStopped:
-		restream_->startStopped(context, sessionId, outputIds);
-		break;
-	case OperationAction::RestartAll:
-		restream_->restartAll(context, sessionId, outputIds);
-		break;
 	default:
 		break;
 	}
 }
 
-// Открывает меню для значения outputId, копируя также context и Session до любого вложенного event loop.
-void RestreamDock::outputActions(DockContext context, QString sessionId, QString outputId)
+// Передаёт один пакет ровно показанных строк. action задаёт Start/Stop/Restart выходов,
+// а request копируется до диалога: обновление модели во вложенном цикле не добавляет новых целей.
+// Контроллер повторно проверяет исходные IDs, Session, режим и эпоху; UI не выбирает им замену.
+void RestreamDock::dispatchOutputAction(OperationAction action)
 {
-	if (!restream_ || !stateStore_.dockServer().session)
+	if (!restream_ || (action != OperationAction::StartAllOutputs && action != OperationAction::StopAllOutputs &&
+			   action != OperationAction::RestartAllOutputs))
 		return;
-	if (context != stateStore_.dockContext() || stateStore_.dockServer().session->id != sessionId)
+	// request сохраняет безопасную value-проекцию вместе с порядком и именами исходных строк.
+	const auto request = shownOutputs_;
+	// sourceSessionId сохраняет идентичность показанного списка, в том числе завершённого эфира.
+	const auto sourceSessionId = shownSessionId_;
+	if (!request.context.valid() || request.context != stateStore_.dockContext() || request.targets.isEmpty())
 		return;
-	// metadata даёт только начальную доступность меню; перед отправкой контроллер проверяет цель заново.
-	const auto metadata = stateStore_.dockServer().outputs.value(outputId);
-	// operations и busy отделяют доступность команд от просмотра подробностей уже начатого действия.
-	const auto &operations = stateStore_.operations();
-	const bool busy = operations.current && operations.current->phase != OperationPhase::Idle &&
-			  operations.current->phase != OperationPhase::Finished;
-	// allowed учитывает свежесть исходной цели; фасад повторяет проверку после закрытия меню и диалогов.
-	const bool allowed = !busy && stateStore_.connectionStatus() == ConnectionStatus::Connected &&
-			     stateStore_.dockServer().session->state == QStringLiteral("RUNNING") &&
-			     fresh(stateStore_.dockServer().sessionStatus.availability) &&
-			     fresh(stateStore_.dockServer().outputsStatus.availability);
-	// menu принадлежит стеку GUI и возвращает выбранное намерение, не захватывая индекс строки.
-	QMenu menu(this);
-	// start, stop и restart обозначают три явные команды выбранного выхода.
-	auto *start = menu.addAction(text_("Operation.StartOutput"));
-	auto *stop = menu.addAction(text_("Operation.StopOutput"));
-	auto *restart = menu.addAction(text_("Operation.RestartOutput"));
-	// details переводит в существующее окно; оно также проверяет неизменность исходной цели.
-	auto *details = menu.addAction(text_("Operation.OutputDetails"));
-	start->setEnabled(allowed && metadata.attached && !metadata.desiredRunning);
-	stop->setEnabled(allowed && metadata.attached && metadata.desiredRunning);
-	restart->setEnabled(allowed && metadata.attached);
-	// selected — действие исходного меню, даже если обновилась строка дока.
-	const auto *selected = menu.exec(QCursor::pos());
-	if (!selected)
-		return;
-	if (selected == details) {
-		emit outputDetailsRequested(context, sessionId, outputId);
-		return;
-	}
-	if (selected == restart) {
-		// alive замечает завершение OBS, пока пользователь отвечает на подтверждение.
+	if (action == OperationAction::StopAllOutputs || action == OperationAction::RestartAllOutputs) {
+		// alive замечает удаление Dock во вложенном цикле подтверждения.
 		const QPointer<RestreamDock> alive(this);
-		// confirmation сохраняет стандартные ответы и их смысл после явного перевода.
-		const QPointer<QMessageBox> confirmation =
-			new QMessageBox(QMessageBox::Question, text_("Operation.ConfirmTitle"),
-					text_("Operation.ConfirmRestart"), QMessageBox::Yes | QMessageBox::No, this);
+		// confirmation подтверждает только пакет выходов; Session и OBS этим действием не завершаются.
+		const QPointer<QMessageBox> confirmation = new QMessageBox(
+			QMessageBox::Question, text_("Operation.ConfirmTitle"),
+			text_(action == OperationAction::StopAllOutputs ? "Operation.ConfirmStopOutputs"
+									: "Operation.ConfirmRestartAll"),
+			QMessageBox::Yes | QMessageBox::No, this);
+		confirmation->setTextFormat(Qt::PlainText);
 		confirmation->setDefaultButton(QMessageBox::No);
 		localizeConfirmation(*confirmation, text_);
-		// choice фиксируется до удаления собственного диалога.
+		// choice фиксируется до удаления диалога, затем проверяются Dock и исходный context.
 		const auto choice = confirmation->exec();
 		if (confirmation)
 			delete confirmation;
 		if (!alive || choice != QMessageBox::Yes)
 			return;
 	}
-	restream_->outputActions(context, sessionId, outputId,
-				 selected == start  ? OperationAction::StartOutput
-				 : selected == stop ? OperationAction::StopOutput
-						    : OperationAction::RestartOutput);
+	if (stateStore_.dockContext() != request.context ||
+	    (stateStore_.dockServer().session ? stateStore_.dockServer().session->id : QString{}) != sourceSessionId)
+		return;
+	restream_->controlOutputs(request, action);
+}
+
+// Фиксирует ветвь запуска и раздельные IDs до меню. После вложенных циклов исходные context,
+// Session и цель проверяются снова: появившийся эфир не превращает создание в add-output.
+// anchor задаёт положение меню; неизвестная runtime-строка без связи с каталогом не адресует команды.
+void RestreamDock::outputActions(DockContext context, QString sessionId, QString outputId, QString destinationId,
+				 QToolButton *anchor)
+{
+	if (!anchor || !context.valid() || context != stateStore_.dockContext())
+		return;
+	// initial содержит долговечные наблюдения только до входа во вложенный цикл меню.
+	const auto &initial = stateStore_.dockServer();
+	// sameSession разрешает команды только для исходной Session; просмотр Destination от неё не зависит.
+	const bool sameSession = (initial.session ? initial.session->id : QString{}) == sessionId;
+	// found связывает точный Output с его историческим Destination, не используя имя строки.
+	const auto found = initial.outputs.constFind(outputId);
+	// attached фиксирует наличие исходного прикреплённого Output независимо от его runtime.
+	const bool attached = sameSession && !outputId.isEmpty() && initial.session &&
+			      found != initial.outputs.cend() && found->attached;
+	// metadata сохраняет имя, назначение и намерение исходного Output до обновлений состояния.
+	const auto metadata = attached ? *found : DockOutput{};
+	// sameDestination запрещает команды изменившейся связи Output, но не просмотр исходного Destination.
+	const bool sameDestination = !attached || metadata.destinationId == destinationId;
+	if (!attached && destinationId.isEmpty())
+		return;
+	// StartMode отделяет три серверных действия. Выбранная ветвь не меняется после меню.
+	enum class StartMode {
+		// Unavailable запрещает запуск в переходном либо неизвестном состоянии Session.
+		Unavailable,
+		// AttachedOutput запускает прежний остановленный Output по его историческому снимку.
+		AttachedOutput,
+		// AddToSession прикрепляет назначение к исходной RUNNING Session с новым снимком.
+		AddToSession,
+		// CreateSession создаёт серверную Session только для выбранного назначения.
+		CreateSession
+	};
+	// mode вычисляется обработчиком один раз до меню по исходной Session. Терминальный Output
+	// не адресуется командой запуска: новое исполнение может использовать только Destination ID.
+	const auto mode = [&] {
+		if (!sameSession || !sameDestination)
+			return StartMode::Unavailable;
+		if (initial.session && initial.session->state == QStringLiteral("RUNNING"))
+			return attached ? StartMode::AttachedOutput : StartMode::AddToSession;
+		if ((!initial.session || initial.session->state == QStringLiteral("STOPPED") ||
+		     initial.session->state == QStringLiteral("FAILED") ||
+		     initial.session->state == QStringLiteral("INTERRUPTED")) &&
+		    !destinationId.isEmpty())
+			return StartMode::CreateSession;
+		return StartMode::Unavailable;
+	}();
+	// canCommand проверяет исходные Output/Session по полным свежим данным. intent при start/stop
+	// дополнительно сверяет desiredRunning; отсутствие runtime не мешает сохранённому намерению.
+	const auto canCommand = [&](std::optional<OperationAction> intent = std::nullopt) {
+		// server содержит нынешнюю Session и полный долговечный состав, а не снимок до меню.
+		const auto &server = stateStore_.dockServer();
+		// operations и busy отделяют возможность новой команды от просмотра подробностей.
+		const auto &operations = stateStore_.operations();
+		const bool busy = operations.current && operations.current->phase != OperationPhase::Idle &&
+				  operations.current->phase != OperationPhase::Finished;
+		// output заново находит исходный Output ID, даже если виджет строки уже использован для другого.
+		const auto output = server.outputs.constFind(outputId);
+		return attached && sameDestination && restream_ && !busy && stateStore_.dockContext() == context &&
+		       stateStore_.connectionStatus() == ConnectionStatus::Connected && server.session &&
+		       server.session->id == sessionId && server.session->state == QStringLiteral("RUNNING") &&
+		       fresh(server.sessionStatus.availability) && server.sessionStatus.complete &&
+		       fresh(server.outputsStatus.availability) && server.outputsStatus.complete &&
+		       output != server.outputs.cend() && output->attached && output->destinationId == destinationId &&
+		       (!intent || ((*intent != OperationAction::StartOutput || !output->desiredRunning) &&
+				    (*intent != OperationAction::StopOutput || output->desiredRunning)));
+	};
+	// canStart повторяет допуск только зафиксированной ветви. Каталог нужен для нового снимка,
+	// но запуск attached Output использует его старый снимок и не зависит от нынешнего Destination.
+	const auto canStart = [&] {
+		if (mode == StartMode::AttachedOutput)
+			return canCommand(OperationAction::StartOutput);
+		if (mode == StartMode::Unavailable)
+			return false;
+		// server предоставляет свежесть каталога и исходной Session при проверке после меню.
+		const auto &server = stateStore_.dockServer();
+		// operations и busy запрещают начать ещё один workflow, пока прежний не завершён.
+		const auto &operations = stateStore_.operations();
+		const bool busy = operations.current && operations.current->phase != OperationPhase::Idle &&
+				  operations.current->phase != OperationPhase::Finished;
+		if (!restream_ || busy || stateStore_.dockContext() != context ||
+		    stateStore_.connectionStatus() != ConnectionStatus::Connected ||
+		    !fresh(server.sessionStatus.availability) || !server.sessionStatus.complete ||
+		    !fresh(server.destinationsStatus.availability) || !server.destinationsStatus.complete ||
+		    destinationId.isEmpty() || !server.destinations.contains(destinationId) ||
+		    (server.session ? server.session->id : QString{}) != sessionId)
+			return false;
+		if (mode == StartMode::CreateSession)
+			return !server.session || server.session->state == QStringLiteral("STOPPED") ||
+			       server.session->state == QStringLiteral("FAILED") ||
+			       server.session->state == QStringLiteral("INTERRUPTED");
+		if (!server.session || server.session->state != QStringLiteral("RUNNING") ||
+		    !fresh(server.outputsStatus.availability) || !server.outputsStatus.complete)
+			return false;
+		// output проверяет отсутствие уже прикреплённого назначения; detached история не мешает add.
+		for (const auto &output : server.outputs) {
+			if (output.attached && output.destinationId == destinationId)
+				return false;
+		}
+		return true;
+	};
+	// allowed задаёт начальную доступность прежних Output-команд; перед отправкой допуск повторяется.
+	const bool allowed = canCommand();
+	// alive замечает удаление Dock во вложенных циклах самого меню и подтверждения.
+	const QPointer<RestreamDock> alive(this);
+	// position сохраняет положение кнопки до возможного обновления или удаления строки.
+	const auto position = anchor->mapToGlobal(QPoint(0, anchor->height()));
+	// menu принадлежит Dock; QPointer запрещает доступ после удаления вместе с родителем.
+	const QPointer<QMenu> menu = new QMenu(this);
+	// start предлагает фиксированную ветвь выбранного назначения или остановленного Output.
+	auto *start = menu->addAction(text_("Operation.StartOutput"));
+	// stop останавливает только исходный прикреплённый Output с сохранённым намерением запуска.
+	auto *stop = menu->addAction(text_("Operation.StopOutput"));
+	// restart сохраняет прежнюю последовательность stop/start того же Output с подтверждением.
+	auto *restart = menu->addAction(text_("Operation.RestartOutput"));
+	// details открывает сохранённый Destination даже без Session или прикреплённого Output.
+	auto *details = menu->addAction(text_("Operation.OutputDetails"));
+	start->setEnabled(canStart());
+	stop->setEnabled(allowed && metadata.desiredRunning);
+	restart->setEnabled(allowed);
+	details->setEnabled(!destinationId.isEmpty());
+	// selected заимствован у меню; после его вложенного цикла сначала проверяются владельцы.
+	const auto *selected = menu->exec(position);
+	if (!alive || !menu)
+		return;
+	// openDetails сохраняет выбор до удаления menu и принадлежащих ему QAction.
+	const bool openDetails = selected == details;
+	// action сохраняет значение намерения; указатели действий после удаления menu не используются.
+	const auto action = selected == start  ? OperationAction::StartOutput
+			    : selected == stop ? OperationAction::StopOutput
+					       : OperationAction::RestartOutput;
+	// chosen отличает отменённое меню от явно выбранного действия.
+	const bool chosen = selected != nullptr;
+	delete menu;
+	if (!chosen)
+		return;
+	if (openDetails) {
+		if (stateStore_.dockContext() == context && !destinationId.isEmpty())
+			emit destinationDetailsRequested(context, destinationId);
+		return;
+	}
+	if (action == OperationAction::StartOutput) {
+		if (!canStart())
+			return;
+		if (mode == StartMode::CreateSession)
+			restream_->startDestination(context, destinationId);
+		else if (mode == StartMode::AddToSession)
+			restream_->addOutput(context, sessionId, destinationId);
+		else if (mode == StartMode::AttachedOutput)
+			restream_->outputActions(context, sessionId, outputId, action);
+		return;
+	}
+	if (!canCommand(action))
+		return;
+	if (action == OperationAction::RestartOutput) {
+		// name показывает имя исходного снимка, поэтому переименование не меняет цель подтверждения.
+		const auto name = metadata.name.isEmpty() ? text_("Dock.UnnamedOutput") : metadata.name;
+		// confirmation принадлежит Dock и сохраняет прежние переведённые ответы и безопасный ответ по умолчанию.
+		const QPointer<QMessageBox> confirmation = new QMessageBox(QMessageBox::Question,
+									   text_("Operation.ConfirmTitle"),
+									   text_("Operation.ConfirmRestart").arg(name),
+									   QMessageBox::Yes | QMessageBox::No, this);
+		confirmation->setTextFormat(Qt::PlainText);
+		confirmation->setDefaultButton(QMessageBox::No);
+		localizeConfirmation(*confirmation, text_);
+		// choice фиксирует ответ до освобождения диалога; alive проверяется до следующего доступа к Dock.
+		const auto choice = confirmation->exec();
+		if (confirmation)
+			delete confirmation;
+		if (!alive || choice != QMessageBox::Yes)
+			return;
+	}
+	if (!canCommand(action))
+		return;
+	restream_->outputActions(context, sessionId, outputId, action);
 }
 
 } // namespace gost

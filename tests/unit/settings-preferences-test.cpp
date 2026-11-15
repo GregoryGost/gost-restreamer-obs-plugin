@@ -3,7 +3,11 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QScopeGuard>
+#include <QSignalSpy>
 #include <QTest>
+
+#include <limits>
 
 using namespace gost;
 
@@ -40,6 +44,14 @@ private slots:
 	void invalidPreferencesAreNeverOverwritten_data();
 	// Проверяет типы, диапазоны и отказ записи неподдерживаемого JSON.
 	void invalidPreferencesAreNeverOverwritten();
+	// Задаёт допустимые пределы общего сохранения SSE, REST и журнала.
+	void advancedPreferencesPublishOneCompleteSnapshot_data();
+	// Одна запись публикует сразу все три параметра и сохраняет прежние UUID/привязки.
+	void advancedPreferencesPublishOneCompleteSnapshot();
+	// Задаёт недопустимые сочетания, которые нельзя частично принять в RAM.
+	void invalidAdvancedPreferencesDoNotChangeMemoryOrDisk_data();
+	// Неверный параметр отклоняет весь набор без уведомления или записи.
+	void invalidAdvancedPreferencesDoNotChangeMemoryOrDisk();
 	// Отказ атомарной записи оставляет рабочие preferences в RAM и исходный файл на месте.
 	void failedWritePreservesWorkingPreferencesAndOriginalFile();
 };
@@ -69,6 +81,8 @@ void SettingsPreferencesTest::legacyFormatsKeepBindingsAndUseDefaults()
 	// settings читает defaults без миграции на диске; отдельная запись выполнится только по намерению.
 	SettingsStore settings(path);
 	QVERIFY(settings.load());
+	QVERIFY(!settings.autoConnect());
+	QVERIFY(settings.reconnect());
 	QCOMPARE(settings.httpTimeoutSeconds(), 15);
 	QVERIFY(!settings.detailedLogging());
 	QCOMPARE(settings.sseRejectionRetries(), version == 1 ? 3 : 7);
@@ -82,6 +96,8 @@ void SettingsPreferencesTest::legacyFormatsKeepBindingsAndUseDefaults()
 	// restored доказывает миграцию вместе с UUID, прежним лимитом SSE и сохранённой привязкой.
 	SettingsStore restored(path);
 	QVERIFY(restored.load());
+	QVERIFY(!restored.autoConnect());
+	QVERIFY(restored.reconnect());
 	QCOMPARE(restored.httpTimeoutSeconds(), 60);
 	QVERIFY(restored.detailedLogging());
 	QCOMPARE(restored.sseRejectionRetries(), version == 1 ? 3 : 7);
@@ -166,6 +182,105 @@ void SettingsPreferencesTest::invalidPreferencesAreNeverOverwritten()
 	QVERIFY(!settings.save());
 	QCOMPARE(readSettings(path), invalid);
 }
+// Проверяет обе границы REST, отсутствие повторов, безлимитный SSE и максимальный конечный лимит.
+void SettingsPreferencesTest::advancedPreferencesPublishOneCompleteSnapshot_data()
+{
+	QTest::addColumn<int>("retries");
+	QTest::addColumn<int>("seconds");
+	QTest::addColumn<bool>("detailed");
+	QTest::newRow("unlimited-short") << -1 << 5 << true;
+	QTest::newRow("no-retries-long") << 0 << 60 << false;
+	QTest::newRow("largest-finite") << std::numeric_limits<int>::max() << 25 << true;
+}
+
+// Подписчик changed должен видеть один полный набор; новый экземпляр проверяет реальную запись и привязки.
+void SettingsPreferencesTest::advancedPreferencesPublishOneCompleteSnapshot()
+{
+	// retries, seconds и detailed задают независимо выбранное допустимое сочетание предпочтений.
+	QFETCH(int, retries);
+	QFETCH(int, seconds);
+	QFETCH(bool, detailed);
+	// temp изолирует файл сценария; path не обращается к конфигурации пользователя.
+	WorkspaceTemp temp(QStringLiteral("advanced-preferences"));
+	QVERIFY(temp.isValid());
+	const auto path = temp.filePath(QStringLiteral("settings.json"));
+	// settings создаёт реальную идентичность профиля и две независимые серверные привязки.
+	SettingsStore settings(path);
+	QVERIFY(settings.setServerOrigin(QStringLiteral("http://first")));
+	settings.observeProfile(FrontendEvent::ProfileChanged,
+				{QStringLiteral("A"), QStringLiteral("profiles/a"), {QStringLiteral("A")}, true});
+	// uuid фиксирует идентичность, которая не должна меняться при сохранении предпочтений.
+	const auto uuid = settings.profileUuid();
+	QVERIFY(!uuid.isEmpty());
+	QVERIFY(settings.setSelectedStream(QStringLiteral("http://first"), uuid, QStringLiteral("first-stream")));
+	QVERIFY(settings.setSelectedStream(QStringLiteral("http://second"), uuid, QStringLiteral("second-stream")));
+	// changed фиксирует число публикаций; snapshots сохраняет значения, доступные синхронному подписчику.
+	QSignalSpy changed(&settings, &SettingsStore::changed);
+	QVERIFY(changed.isValid());
+	QList<QJsonObject> snapshots;
+	// Обработчик changed читает все три рабочих поля в момент публикации, выявляя промежуточные комбинации.
+	connect(&settings, &SettingsStore::changed, &settings, [&] {
+		snapshots.append(QJsonObject{{QStringLiteral("retries"), settings.sseRejectionRetries()},
+					     {QStringLiteral("seconds"), settings.httpTimeoutSeconds()},
+					     {QStringLiteral("detailed"), settings.detailedLogging()}});
+	});
+	QVERIFY(settings.saveAdvancedPreferences(retries, seconds, detailed));
+	QCOMPARE(changed.count(), 1);
+	QCOMPARE(snapshots.size(), 1);
+	QCOMPARE(snapshots.front(), (QJsonObject{{QStringLiteral("retries"), retries},
+						 {QStringLiteral("seconds"), seconds},
+						 {QStringLiteral("detailed"), detailed}}));
+	QVERIFY(!settings.unsaved());
+	// restored исключает ложный успех, при котором поменялась только память исходного экземпляра.
+	SettingsStore restored(path);
+	QVERIFY(restored.load());
+	QCOMPARE(restored.sseRejectionRetries(), retries);
+	QCOMPARE(restored.httpTimeoutSeconds(), seconds);
+	QCOMPARE(restored.detailedLogging(), detailed);
+	QCOMPARE(restored.serverOrigin(), QStringLiteral("http://first"));
+	QVERIFY(restored.profiles().contains(uuid));
+	QCOMPARE(restored.profiles().value(uuid).name, QStringLiteral("A"));
+	QCOMPARE(restored.profiles().value(uuid).locator, QStringLiteral("profiles/a"));
+	QCOMPARE(restored.selectedStream(QStringLiteral("http://first"), uuid), QStringLiteral("first-stream"));
+	QCOMPARE(restored.selectedStream(QStringLiteral("http://second"), uuid), QStringLiteral("second-stream"));
+}
+
+// Неверное число повторов или срок REST не разрешают применить остальные допустимые поля набора.
+void SettingsPreferencesTest::invalidAdvancedPreferencesDoNotChangeMemoryOrDisk_data()
+{
+	QTest::addColumn<int>("retries");
+	QTest::addColumn<int>("seconds");
+	QTest::newRow("invalid-retries") << -2 << 60;
+	QTest::newRow("timeout-below-minimum") << -1 << 4;
+	QTest::newRow("timeout-above-maximum") << 7 << 61;
+}
+
+// Отказ проверки набора не изменяет RAM, исходный файл и число публикаций SettingsStore.
+void SettingsPreferencesTest::invalidAdvancedPreferencesDoNotChangeMemoryOrDisk()
+{
+	// retries и seconds содержат один недопустимый параметр вместе с другим допустимым изменением.
+	QFETCH(int, retries);
+	QFETCH(int, seconds);
+	// temp/path/settings создают подтверждённые исходные предпочтения только внутри workspace.
+	WorkspaceTemp temp(QStringLiteral("advanced-invalid"));
+	QVERIFY(temp.isValid());
+	const auto path = temp.filePath(QStringLiteral("settings.json"));
+	SettingsStore settings(path);
+	QVERIFY(settings.saveAdvancedPreferences(3, 15, false));
+	// original и changed обнаруживают запись либо уведомление даже при сохранении прежних значений.
+	const auto original = readSettings(path);
+	QSignalSpy changed(&settings, &SettingsStore::changed);
+	QVERIFY(changed.isValid());
+	QVERIFY(!settings.saveAdvancedPreferences(retries, seconds, true));
+	QCOMPARE(settings.sseRejectionRetries(), 3);
+	QCOMPARE(settings.httpTimeoutSeconds(), 15);
+	QVERIFY(!settings.detailedLogging());
+	QVERIFY(!settings.unsaved());
+	QCOMPARE(readSettings(path), original);
+	QCOMPARE(changed.count(), 0);
+}
+
+// Отказ commit оставляет весь принятый набор в RAM; повтор без нового ввода сохраняет его после снятия запрета.
 void SettingsPreferencesTest::failedWritePreservesWorkingPreferencesAndOriginalFile()
 {
 	// temp/path/settings создают исходный документ на диске внутри workspace.
@@ -174,21 +289,36 @@ void SettingsPreferencesTest::failedWritePreservesWorkingPreferencesAndOriginalF
 	const auto path = temp.filePath(QStringLiteral("settings.json"));
 	SettingsStore settings(path);
 	QVERIFY(settings.save());
-	// original сохраняет проверяемую старую версию; saved/after фиксируют исход отказавшей записи.
+	// original сохраняет проверяемую старую версию.
 	const auto original = readSettings(path);
 	QVERIFY(QFile::setPermissions(path, QFileDevice::ReadOwner));
-	settings.setHttpTimeoutSeconds(60);
-	settings.setDetailedLogging(true);
-	const bool saved = settings.save();
+	// restorePermissions возвращает возможность удалить сценарный файл даже после раннего отказа проверки.
+	const auto restorePermissions =
+		qScopeGuard([&] { QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner); });
+	// changed проверяет одну публикацию полного набора при отказе и одну при повторном commit.
+	QSignalSpy changed(&settings, &SettingsStore::changed);
+	QVERIFY(changed.isValid());
+	// saved и after фиксируют исход и точные байты отказавшей записи до восстановления доступа.
+	const bool saved = settings.saveAdvancedPreferences(-1, 60, true);
 	const auto after = readSettings(path);
 	QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
 	QVERIFY(!saved);
 	QCOMPARE(after, original);
+	QCOMPARE(changed.count(), 1);
+	QCOMPARE(settings.sseRejectionRetries(), -1);
 	QCOMPARE(settings.httpTimeoutSeconds(), 60);
 	QVERIFY(settings.detailedLogging());
 	QVERIFY(settings.unsaved());
-	QVERIFY(settings.save());
+	QCOMPARE(settings.errorKey(), QStringLiteral("Settings.WriteError"));
+	QVERIFY(settings.saveAdvancedPreferences(-1, 60, true));
+	QCOMPARE(changed.count(), 2);
 	QVERIFY(!settings.unsaved());
+	// restored читает все три значения после повтора, а не рабочие значения прежнего объекта.
+	SettingsStore restored(path);
+	QVERIFY(restored.load());
+	QCOMPARE(restored.sseRejectionRetries(), -1);
+	QCOMPARE(restored.httpTimeoutSeconds(), 60);
+	QVERIFY(restored.detailedLogging());
 }
 
 QTEST_GUILESS_MAIN(SettingsPreferencesTest)

@@ -10,19 +10,40 @@ namespace gost {
 
 // Намерение пользователя; наблюдение OBS само по себе не создаёт ни одного из этих действий.
 enum class OperationAction {
+	// None обозначает отсутствие явного пользовательского действия.
 	None,
+	// CheckFallback проверяет пригодность всех Enabled назначений без запуска.
 	CheckFallback,
+	// StartFallback запускает зафиксированный набор прежней общей проверки.
 	StartFallback,
+	// AddOutput прикрепляет одно назначение к уже выбранной RUNNING Session.
 	AddOutput,
+	// Pause задаёт серверную паузу исходной Session.
 	Pause,
+	// Resume снимает серверную паузу исходной Session.
 	Resume,
+	// StopAll останавливает OBS и исходную Session с отдельным подтверждением обеих частей.
 	StopAll,
+	// StartOutput запускает точный уже прикреплённый остановленный Output.
 	StartOutput,
+	// StopOutput останавливает выбранный Output без изменения соседних выходов.
 	StopOutput,
+	// RestartOutput выполняет stop и start того же Output с разными квитанциями.
 	RestartOutput,
+	// DetachOutput отсоединяет выбранный Output, сохраняя конфигурацию назначения.
 	DetachOutput,
+	// StartStopped фиксирует и последовательно запускает остановленные прикреплённые Outputs.
 	StartStopped,
-	RestartAll
+	// RestartAll фиксирует и последовательно перезапускает выбранные прикреплённые Outputs.
+	RestartAll,
+	// StartDestination создаёт Session только с одним выбранным назначением без запуска OBS.
+	StartDestination,
+	// StartAllOutputs запускает только замороженные показанные строки, не прерывая desired=true.
+	StartAllOutputs,
+	// StopAllOutputs останавливает только выходы, сохраняя Session и передачу OBS.
+	StopAllOutputs,
+	// RestartAllOutputs выполняет stop/start attached и добавляет ещё не исполняющиеся назначения.
+	RestartAllOutputs
 };
 // Фаза единственного исполнителя; Finished сохраняет результат, но не блокирует новое намерение.
 enum class OperationPhase { Idle, Prechecking, Sending, PollingReceipt, ConfirmingState, StoppingObs, Finished };
@@ -61,6 +82,30 @@ struct FallbackPrecheck {
 	bool rebuildWarning = true;
 };
 
+// Адресация и безопасная подпись одной показанной строки; имя не участвует в выборе цели.
+struct OutputBatchTarget {
+	// outputId адресует исторический attached Output исходной Session; пуст у каталоговой строки.
+	QString outputId;
+	// destinationId адресует назначение независимо от наличия текущего исполнения.
+	QString destinationId;
+	// name сохраняет показанную подпись для результатов и явного повтора.
+	QString name;
+};
+
+// Неизменяемое намерение над всем показанным списком, включая строки за прокруткой.
+struct OutputBatchRequest {
+	// context фиксирует origin, профиль OBS и выбранный Stream до подтверждения.
+	DockContext context;
+	// sessionId фиксирует исходную RUNNING Session; пуст при noActiveSession.
+	QString sessionId;
+	// noActiveSession означает полное свежее подтверждение отсутствия активного эфира.
+	bool noActiveSession = false;
+	// configurationGeneration запрещает создавать новые снимки после изменения конфигурации.
+	quint64 configurationGeneration = 0;
+	// targets сохраняет исходный порядок и точные раздельные IDs всех показанных строк.
+	QVector<OutputBatchTarget> targets;
+};
+
 // Раздельные результаты одного Output: успех команды не равен успеху публикации площадки.
 struct OutputOperationResult {
 	// Точная сохранённая идентичность Output.
@@ -69,6 +114,16 @@ struct OutputOperationResult {
 	QString name;
 	// Итог элемента; у restart Completed возможен лишь после stop и start.
 	OperationOutcome outcome = OperationOutcome::NotSent;
+	// destinationId остаётся отдельным адресом назначения даже до появления Output.
+	QString destinationId;
+	// stopOutcome показывает результат обязательной stop-части; None означает неприменимость.
+	OperationOutcome stopOutcome = OperationOutcome::None;
+	// startOutcome не становится Completed только из-за успеха предшествующего stop.
+	OperationOutcome startOutcome = OperationOutcome::None;
+	// noOp отмечает подтверждённое отсутствие необходимости посылать команду этой строки.
+	bool noOp = false;
+	// messageKey содержит только локальную безопасную причину, без failure.message сервера.
+	QString messageKey;
 };
 
 // Публичное значение текущей операции; исходные тела POST остаются только в RAM исполнителя.
@@ -107,6 +162,8 @@ struct WorkflowResult {
 	bool remainingStopped = false;
 	// Наличие живого RAM payload допускает явный повтор с тем же request_id.
 	bool retryAvailable = false;
+	// Имя первой сохранённой Unknown строки поясняет цель следующего явного повтора.
+	QString retryTargetName;
 	// Безопасная локальная причина для UI.
 	QString messageKey;
 };

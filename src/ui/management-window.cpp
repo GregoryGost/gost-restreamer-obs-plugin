@@ -5,11 +5,9 @@
 #include "core/settings-store.hpp"
 #include "core/configuration-controller.hpp"
 #include "ui/configuration-editor.hpp"
-#include "ui/confirmation-dialog.hpp"
 #include "ui/status-label.hpp"
 
 #include <QApplication>
-#include <QCheckBox>
 #include <QComboBox>
 #include <QEvent>
 #include <QFile>
@@ -20,7 +18,6 @@
 #include <QList>
 #include <QListWidget>
 #include <QLineEdit>
-#include <QMessageBox>
 #include <QPalette>
 #include <QPixmap>
 #include <QPushButton>
@@ -30,6 +27,7 @@
 #include <QSignalBlocker>
 #include <QScrollArea>
 #include <QSpinBox>
+#include <QStringList>
 #include <QStackedWidget>
 #include <QStyle>
 #include <QTimer>
@@ -116,25 +114,13 @@ QWidget *makePage(const QString &title, const QString &message, QWidget *parent)
 	return page;
 }
 
-// Показывает локализованные стандартные Yes/No для parent с исходным выбором No.
-// title и message выводятся обычным текстом; удаление родителя во время exec не оставляет висячий диалог.
-int askConfirmation(QWidget *parent, const TextLookup &text, const QString &title, const QString &message)
-{
-	// dialog принадлежит parent; QPointer позволяет корректно завершить вложенный цикл при удалении окна.
-	QPointer<QMessageBox> dialog =
-		new QMessageBox(QMessageBox::Question, title, message, QMessageBox::Yes | QMessageBox::No, parent);
-	dialog->setTextFormat(Qt::PlainText);
-	dialog->setDefaultButton(QMessageBox::No);
-	localizeConfirmation(*dialog, text);
-	// choice сохраняет стандартный идентификатор ответа до удаления временного диалога.
-	const int choice = dialog->exec();
-	delete dialog.data();
-	return choice;
-}
-
 } // namespace
 
-// Создаёт страницы единого окна и соединения с общими сервисами; закрытие окна только скрывает его.
+// Создаёт страницы для stateStore с переводами text, связывая окно с parent и заимствованными
+// connection/configuration. Неименованный RestreamController не используется этим представлением.
+// Каждая страница настроек применяет свой черновик только явным сохранением;
+// отмена восстанавливает её текущие рабочие значения без записи и сетевых действий.
+// Соединения Qt привязаны к этому окну и прекращаются при его удалении; закрытие только скрывает окно.
 ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent,
 				   ConnectionController *connection, RestreamController *,
 				   ConfigurationController *configuration)
@@ -211,7 +197,7 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	// groupsLayout располагает заголовок и редактор связей группы.
 	auto *groupsLayout = new QVBoxLayout(groups);
 	addPageHeading(*groupsLayout, text_("Page.Groups"));
-	// profiles и profilesLayout представляют полный профиль самостоятельным разделом навигации.
+	// profiles содержит самостоятельную страницу профилей; profilesLayout размещает её заголовок и редактор.
 	auto *profiles = new QWidget(pages);
 	auto *profilesLayout = new QVBoxLayout(profiles);
 	addPageHeading(*profilesLayout, text_("Page.Profiles"));
@@ -253,12 +239,12 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	diagnosticsLayout->addWidget(notice);
 	diagnosticsLayout->addStretch();
 	addPage("Page.Diagnostics", diagnostics, "sources/window.svg", QStyle::SP_FileDialogDetailedView);
-	// settingsPage содержит только настройки подключения и выбора Stream.
+	// settingsPage содержит черновик адреса API и явные действия сохранения/отмены.
 	auto *settingsPage = new QWidget(pages);
-	// settingsLayout размещает форму, команды подключения и безопасные сообщения.
+	// settingsLayout размещает форму адреса, кнопки и локальные сообщения о её сохранении.
 	auto *settingsLayout = new QVBoxLayout(settingsPage);
 	addPageHeading(*settingsLayout, text_("Page.Settings"));
-	// form выравнивает поля сетевых предпочтений и текущий Stream.
+	// form выравнивает подпись и поле адреса API.
 	auto *form = new QFormLayout;
 	form->setRowWrapPolicy(QFormLayout::WrapLongRows);
 	apiUrl_ = new QLineEdit(stateStore_.serverOrigin(), settingsPage);
@@ -267,44 +253,31 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	apiUrl_->setPlaceholderText(QStringLiteral("http://host:8080"));
 	apiUrl_->setMaxLength(4096);
 	form->addRow(text_("Settings.ServerUrl"), apiUrl_);
-	autoConnect_ = new QCheckBox(text_("Settings.AutoConnect"), settingsPage);
-	autoConnect_->setObjectName(QStringLiteral("autoConnect"));
-	form->addRow(autoConnect_);
-	reconnect_ = new QCheckBox(text_("Settings.Reconnect"), settingsPage);
-	reconnect_->setObjectName(QStringLiteral("reconnect"));
-	form->addRow(reconnect_);
-	streams_ = new QComboBox(settingsPage);
-	streams_->setObjectName(QStringLiteral("streamSelector"));
-	streams_->setAccessibleName(text_("Settings.Stream"));
-	form->addRow(text_("Settings.Stream"), streams_);
-	connectionStatus_ = new StatusLabel(settingsPage);
-	connectionStatus_->setObjectName(QStringLiteral("connectionStatus"));
-	form->addRow(text_("Settings.ConnectionStatus"), connectionStatus_);
 	settingsLayout->addLayout(form);
-	// buttons группирует явные действия подключения и отключения.
+	// buttons группирует сохранение адреса и отмену локального ввода.
 	auto *buttons = new QHBoxLayout;
-	connectButton_ = new QPushButton(text_("Settings.Connect"), settingsPage);
-	connectButton_->setObjectName(QStringLiteral("connectButton"));
-	disconnectButton_ = new QPushButton(text_("Settings.Disconnect"), settingsPage);
-	disconnectButton_->setObjectName(QStringLiteral("disconnectButton"));
-	buttons->addWidget(connectButton_);
-	buttons->addWidget(disconnectButton_);
+	settingsSaveButton_ = new QPushButton(text_("Settings.Save"), settingsPage);
+	settingsSaveButton_->setObjectName(QStringLiteral("settingsSaveButton"));
+	settingsCancelButton_ = new QPushButton(text_("Settings.Cancel"), settingsPage);
+	settingsCancelButton_->setObjectName(QStringLiteral("settingsCancelButton"));
+	buttons->addWidget(settingsSaveButton_);
+	buttons->addWidget(settingsCancelButton_);
 	buttons->addStretch();
 	settingsLayout->addLayout(buttons);
-	connectionMessage_ = new QLabel(settingsPage);
-	connectionMessage_->setObjectName(QStringLiteral("connectionMessage"));
-	connectionMessage_->setTextFormat(Qt::PlainText);
-	connectionMessage_->setWordWrap(true);
-	settingsLayout->addWidget(connectionMessage_);
+	settingsMessage_ = new QLabel(settingsPage);
+	settingsMessage_->setObjectName(QStringLiteral("settingsMessage"));
+	settingsMessage_->setTextFormat(Qt::PlainText);
+	settingsMessage_->setWordWrap(true);
+	settingsLayout->addWidget(settingsMessage_);
 	settingsLayout->addStretch();
 	addPage("Page.Settings", settingsPage, "settings/general.svg", QStyle::SP_ComputerIcon);
 
-	// advancedPage содержит существующий параметр повторов подписки SSE.
+	// advancedPage содержит черновики предпочтений SSE, REST и журнала OBS.
 	auto *advancedPage = new QWidget(pages);
 	// advancedLayout размещает дополнительные сетевые предпочтения и результат сохранения.
 	auto *advancedLayout = new QVBoxLayout(advancedPage);
 	addPageHeading(*advancedLayout, text_("Page.Advanced"));
-	// advancedForm выравнивает существующий лимит повторов SSE.
+	// advancedForm выравнивает поля лимита SSE, срока REST и режима журнала.
 	auto *advancedForm = new QFormLayout;
 	advancedForm->setRowWrapPolicy(QFormLayout::WrapLongRows);
 	sseRejectionRetries_ = new QSpinBox(advancedPage);
@@ -328,12 +301,17 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	logMode_->addItem(text_("Settings.LogDetailed"), true);
 	advancedForm->addRow(text_("Settings.LogMode"), logMode_);
 	advancedLayout->addLayout(advancedForm);
-	// logNotice поясняет единый журнал OBS без вывода каких-либо серверных значений.
-	auto *logNotice = new QLabel(text_("Settings.LogNotice"), advancedPage);
-	logNotice->setTextFormat(Qt::PlainText);
-	logNotice->setWordWrap(true);
-	advancedLayout->addWidget(logNotice);
-	advancedSettingsMessage_ = new QLabel(advancedPage);
+	// advancedButtons группирует явное применение всех трёх предпочтений и отмену их черновика.
+	auto *advancedButtons = new QHBoxLayout;
+	advancedSettingsSaveButton_ = new QPushButton(text_("Settings.Save"), advancedPage);
+	advancedSettingsSaveButton_->setObjectName(QStringLiteral("advancedSettingsSaveButton"));
+	advancedSettingsCancelButton_ = new QPushButton(text_("Settings.Cancel"), advancedPage);
+	advancedSettingsCancelButton_->setObjectName(QStringLiteral("advancedSettingsCancelButton"));
+	advancedButtons->addWidget(advancedSettingsSaveButton_);
+	advancedButtons->addWidget(advancedSettingsCancelButton_);
+	advancedButtons->addStretch();
+	advancedLayout->addLayout(advancedButtons);
+	advancedSettingsMessage_ = new StatusLabel(advancedPage, false);
 	advancedSettingsMessage_->setObjectName(QStringLiteral("advancedSettingsMessage"));
 	advancedSettingsMessage_->setTextFormat(Qt::PlainText);
 	advancedSettingsMessage_->setWordWrap(true);
@@ -341,71 +319,84 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	advancedLayout->addStretch();
 	addPage("Page.Advanced", advancedPage, "settings/advanced.svg", QStyle::SP_FileDialogContentsView);
 
-	// Обработчик подключения проверяет введённый origin и подтверждает смену сервера до передачи контроллеру.
-	connect(connectButton_, &QPushButton::clicked, this, [this] {
-		// Подтверждение требуется при смене уже выбранного origin. Неверный ввод передаётся контроллеру
-		// для сообщения в существующем UI, а не заменяет адрес догадкой или исправлением по умолчанию.
+	// Изменение текста сбрасывает прежнюю локальную ошибку и обновляет доступность Save/Cancel.
+	connect(apiUrl_, &QLineEdit::textChanged, this, [this] {
+		apiUrlInvalid_ = false;
+		refresh();
+	});
+	// Save проверяет черновик до вызова контроллера. Нажатие само подтверждает выбранный сервер;
+	// эквивалентный origin не прерывает связь, но позволяет повторить подключение после Error/Disconnected.
+	connect(settingsSaveButton_, &QPushButton::clicked, this, [this] {
 		if (!connection_) {
 			return;
 		}
 		// origin содержит проверенный канонический адрес, если пользователь ввёл допустимое значение.
 		const auto origin = SettingsStore::canonicalOrigin(apiUrl_->text());
-		if (origin && !stateStore_.serverOrigin().isEmpty() && *origin != stateStore_.serverOrigin()) {
-			// guard запрещает продолжение после удаления окна во вложенном цикле подтверждения.
-			const QPointer<ManagementWindow> guard = this;
-			// choice подтверждает смену уже выбранного сервера, сохраняя явный пользовательский выбор.
-			const auto choice = askConfirmation(this, text_, text_("Settings.ChangeServerTitle"),
-							    text_("Settings.ChangeServerConfirm").arg(*origin));
-			if (!guard || choice != QMessageBox::Yes) {
-				return;
-			}
+		if (!origin) {
+			apiUrlInvalid_ = true;
+			refresh();
+			return;
 		}
-		connection_->connectToServer(apiUrl_->text());
-	});
-	// Обработчик отключения прекращает наблюдение, не завершая серверный эфир или штатную трансляцию OBS.
-	connect(disconnectButton_, &QPushButton::clicked, this, [this] {
-		if (connection_) {
-			connection_->disconnectFromServer();
+		apiUrlInvalid_ = false;
+		apiUrl_->setText(*origin);
+		// canRetry разрешает повторное подключение к тому же адресу лишь после остановки наблюдения.
+		const bool canRetry = stateStore_.connectionStatus() == ConnectionStatus::Error ||
+				      stateStore_.connectionStatus() == ConnectionStatus::Disconnected;
+		if (*origin == stateStore_.serverOrigin() && !canRetry) {
+			refresh();
+			return;
 		}
+		connection_->connectToServer(*origin);
 	});
-	// Обработчик сохраняет enabled как предпочтение автоподключения; эфир не запускается.
-	connect(autoConnect_, &QCheckBox::toggled, this, [this](bool enabled) {
-		if (connection_) {
-			connection_->setAutoConnect(enabled);
-		}
+	// Cancel восстанавливает текущий рабочий origin и очищает только локальную ошибку формы.
+	// Черновик дополнительных предпочтений не затрагивается; сетевые действия здесь не выполняются.
+	connect(settingsCancelButton_, &QPushButton::clicked, this, [this] {
+		apiUrlInvalid_ = false;
+		apiUrl_->setText(stateStore_.serverOrigin());
+		refresh();
 	});
-	// Обработчик передаёт enabled в существующую настройку восстановления наблюдения.
-	connect(reconnect_, &QCheckBox::toggled, this, [this](bool enabled) {
-		if (connection_) {
-			connection_->setReconnect(enabled);
-		}
+	connect(sseRejectionRetries_, &QSpinBox::valueChanged, this, &ManagementWindow::editAdvancedSettings);
+	connect(httpTimeout_, &QSpinBox::valueChanged, this, &ManagementWindow::editAdvancedSettings);
+	connect(logMode_, &QComboBox::currentIndexChanged, this, &ManagementWindow::editAdvancedSettings);
+	// sseEditor и timeoutEditor принадлежат своим spinbox. textEdited отмечает ввод до valueChanged,
+	// поскольку keyboardTracking=false откладывает разбор до потери фокуса или interpretText().
+	auto *sseEditor = sseRejectionRetries_->findChild<QLineEdit *>();
+	auto *timeoutEditor = httpTimeout_->findChild<QLineEdit *>();
+	connect(sseEditor, &QLineEdit::textEdited, this, &ManagementWindow::editAdvancedSettings);
+	connect(timeoutEditor, &QLineEdit::textEdited, this, &ManagementWindow::editAdvancedSettings);
+	// Save разбирает ожидающий текст обоих spinbox и фиксирует полный набор до синхронной публикации.
+	// Пока контроллер сохраняет настройки, dirty защищает оставшиеся поля от промежуточного refresh.
+	connect(advancedSettingsSaveButton_, &QPushButton::clicked, this, [this] {
+		if (!connection_)
+			return;
+		sseRejectionRetries_->interpretText();
+		httpTimeout_->interpretText();
+		// retries задаёт новый лимит SSE; seconds — срок REST; detailed — выбранный режим журнала.
+		const int retries = sseRejectionRetries_->value();
+		const int seconds = httpTimeout_->value();
+		const bool detailed = logMode_->currentData().toBool();
+		advancedSettingsDirty_ = true;
+		// guard запрещает обращаться к виджетам после удаления окна синхронным обработчиком состояния.
+		const QPointer<ManagementWindow> guard(this);
+		// saved подтверждает именно commit файла, а не одно принятие значений в рабочую RAM.
+		const bool saved = connection_->saveAdvancedPreferences(retries, seconds, detailed);
+		if (!guard)
+			return;
+		advancedSettingsSaveResult_ = saved;
+		advancedSettingsDirty_ = stateStore_.sseRejectionRetries() != retries ||
+					 stateStore_.httpTimeoutSeconds() != seconds ||
+					 stateStore_.detailedLogging() != detailed;
+		refresh();
 	});
-	// Обработчик сохраняет retries как существующий лимит повторов отклонённой подписки SSE.
-	connect(sseRejectionRetries_, &QSpinBox::valueChanged, this, [this](int retries) {
-		if (connection_) {
-			connection_->setSseRejectionRetries(retries);
-		}
-	});
-	// seconds изменяет общий срок только будущих обычных REST-заданий.
-	connect(httpTimeout_, &QSpinBox::valueChanged, this, [this](int seconds) {
-		if (connection_)
-			connection_->setHttpTimeoutSeconds(seconds);
-	});
-	// index указывает один из двух закрытых режимов; отображаемое имя не сериализуется.
-	connect(logMode_, &QComboBox::currentIndexChanged, this, [this](int index) {
-		if (connection_ && index >= 0)
-			connection_->setDetailedLogging(logMode_->itemData(index).toBool());
-	});
-	// Обработчик использует точный itemData выбранного index, а не отображаемое имя Stream.
-	connect(streams_, &QComboBox::currentIndexChanged, this, [this](int index) {
-		if (connection_ && index >= 0) {
-			connection_->selectStream(streams_->itemData(index).toString());
-		}
+	// Cancel возвращает текущие рабочие значения, включая RAM после отказа диска, без вызова контроллера.
+	connect(advancedSettingsCancelButton_, &QPushButton::clicked, this, [this] {
+		advancedSettingsDirty_ = false;
+		advancedSettingsSaveResult_.reset();
+		refresh();
 	});
 	connect(navigation, &QListWidget::currentRowChanged, this, &ManagementWindow::changePage);
 	connect(&stateStore_, &StateStore::obsStateChanged, this, &ManagementWindow::refresh);
 	connect(&stateStore_, &StateStore::serverStateChanged, this, &ManagementWindow::refresh);
-	connect(&stateStore_, &StateStore::streamsChanged, this, &ManagementWindow::refreshStreams);
 	// initialPage восстанавливает вид существующего RAM-черновика при редком пересоздании самого окна.
 	int initialPage = 0;
 	if (configuration_ && stateStore_.configurationEditor().draft) {
@@ -425,7 +416,6 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	}
 	currentPage_ = initialPage;
 	navigation->setCurrentRow(initialPage);
-	refreshStreams();
 	refresh();
 }
 
@@ -521,120 +511,114 @@ void ManagementWindow::changePage(int row)
 	activateCurrentEditor();
 }
 
-void ManagementWindow::refreshStreams()
+// Сохраняет даже ещё не разобранный ввод spinbox до явного решения пользователя; новых настроек не публикует.
+void ManagementWindow::editAdvancedSettings()
 {
-	// Синтетический пункт старого ID хранит точное itemData. Он сохраняет принадлежность выбора,
-	// но не подтверждает наличие Stream на сервере; контроллер разрешает новый выбор только из полученных.
-	// Пересоздание пунктов не является пользовательским выбором и не должно менять сохранённую привязку.
-	const QSignalBlocker blockStreams(streams_);
-	streams_->clear();
-	streams_->addItem(text_("Stream.Choose"), QString{});
-	for (const auto &stream : stateStore_.streams()) {
-		streams_->addItem(stream.name, stream.id);
-	}
-	displayedSelectionId_ = stateStore_.selectedStreamId();
-	int selected = streams_->findData(displayedSelectionId_);
-	if (selected < 0 && !displayedSelectionId_.isEmpty()) {
-		// Неполный список не доказывает удаления сохранённого Stream; привязка остаётся до явного выбора.
-		streams_->addItem(text_(stateStore_.streamsComplete() ? "Stream.Unavailable" : "Stream.Unconfirmed")
-					  .arg(displayedSelectionId_),
-				  displayedSelectionId_);
-		selected = streams_->count() - 1;
-	}
-	streams_->setCurrentIndex(selected < 0 ? 0 : selected);
+	advancedSettingsDirty_ = true;
+	advancedSettingsSaveResult_.reset();
+	refresh();
 }
 
+// Отражает диагностику и доступность форм без обратного сохранения через сигналы виджетов.
+// Черновики адреса и дополнительных предпочтений сохраняются при любых обновлениях состояния.
 void ManagementWindow::refresh()
 {
-	// Отражение состояния не должно вызвать методы изменения или сохранение обратно через toggled/valueChanged.
-	// Список потоков обновляется отдельно: частая SSE-телеметрия иначе сбрасывала бы раскрытый список.
 	// profile содержит последнее доступное имя профиля OBS.
 	const auto &profile = stateStore_.profileName();
 	profile_->setText(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData"));
 	streaming_->setStreamingStatus(text_, stateStore_.streamingActive());
-	// blockAuto не допускает сохранения отражённого значения автоподключения как нового ввода.
-	const QSignalBlocker blockAuto(autoConnect_);
-	// blockReconnect не допускает обратного вызова изменения reconnect при отражении состояния.
-	const QSignalBlocker blockReconnect(reconnect_);
-	// blockSseRetries не допускает обратного сохранения отражённого лимита повторов.
-	const QSignalBlocker blockSseRetries(sseRejectionRetries_);
-	// blockTimeout и blockLog исключают обратное сохранение отражённых предпочтений.
-	const QSignalBlocker blockTimeout(httpTimeout_);
-	const QSignalBlocker blockLog(logMode_);
-	autoConnect_->setChecked(stateStore_.autoConnect());
-	reconnect_->setChecked(stateStore_.reconnect());
-	if (sseRejectionRetries_->value() != stateStore_.sseRejectionRetries()) {
+	if (!advancedSettingsDirty_) {
+		// blockSseRetries, blockTimeout и blockLog не превращают отражение рабочих значений в новый ввод.
+		const QSignalBlocker blockSseRetries(sseRejectionRetries_);
+		const QSignalBlocker blockTimeout(httpTimeout_);
+		const QSignalBlocker blockLog(logMode_);
 		sseRejectionRetries_->setValue(stateStore_.sseRejectionRetries());
+		httpTimeout_->setValue(stateStore_.httpTimeoutSeconds());
+		logMode_->setCurrentIndex(stateStore_.detailedLogging() ? 1 : 0);
 	}
-	autoConnect_->setEnabled(connection_ != nullptr);
-	reconnect_->setEnabled(connection_ != nullptr);
-	sseRejectionRetries_->setEnabled(connection_ && stateStore_.reconnect());
-	httpTimeout_->setValue(stateStore_.httpTimeoutSeconds());
+	sseRejectionRetries_->setEnabled(connection_ != nullptr);
 	httpTimeout_->setEnabled(connection_ != nullptr);
-	logMode_->setCurrentIndex(stateStore_.detailedLogging() ? 1 : 0);
 	logMode_->setEnabled(connection_ != nullptr);
-	connectButton_->setEnabled(connection_ != nullptr);
-	disconnectButton_->setEnabled(connection_ && stateStore_.connectionStatus() != ConnectionStatus::Disconnected);
-	connectionStatus_->setConnectionStatus(text_, stateStore_.connectionStatus());
-	// Обычная телеметрия не пересоздаёт список и не закрывает открытый пользователем выбор потока.
-	if (displayedSelectionId_ != stateStore_.selectedStreamId()) {
-		refreshStreams();
-	}
-	// streamsComplete отделяет полный список серверных Stream от частичного чтения.
-	const bool streamsComplete = stateStore_.streamsComplete();
-	// canChooseStream разрешает выбор только из доступных подтверждённых вариантов.
-	const bool canChooseStream = streamsComplete ? stateStore_.connectionStatus() == ConnectionStatus::Connected
-						     : !stateStore_.streams().isEmpty();
-	streams_->setEnabled(connection_ && stateStore_.profileResolved() && canChooseStream);
-	// messages собирает безопасные локализованные пояснения без сетевых тел и секретов.
+	advancedSettingsSaveButton_->setEnabled(connection_ &&
+						(advancedSettingsDirty_ || stateStore_.settingsUnsaved()));
+	advancedSettingsCancelButton_->setEnabled(connection_ && advancedSettingsDirty_);
+	// hasDraft отличает фактический изменённый ввод или локальную ошибку от текущего рабочего адреса.
+	const bool hasDraft = apiUrl_->text() != stateStore_.serverOrigin() || apiUrlInvalid_;
+	// canRetry разрешает вручную повторить подключение после окончательного отказа или отключения.
+	const bool canRetry = !stateStore_.serverOrigin().isEmpty() &&
+			      (stateStore_.connectionStatus() == ConnectionStatus::Error ||
+			       stateStore_.connectionStatus() == ConnectionStatus::Disconnected);
+	settingsSaveButton_->setEnabled(connection_ && (hasDraft || canRetry));
+	settingsCancelButton_->setEnabled(connection_ && hasDraft);
+	// messages собирает локальные сообщения страницы без сетевых ошибок и предупреждений о выборе Stream.
 	QStringList messages;
-	if (!streamsComplete &&
-	    stateStore_.configuration().streamsStatus.availability != RuntimeAvailability::Unknown) {
-		messages.append(text_("Stream.ListIncomplete"));
-	}
-	if (!stateStore_.profileNoticeKey().isEmpty()) {
-		messages.append(text_(stateStore_.profileNoticeKey().toUtf8().constData()));
-	}
-	if (!stateStore_.safeErrorKey().isEmpty()) {
-		messages.append(text_(stateStore_.safeErrorKey().toUtf8().constData()));
-	}
-	// unsavedMessage отделяет ошибку сохранения предпочтений от состояния серверного эфира.
+	if (apiUrlInvalid_)
+		messages.append(text_("Error.InvalidServerUrl"));
+	// unsavedMessage отделяет отказ записи предпочтений от состояния серверного эфира.
 	const auto unsavedMessage = stateStore_.settingsUnsaved() ? text_("Settings.Unsaved") : QString{};
 	if (!unsavedMessage.isEmpty())
 		messages.append(unsavedMessage);
-	connectionMessage_->setText(messages.join(QLatin1Char('\n')));
-	advancedSettingsMessage_->setText(unsavedMessage);
-	advancedSettingsMessage_->setVisible(!unsavedMessage.isEmpty());
+	settingsMessage_->setText(messages.join(QLatin1Char('\n')));
+	settingsMessage_->setVisible(!messages.isEmpty());
+	// advancedMessage отделяет подтверждённую запись от рабочего изменения только в RAM.
+	QString advancedMessage;
+	// advancedTone сохраняет смысл результата для светлой/тёмной палитры OBS без собственной цветовой схемы.
+	auto advancedTone = StatusLabel::Tone::Neutral;
+	if (stateStore_.settingsUnsaved()) {
+		advancedMessage =
+			text_(advancedSettingsSaveResult_ == false ? "Settings.WriteError" : "Settings.Unsaved");
+		advancedTone = StatusLabel::Tone::Error;
+	} else if (advancedSettingsSaveResult_) {
+		advancedMessage =
+			text_(*advancedSettingsSaveResult_ ? "Settings.AdvancedSaved" : "Settings.AdvancedSaveFailed");
+		advancedTone = *advancedSettingsSaveResult_ ? StatusLabel::Tone::Active : StatusLabel::Tone::Error;
+	}
+	advancedSettingsMessage_->setStatus(advancedMessage, advancedTone);
+	advancedSettingsMessage_->setVisible(!advancedMessage.isEmpty());
 }
 
-// Открывает сохранённое назначение исходного Output, сохраняя ввод другой карточки в RAM.
-// Ссылка из Dock не переносится в другой контекст или Session и не отправляет команды эфира.
+// Преобразует прежний адрес Output/Session в Destination ID и делегирует существующей карточке.
+// context не допускает переход к другому Stream, а sessionId/outputId сохраняют смысл прежнего адаптера.
 void ManagementWindow::selectOutput(const DockContext &context, const QString &sessionId, const QString &outputId)
 {
-	if (!configuration_ || stateStore_.dockContext() != context || !stateStore_.dockServer().session ||
+	if (stateStore_.dockContext() != context || !stateStore_.dockServer().session ||
 	    stateStore_.dockServer().session->id != sessionId)
 		return;
-	// output связывает исходный Output с постоянной записью назначения по точному ID.
+	// output связывает исходный прикреплённый Output с сохранённым назначением.
 	const auto output = stateStore_.dockServer().outputs.constFind(outputId);
 	if (output == stateStore_.dockServer().outputs.cend() || !output->attached || output->destinationId.isEmpty())
 		return;
-	// destinationId сохраняет адрес до публикации формы, которая может обновить общее состояние.
+	// destinationId копируется до публикации формы, которая может заменить метаданные Dock.
 	const auto destinationId = output->destinationId;
-	// guard отслеживает удаление окна; editor паркует несохранённый ввод прежней страницы.
+	selectDestination(context, destinationId);
+}
+
+// Открывает сохранённое назначение без зависимости от Session, attached и runtime.
+// context и destinationId задают исходную строку Dock. Чужой черновик паркуется в RAM,
+// секреты маскируются; вложенные события не позволяют открыть карточку в новом контексте.
+void ManagementWindow::selectDestination(const DockContext &context, const QString &destinationId)
+{
+	if (!configuration_ || navigationChanging_ || !context.valid() || destinationId.isEmpty() ||
+	    stateStore_.dockContext() != context)
+		return;
+	// sourceContext и sourceDestination сохраняют значения, даже если вызывающий передал ссылки на StateStore.
+	const auto sourceContext = context;
+	const auto sourceDestination = destinationId;
+	// guard замечает удаление окна; editor сохраняет ввод прежней страницы через canLeave(true).
 	const QPointer<ManagementWindow> guard(this);
 	auto *editor = currentEditor();
 	if (editor && !editor->canLeave(true))
 		return;
-	if (!guard)
+	if (!guard || stateStore_.dockContext() != sourceContext)
 		return;
 	hideSecrets();
-	// opened восстанавливает прежний ввод нужного назначения либо начинает его адресное чтение.
-	const bool opened = configuration_->restoreDraft(ConfigurationKind::Destination, destinationId) ||
-			    configuration_->open(ConfigurationKind::Destination, destinationId, true);
-	if (!guard || !opened || stateStore_.dockContext() != context || !stateStore_.dockServer().session ||
-	    stateStore_.dockServer().session->id != sessionId)
+	// opened восстанавливает RAM-черновик назначения либо запускает его точное адресное чтение.
+	// Отсутствие записи обрабатывает прежний редактор, поэтому каталог/Session здесь не служат фильтром.
+	const bool opened = configuration_->restoreDraft(ConfigurationKind::Destination, sourceDestination) ||
+			    configuration_->open(ConfigurationKind::Destination, sourceDestination, true);
+	if (!guard || !opened || stateStore_.dockContext() != sourceContext)
 		return;
-	// blocked не запускает вторую активацию, которая могла бы заменить уже открытую карточку.
+	// blocked исключает повторную активацию, которая могла бы заменить уже выбранную карточку.
 	const QSignalBlocker blocked(navigation_);
 	currentPage_ = 1;
 	navigation_->setCurrentRow(currentPage_);

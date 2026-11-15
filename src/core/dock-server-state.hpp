@@ -57,13 +57,28 @@ struct DockFallback {
 	QString currentStatus;
 };
 
+// Содержит безопасное имя сохранённого назначения; его ID задаётся ключом карты Dock.
+struct DockDestination {
+	// name отображается даже без Session; секретные поля полного Destination здесь не хранятся.
+	QString name;
+};
+
 // REST-метаданные Dock отделены от оперативных SSE-наблюдений; свежесть и полнота задаются для каждой части.
 struct DockServerState {
+	// sessionStatus описывает свежесть и полноту поиска единственной активной Session.
 	ReadStatus sessionStatus;
+	// session содержит подтверждённую серверную запись, независимо от наличия runtime.
 	std::optional<DockSession> session;
+	// outputsStatus относится к составу Outputs выбранной Session.
 	ReadStatus outputsStatus;
+	// outputs содержит сохранённые записи по Output ID, включая подтверждённый detach.
 	QMap<QString, DockOutput> outputs;
+	// fallback содержит независимо прочитанное назначение и метаданные заглушки.
 	DockFallback fallback;
+	// destinationsStatus описывает отдельное чтение каталога выбранного Stream, без зависимости от Session.
+	ReadStatus destinationsStatus;
+	// destinations хранит только безопасные имена по Destination ID, включая выключенные назначения.
+	QMap<QString, DockDestination> destinations;
 };
 
 // Независимые подтверждения для одного исполнения: state — его состояние, input — подключение входа

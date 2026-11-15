@@ -269,6 +269,9 @@ PluginLifecycle::~PluginLifecycle()
 	shutdown();
 }
 
+// Создаёт GUI Runtime и передаёт Dock OBS только при успешной регистрации.
+// Возвращает true после регистрации или при уже загруженном Runtime; отсутствие GUI и отказ дают false.
+// Все обработчики привязаны к Runtime; исключение освобождает ресурсы через shutdown.
 bool PluginLifecycle::load()
 {
 	// application проверяет существование GUI и принадлежность вызова его потоку.
@@ -285,12 +288,22 @@ bool PluginLifecycle::load()
 		runtime_ = std::make_unique<Runtime>(frontend_, options_);
 		// dock удерживает виджет до успешной передачи Frontend; отказ регистрации не оставляет утечки.
 		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_, nullptr, options_.version,
-							   runtime_->restream.get());
+							   runtime_->restream.get(), runtime_->connection.get());
 		runtime_->dock = dock.get();
-		// Callback шестерёнки показывает только одно окно и прекращается вместе с Runtime.
+		// Обработчик шестерёнки показывает только одно окно и прекращается вместе с Runtime.
 		connect(dock.get(), &RestreamDock::managementRequested, runtime_.get(),
 			[this] { openManagementWindow(); });
-		// Меню выхода открывает тот же экземпляр окна и передаёт точные IDs исходного нажатия.
+		// Маршрут Details передаёт только исходный context и Destination ID, без требования Session.
+		connect(dock.get(), &RestreamDock::destinationDetailsRequested, runtime_.get(),
+			[this](DockContext context, QString destinationId) {
+				if (!runtime_ || runtime_->stateStore->dockContext() != context)
+					return;
+				openManagementWindow();
+				if (runtime_ && runtime_->managementWindow &&
+				    runtime_->stateStore->dockContext() == context)
+					runtime_->managementWindow->selectDestination(context, destinationId);
+			});
+		// Прежний сигнал остаётся адаптером для точных IDs исходной Session и Output.
 		connect(dock.get(), &RestreamDock::outputDetailsRequested, runtime_.get(),
 			[this](DockContext context, QString sessionId, QString outputId) {
 				openManagementWindow();

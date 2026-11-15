@@ -1,5 +1,6 @@
 #include "configuration-editor.hpp"
 #include "profile-editor.hpp"
+#include "status-label.hpp"
 #include "secret-field.hpp"
 #include "confirmation-dialog.hpp"
 #include "core/configuration-controller.hpp"
@@ -76,6 +77,106 @@ QString ordinaryValue(const ConfigurationEntity &entity, const QString &field)
 	}
 	return {};
 }
+// Возвращает знакомую подпись поля path через text; неизвестный вложенный путь использует подпись корня.
+QString fieldCaption(const QString &path, const TextLookup &text)
+{
+	// captions связывает только известные пути с доверенными ключами локализации.
+	static const QMap<QString, const char *> captions{
+		{QStringLiteral("name"), "Editor.Name"},
+		{QStringLiteral("publication_key"), "Editor.PublicationKey"},
+		{QStringLiteral("endpoint"), "Editor.Endpoint"},
+		{QStringLiteral("stream_key"), "Editor.StreamKey"},
+		{QStringLiteral("stream_id"), "Stream.Label"},
+		{QStringLiteral("group_id"), "Editor.Group"},
+		{QStringLiteral("profile_id"), "Editor.Profile"},
+		{QStringLiteral("platform"), "Editor.Platform"},
+		{QStringLiteral("enabled"), "Editor.EnabledFuture"},
+		{QStringLiteral("profile"), "Editor.Profile"},
+		{QStringLiteral("profile.mode"), "Profile.VideoMode"},
+		{QStringLiteral("profile.live_audio_mode"), "Profile.LiveAudio"},
+		{QStringLiteral("profile.format.video"), "Profile.VideoFormat"},
+		{QStringLiteral("profile.format.video.codec"), "Profile.Codec"},
+		{QStringLiteral("profile.format.video.width"), "Profile.Width"},
+		{QStringLiteral("profile.format.video.height"), "Profile.Height"},
+		{QStringLiteral("profile.format.video.frame_rate"), "Profile.Fps"},
+		{QStringLiteral("profile.format.audio"), "Profile.AudioFormat"},
+		{QStringLiteral("profile.format.audio.codec"), "Profile.Codec"},
+		{QStringLiteral("profile.format.audio.sample_rate_hz"), "Profile.SampleRate"},
+		{QStringLiteral("profile.format.audio.channels"), "Profile.Channels"},
+		{QStringLiteral("profile.format.audio.channel_layout"), "Profile.ChannelLayout"},
+		{QStringLiteral("profile.video_encoding"), "Profile.Bitrates"},
+		{QStringLiteral("profile.video_encoding.target_bitrate_bps"), "Profile.TargetBitrate"},
+		{QStringLiteral("profile.video_encoding.max_bitrate_bps"), "Profile.MaxBitrate"},
+		{QStringLiteral("profile.video_encoding.buffer_bits"), "Profile.Buffer"},
+		{QStringLiteral("profile.video_encoding.gop_frames"), "Profile.Gop"},
+		{QStringLiteral("profile.video_encoding.closed_gop"), "Profile.ClosedGop"},
+		{QStringLiteral("profile.video_encoding.max_b_frames"), "Profile.BFrames"},
+		{QStringLiteral("profile.audio_encoding"), "Profile.AudioBitrate"},
+		{QStringLiteral("profile.audio_encoding.bitrate_bps"), "Profile.AudioBitrate"},
+		{QStringLiteral("profile.encoding"), "Profile.Encoding"},
+		{QStringLiteral("profile.encoding.version"), "Profile.Encoding"},
+		{QStringLiteral("profile.encoding.video_encoder"), "Profile.VideoEncoder"},
+		{QStringLiteral("profile.encoding.audio_encoder"), "Profile.AudioEncoder"},
+		{QStringLiteral("profile.encoding.rate_control"), "Profile.RateControl"},
+		{QStringLiteral("profile.encoding.rescale_output"), "Profile.Rescale"},
+		{QStringLiteral("profile.encoding.video_custom"), "Profile.Custom"},
+		{QStringLiteral("profile.encoding.audio_custom"), "Profile.Custom"},
+		{QStringLiteral("profile.encoding.nvenc"), "Profile.Nvenc"},
+		{QStringLiteral("profile.encoding.svt_av1"), "Profile.Svt"},
+		{QStringLiteral("profile.encoding.nvenc.preset"), "Profile.Preset"},
+		{QStringLiteral("profile.encoding.nvenc.tuning"), "Profile.Tuning"},
+		{QStringLiteral("profile.encoding.nvenc.multipass"), "Profile.Multipass"},
+		{QStringLiteral("profile.encoding.nvenc.lookahead_frames"), "Profile.Lookahead"},
+		{QStringLiteral("profile.encoding.nvenc.aq_strength"), "Profile.AqStrength"},
+		{QStringLiteral("profile.encoding.nvenc.aq_mode"), "Profile.AqMode"},
+		{QStringLiteral("profile.encoding.nvenc.enable_spatial_aq"), "Profile.SpatialAq"},
+		{QStringLiteral("profile.encoding.nvenc.enable_temporal_aq"), "Profile.TemporalAq"},
+		{QStringLiteral("profile.encoding.svt_av1.preset"), "Profile.Preset"},
+		{QStringLiteral("profile.encoding.svt_av1.tuning"), "Profile.Tuning"},
+		{QStringLiteral("profile.encoding.svt_av1.multipass"), "Profile.Multipass"},
+		{QStringLiteral("profile.encoding.svt_av1.lookahead_frames"), "Profile.Lookahead"},
+		{QStringLiteral("profile.encoding.svt_av1.aq_strength"), "Profile.AqStrength"},
+		{QStringLiteral("profile.encoding.svt_av1.aq_mode"), "Profile.AqMode"},
+		{QStringLiteral("profile.encoding.svt_av1.enable_spatial_aq"), "Profile.SpatialAq"},
+		{QStringLiteral("profile.encoding.svt_av1.enable_temporal_aq"), "Profile.TemporalAq"}};
+	// found выбирает точную подпись, а при неизвестном вложенном поле — подпись известного корня.
+	auto found = captions.constFind(path);
+	if (found == captions.cend())
+		found = captions.constFind(path.section(QLatin1Char('.'), 0, 0));
+	return text(found == captions.cend() ? "Editor.Field" : found.value());
+}
+
+// Выбирает оформление общего сообщения editor; любой отказ или неизвестность важнее частичного успеха.
+StatusLabel::Tone feedbackTone(const ConfigurationEditorState &editor, bool localError)
+{
+	if (localError || !editor.fieldIssues.isEmpty() || editor.reconciliationRequired || editor.serverConflict ||
+	    !editor.destinationReconciliation.isEmpty() || editor.outcome == ConfigurationOutcome::Rejected ||
+	    editor.outcome == ConfigurationOutcome::Conflict || editor.outcome == ConfigurationOutcome::Unknown ||
+	    (!editor.messageKey.isEmpty() && editor.messageKey != QStringLiteral("Configuration.Saved") &&
+	     editor.messageKey != QStringLiteral("Configuration.Deleted")) ||
+	    (!editor.destinationMessageKey.isEmpty() &&
+	     editor.destinationMessageKey != QStringLiteral("Configuration.DestinationsSaved")))
+		return StatusLabel::Tone::Error;
+	// outcome проверяет каждый отдельный результат пакета, чтобы общий успех не скрывал частичный отказ.
+	for (const auto &outcome : editor.destinationOutcomes)
+		if (outcome != ConfigurationOutcome::Saved)
+			return StatusLabel::Tone::Error;
+	if (editor.loading || editor.writing)
+		return StatusLabel::Tone::Pending;
+	if (editor.outcome == ConfigurationOutcome::Saved || editor.outcome == ConfigurationOutcome::Deleted ||
+	    editor.destinationMessageKey == QStringLiteral("Configuration.DestinationsSaved"))
+		return StatusLabel::Tone::Active;
+	return StatusLabel::Tone::Neutral;
+}
+
+// Дополняет причину error сводкой через text; uncertain сохраняет неизвестность прежней записи,
+// даже если новый локальный ввод уже не проходит проверку.
+QString localFeedback(const QString &error, const TextLookup &text, bool uncertain = false)
+{
+	if (uncertain)
+		return text("Configuration.Unknown") + (error.isEmpty() ? QString{} : QLatin1Char('\n') + error);
+	return error.isEmpty() ? QString{} : text("Configuration.NotSaved") + QLatin1Char('\n') + error;
+}
 } // namespace
 
 /** Синхронизирует единственную RAM-форму с одной страницей. Сигналы отражения
@@ -85,7 +186,8 @@ public:
 	// Создаёт дочерние элементы и подписки; общие сервисы заимствуются в GUI-потоке.
 	Impl(ConfigurationEditor &owner, StateStore &state, ConfigurationController &controller, TextLookup text,
 	     ConfigurationKind kind);
-	// Обновляет списки и сообщения; форму заменяет только при реальной смене базы/карточки.
+	// Обновляет списки и сообщения, снимая прежнюю локальную ошибку при начале записи;
+	// форму заменяет только при реальной смене базы/карточки.
 	void refresh();
 	// Отражает полный draft и отдельные намерения замены секретов без новых сигналов ввода.
 	void populate(const ConfigurationEditorState &editor);
@@ -149,9 +251,9 @@ public:
 	QWidget *inputFields_ = nullptr;
 	// status_ показывает полноту списка; message_ — безопасный результат/ошибки текущей карточки.
 	QLabel *status_ = nullptr;
-	QLabel *message_ = nullptr;
+	StatusLabel *message_ = nullptr;
 	// endpointRequiredError_ располагает ошибку обязательного адреса непосредственно под его полем.
-	QLabel *endpointRequiredError_ = nullptr;
+	StatusLabel *endpointRequiredError_ = nullptr;
 	// name_ и platform_ содержат обычный ввод; stream_/group_/profile_ выбирают точные ID отношений.
 	QLineEdit *name_ = nullptr;
 	QComboBox *platform_ = nullptr;
@@ -160,7 +262,7 @@ public:
 	QComboBox *profile_ = nullptr;
 	// destinationSelection_ выбирает участие собственных назначений Stream только в будущих запусках.
 	QListWidget *destinationSelection_ = nullptr;
-	// relationships_ показывает связи карточки либо неполноту списка назначений Stream.
+	// relationships_ сообщает о неполных списках связей в карточках потока и назначения.
 	QLabel *relationships_ = nullptr;
 	// firstSecret_ представляет publication_key/endpoint, secondSecret_ — stream_key назначения.
 	SecretField *firstSecret_ = nullptr;
@@ -228,7 +330,8 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 	name_->setMaxLength(std::numeric_limits<int>::max());
 	name_->setObjectName(QStringLiteral("configurationName"));
 	name_->setAccessibleName(text_("Editor.Name"));
-	fields->addRow(text_("Editor.Name"), name_);
+	if (kind_ != ConfigurationKind::Profile)
+		fields->addRow(text_("Editor.Name"), name_);
 	// Обработчик имени не срабатывает при отражении setText и не включает profile в PATCH при переименовании.
 	QObject::connect(name_, &QLineEdit::textEdited, &owner_, [this] { edited(QStringLiteral("name")); });
 	if (kind_ == ConfigurationKind::Destination || kind_ == ConfigurationKind::Group) {
@@ -271,7 +374,7 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 		fields->addRow(text_(kind_ == ConfigurationKind::Stream ? "Editor.PublicationKey" : "Editor.Endpoint"),
 			       firstSecret_);
 		if (kind_ == ConfigurationKind::Destination) {
-			endpointRequiredError_ = new QLabel(form_);
+			endpointRequiredError_ = new StatusLabel(form_, false);
 			endpointRequiredError_->setObjectName(QStringLiteral("configurationEndpointError"));
 			endpointRequiredError_->setTextFormat(Qt::PlainText);
 			endpointRequiredError_->setWordWrap(true);
@@ -304,7 +407,7 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 		}
 	}
 	if (kind_ == ConfigurationKind::Profile) {
-		profileEditor_ = new ProfileEditor(text_, form_);
+		profileEditor_ = new ProfileEditor(text_, form_, name_);
 		inputLayout->addWidget(profileEditor_);
 		// Невалидный числовой ввод остаётся в форме, но не может быть отправлен save.
 		QObject::connect(profileEditor_, &ProfileEditor::changed, &owner_,
@@ -330,7 +433,7 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 	relationships_->setTextFormat(Qt::PlainText);
 	relationships_->setWordWrap(true);
 	inputLayout->addWidget(relationships_);
-	message_ = new QLabel(form_);
+	message_ = new StatusLabel(form_, false);
 	message_->setTextFormat(Qt::PlainText);
 	message_->setWordWrap(true);
 	message_->setObjectName(QStringLiteral("configurationMessage"));
@@ -577,7 +680,7 @@ void ConfigurationEditor::Impl::relations()
 	// item проходит кеш профилей для выбора связи Group.
 	for (const auto &item : config.profiles)
 		profiles[item.id] = item.name;
-	// streamId содержит принадлежность текущего draft; related перечисляет известные обратные связи.
+	// streamId содержит принадлежность текущего draft; related сообщает о неполных списках связей.
 	QString streamId;
 	QStringList related;
 	// destination и group извлекают принадлежность текущего типизированного draft.
@@ -595,16 +698,12 @@ void ConfigurationEditor::Impl::relations()
 		relation(group_, groups, destination->groupId, config.groupsStatus.complete);
 	if (const auto *group = std::get_if<api::Group>(&draft))
 		relation(profile_, profiles, group->profileId, config.profilesStatus.complete);
-	// Карточка группы задаёт связи селекторами; обратный список назначений в ней не отображается.
-	if (kind_ == ConfigurationKind::Group) {
+	// Обратные списки назначений и групп не входят в карточки группы и профиля.
+	if (kind_ == ConfigurationKind::Group || kind_ == ConfigurationKind::Profile) {
 		relationships_->clear();
 		relationships_->hide();
 		return;
 	}
-	// item показывает группы текущего профиля; имена выводятся только обычным текстом.
-	for (const auto &item : config.groups)
-		if (kind_ == ConfigurationKind::Profile && item.profileId == selectedId_)
-			related.append(text_("Editor.GroupRelation").arg(item.name, item.id));
 	if (!config.groupsStatus.complete || !config.destinationsStatus.complete)
 		related.append(text_("Editor.RelationsIncomplete"));
 	relationships_->setText(related.join(QLatin1Char('\n')));
@@ -679,6 +778,16 @@ void ConfigurationEditor::Impl::refresh()
 	// config и editor представляют независимые серверный кеш и пользовательский draft.
 	const auto &config = state_.configuration();
 	const auto &editor = state_.configurationEditor();
+	// Принятое действие снимает прежнюю локальную ошибку этой карточки, сохраняя сам ввод.
+	if (editor.writing && ownsEditor()) {
+		localError_.clear();
+		// Пустой адрес не мог пройти сохранение: при удалении его старая inline-ошибка уже не относится к действию.
+		// После обычного PATCH признак проверки остаётся, чтобы следующая правка показывала причину и при Unknown.
+		if (endpointRequiredButEmpty(editor)) {
+			endpointValidationAttempted_ = false;
+			updateEndpointRequiredError(editor);
+		}
+	}
 	// contextIdentity изменяется вместе с логическим контекстом, не с обычной телеметрией.
 	const auto contextIdentity = state_.serverOrigin() + QLatin1Char('\n') + state_.dockContext().profileUuid +
 				     QLatin1Char('\n') + state_.selectedStreamId();
@@ -787,11 +896,13 @@ void ConfigurationEditor::Impl::refresh()
 		owner_.hideSecrets();
 	}
 	if (hasCard) {
-		// messages содержит только безопасные локализованные ключи и привязанные к полям пояснения.
+		// messages содержит переведённые локальные подписи и структурированные plain-text причины без value.
 		QStringList messages;
 		if (!localError_.isEmpty())
-			messages.append(localError_);
-		if (!editor.messageKey.isEmpty())
+			messages.append(localFeedback(localError_, text_,
+						      editor.reconciliationRequired ||
+							      editor.outcome == ConfigurationOutcome::Unknown));
+		if (localError_.isEmpty() && !editor.messageKey.isEmpty())
 			messages.append(text_(editor.messageKey.toUtf8().constData()));
 		if (!editor.destinationMessageKey.isEmpty())
 			messages.append(text_(editor.destinationMessageKey.toUtf8().constData()));
@@ -808,14 +919,27 @@ void ConfigurationEditor::Impl::refresh()
 					.arg(editor.destinationNames.value(outcome.key(), text_("Dock.UnnamedOutput")),
 					     text_(key)));
 		}
-		// issue содержит очищенное контроллером пояснение без request value и сырых тел ответа.
-		for (auto issue = editor.fieldIssues.cbegin(); issue != editor.fieldIssues.cend(); ++issue)
-			messages.append(
-				text_("Editor.FieldIssue").arg(issue.key(), text_(issue.value().toUtf8().constData())));
-		message_->setText(messages.join(QLatin1Char('\n')));
+		// issue сохраняет полный путь; переводится только доверенный локальный ключ, detail остаётся текстом.
+		for (auto issue = editor.fieldIssues.cbegin();
+		     localError_.isEmpty() && issue != editor.fieldIssues.cend(); ++issue) {
+			// reason содержит локализованную причину либо структурированное пояснение сервера.
+			const auto reason = !issue->messageKey.isEmpty() ? text_(issue->messageKey.toUtf8().constData())
+					    : issue->detail.isEmpty()    ? text_("Configuration.InvalidField")
+									 : issue->detail;
+			messages.append(text_("Editor.FieldIssue").arg(fieldCaption(issue.key(), text_), reason));
+		}
+		// endpointError учитывает отдельную inline-причину без её повторения в общей сводке.
+		const bool endpointError = endpointValidationAttempted_ && endpointRequiredButEmpty(editor);
+		if (endpointError && localError_.isEmpty() && !editor.reconciliationRequired &&
+		    editor.outcome != ConfigurationOutcome::Unknown &&
+		    editor.messageKey != QStringLiteral("Configuration.NotSaved"))
+			messages.prepend(text_("Configuration.NotSaved"));
+		message_->setStatus(messages.join(QLatin1Char('\n')),
+				    feedbackTone(editor, !localError_.isEmpty() || endpointError));
 	} else {
-		message_->clear();
+		message_->setStatus({}, StatusLabel::Tone::Neutral);
 	}
+
 	save_->setEnabled(editable && !editor.reconciliationRequired && !editor.serverConflict &&
 			  editor.destinationReconciliation.isEmpty() &&
 			  (editor.creating || !editor.dirtyFields.isEmpty() || !editor.destinationChanges.isEmpty()));
@@ -886,7 +1010,10 @@ void ConfigurationEditor::Impl::edited(const QString &field)
 		QString error;
 		profileEditor_->readProfile(profile->profile, error);
 		localError_ = error;
-		message_->setText(localError_);
+		message_->setStatus(localFeedback(localError_, text_,
+						  editor.reconciliationRequired ||
+							  editor.outcome == ConfigurationOutcome::Unknown),
+				    feedbackTone(editor, !localError_.isEmpty()));
 	}
 	updating_ = true;
 	// alive учитывает синхронное уничтожение страницы потребителем нового состояния формы.
@@ -934,7 +1061,8 @@ void ConfigurationEditor::Impl::updateEndpointRequiredError(const ConfigurationE
 		return;
 	// visible оставляет подсказку скрытой до ошибки и снимает её сразу после исправления адреса.
 	const bool visible = endpointValidationAttempted_ && endpointRequiredButEmpty(editor);
-	endpointRequiredError_->setText(visible ? text_("Editor.EndpointRequired") : QString{});
+	endpointRequiredError_->setStatus(visible ? text_("Editor.EndpointRequired") : QString{},
+					  visible ? StatusLabel::Tone::Error : StatusLabel::Tone::Neutral);
 	endpointRequiredError_->setVisible(visible);
 }
 
@@ -949,6 +1077,7 @@ void ConfigurationEditor::Impl::save()
 	endpointValidationAttempted_ = true;
 	if (endpointRequiredButEmpty(editor)) {
 		updateEndpointRequiredError(editor);
+		message_->setStatus(text_("Configuration.NotSaved"), StatusLabel::Tone::Error);
 		return;
 	}
 	updateEndpointRequiredError(editor);
@@ -960,7 +1089,9 @@ void ConfigurationEditor::Impl::save()
 		const auto group = state_.configuration().groups.constFind(destination->groupId);
 		if (group == state_.configuration().groups.cend() || group->streamId != destination->streamId) {
 			localError_ = text_("Editor.GroupStreamMismatch");
-			message_->setText(localError_);
+			message_->setStatus(localFeedback(localError_, text_), localError_.isEmpty()
+										       ? StatusLabel::Tone::Neutral
+										       : StatusLabel::Tone::Error);
 			return;
 		}
 	}
@@ -971,7 +1102,7 @@ void ConfigurationEditor::Impl::save()
 		QString error;
 		if (!profileEditor_->readProfile(std::get<api::Profile>(draft).profile, error)) {
 			localError_ = error;
-			message_->setText(error);
+			message_->setStatus(localFeedback(error, text_), StatusLabel::Tone::Error);
 			return;
 		}
 		// dirty отправляет profile целиком только после действительного изменения либо create.
@@ -1095,7 +1226,8 @@ void ConfigurationEditor::Impl::resolveConflict()
 	if (!ownsEditor() || !editor.serverConflict || !editor.draft)
 		return;
 	if (resolution_ && resolution_->currentData().toInt() == 0) {
-		message_->setText(text_("Editor.ChooseProfileResolution"));
+		message_->setStatus(localFeedback(text_("Editor.ChooseProfileResolution"), text_),
+				    StatusLabel::Tone::Error);
 		return;
 	}
 	if (!confirm("Editor.ConfirmConflictWrite"))
@@ -1138,7 +1270,7 @@ void ConfigurationEditor::Impl::resolveConflict()
 			QString error;
 			if (!profileEditor_->readProfile(profile->profile, error)) {
 				localError_ = error;
-				message_->setText(error);
+				message_->setStatus(localFeedback(error, text_), StatusLabel::Tone::Error);
 				return;
 			}
 		} else

@@ -4,12 +4,16 @@
 #include <QComboBox>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStandardItemModel>
+#include <QStyle>
+#include <QTextDocument>
 #include <QToolButton>
+#include <QToolTip>
 #include <QVBoxLayout>
 #include <limits>
 #include <type_traits>
@@ -266,8 +270,10 @@ public:
 		QLabel *caption = nullptr;
 	};
 	// Создаёт разделы и привязки; owner и text задают QObject-контекст и перевод подписей.
-	Impl(ProfileEditor &owner, TextLookup text);
-	// Добавляет поле с закрытым списком options; bytes сохраняет значения ProfileText как QByteArray.
+	// nameInput, если передан, размещается перед параметрами в общей колонке ввода.
+	Impl(ProfileEditor &owner, TextLookup text, QWidget *nameInput);
+	// Добавляет в form поле DTO path с переводом подписи label; options задаёт закрытый список.
+	// bytes хранит ProfileText как QByteArray, boolean выбирает флажок вместо строки или списка.
 	void add(QFormLayout *form, const char *path, const char *label, const QStringList &options = {},
 		 bool bytes = false, bool boolean = false);
 	// Добавляет локализованную группу формы к общему layout.
@@ -278,6 +284,10 @@ public:
 	void updateApplicability();
 	// Меняет разрешённые пункты path, сохраняя текущий выбор как отдельное исходное значение.
 	void choices(const QString &path, const QStringList &options);
+	// Обновляет справку из текущего текста обоих полей, включая невалидный незавершённый ввод.
+	void updateBitrateHelp();
+	// Показывает актуальную справку после активации значка мышью или клавиатурой.
+	void showBitrateHelp();
 	// Возвращает понятную подпись подтверждённого пункта value, сохраняя path и itemData техническими.
 	QString optionLabel(const QString &path, const QString &value) const;
 	// Находит ввод по path среди полного известного набора полей.
@@ -299,6 +309,8 @@ public:
 	// advanced_ раскрывает advancedContent_ без изменения доступности и несохранённого ввода.
 	QToolButton *advanced_ = nullptr;
 	QWidget *advancedContent_ = nullptr;
+	// bitrateHelp_ показывает текущие основной и максимальный видеобитрейты без изменения черновика.
+	QToolButton *bitrateHelp_ = nullptr;
 	// recipe_ различает Missing/null/v2; nvenc_ и svt_ включают явные необязательные подблоки.
 	QComboBox *recipe_ = nullptr;
 	QCheckBox *nvenc_ = nullptr;
@@ -355,15 +367,49 @@ void ProfileEditor::Impl::add(QFormLayout *form, const char *path, const char *l
 	field.input->setAccessibleName(field.label);
 	field.caption = new QLabel(field.label, &owner_);
 	field.caption->setBuddy(field.input);
-	form->addRow(field.caption, field.input);
+	if (field.path == QStringLiteral("video.target")) {
+		// row держит поле и справку рядом, сохраняя исходное поле ввода и его доступность.
+		auto *row = new QWidget(&owner_);
+		// rowLayout не добавляет внешних отступов к общей колонке формы.
+		auto *rowLayout = new QHBoxLayout(row);
+		rowLayout->setContentsMargins(0, 0, 0, 0);
+		// bitrateHelp_ использует стандартную пиктограмму темы и доступен с клавиатуры.
+		bitrateHelp_ = new QToolButton(row);
+		bitrateHelp_->setObjectName(QStringLiteral("videoBitrateHelp"));
+		bitrateHelp_->setIcon(owner_.style()->standardIcon(QStyle::SP_MessageBoxQuestion));
+		bitrateHelp_->setAutoRaise(true);
+		bitrateHelp_->setFocusPolicy(Qt::StrongFocus);
+		bitrateHelp_->setAccessibleName(text_("Profile.BitrateHelpTitle"));
+		// Нажатие вызывает только справку и не отмечает профиль изменённым.
+		QObject::connect(bitrateHelp_, &QToolButton::clicked, &owner_, [this] { showBitrateHelp(); });
+		rowLayout->addWidget(field.input);
+		rowLayout->addWidget(bitrateHelp_);
+		rowLayout->setStretch(0, 1);
+		form->addRow(field.caption, row);
+	} else {
+		form->addRow(field.caption, field.input);
+	}
+	if (field.path == QStringLiteral("video.target") || field.path == QStringLiteral("video.maximum")) {
+		// textEdited обновляет справку только при пользовательском вводе, не меняя dirty-состояние.
+		QObject::connect(qobject_cast<QLineEdit *>(field.input), &QLineEdit::textEdited, &owner_,
+				 [this] { updateBitrateHelp(); });
+	}
 	fields_.push_back(std::move(field));
 }
 
-ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text) : owner_(owner), text_(std::move(text))
+ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text, QWidget *nameInput)
+	: owner_(owner),
+	  text_(std::move(text))
 {
-	// layout объединяет основной ввод и раскрываемый раздел; basics содержит восемь полей плюс внешнее имя.
+	// layout объединяет основной ввод и раскрываемый раздел; basics выравнивает имя и основные параметры.
 	auto *layout = new QVBoxLayout(&owner_);
-	auto *basics = section(layout, "Profile.Basics");
+	layout->setContentsMargins(0, 0, 0, 0);
+	auto *basics = new QFormLayout;
+	basics->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	basics->setRowWrapPolicy(QFormLayout::WrapLongRows);
+	layout->addLayout(basics);
+	if (nameInput)
+		basics->addRow(text_("Editor.Name"), nameInput);
 	preset_ = new QComboBox(&owner_);
 	preset_->setObjectName(QStringLiteral("profilePreset"));
 	preset_->addItem(text_("Profile.NoPreset"), QString{});
@@ -556,6 +602,7 @@ ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text) : owner_(owner)
 		QObject::connect(combo, &QComboBox::activated, &owner_,
 				 [this, key] { touch(QStringLiteral("custom.") + key); });
 	}
+	updateBitrateHelp();
 }
 
 QWidget *ProfileEditor::Impl::input(const QString &path) const
@@ -566,6 +613,32 @@ QWidget *ProfileEditor::Impl::input(const QString &path) const
 			return field.input;
 	return nullptr;
 }
+
+// Отражает текущие строки основного и скрытого расширенного битрейта без нормализации значений.
+void ProfileEditor::Impl::updateBitrateHelp()
+{
+	// target и maximum сохраняют пользовательский текст в кбит/с, включая временно невалидные строки.
+	auto *target = qobject_cast<QLineEdit *>(input(QStringLiteral("video.target")));
+	auto *maximum = qobject_cast<QLineEdit *>(input(QStringLiteral("video.maximum")));
+	if (!bitrateHelp_ || !target || !maximum)
+		return;
+	// description остаётся обычным текстом для screen reader и локального всплывающего пояснения.
+	const auto description = text_("Profile.BitrateHelpText").arg(target->text(), maximum->text());
+	bitrateHelp_->setAccessibleDescription(description);
+	bitrateHelp_->setToolTip(Qt::convertFromPlainText(description));
+}
+
+// Показывает подсказку у значка и не меняет содержимое или dirty-признаки профиля.
+void ProfileEditor::Impl::showBitrateHelp()
+{
+	updateBitrateHelp();
+	if (!bitrateHelp_)
+		return;
+	// point размещает подсказку под кнопкой; tooltip содержит только текущий локализованный текст.
+	const auto point = bitrateHelp_->mapToGlobal(QPoint(0, bitrateHelp_->height()));
+	QToolTip::showText(point, bitrateHelp_->toolTip(), bitrateHelp_);
+}
+
 void ProfileEditor::Impl::touch(const QString &path)
 {
 	if (loading_)
@@ -766,9 +839,9 @@ void ProfileEditor::Impl::updateApplicability()
 	custom_[QStringLiteral("aac_coder")]->setEnabled(v2);
 }
 
-ProfileEditor::ProfileEditor(TextLookup text, QWidget *parent)
+ProfileEditor::ProfileEditor(TextLookup text, QWidget *parent, QWidget *nameInput)
 	: QWidget(parent),
-	  impl_(std::make_unique<Impl>(*this, std::move(text)))
+	  impl_(std::make_unique<Impl>(*this, std::move(text), nameInput))
 {
 }
 ProfileEditor::~ProfileEditor() = default;
@@ -874,6 +947,7 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 				combo->setCurrentIndex(qMax(0, combo->findData(pair.mid(key.size() + 1))));
 	}
 	impl_->updateApplicability();
+	impl_->updateBitrateHelp();
 	impl_->loading_ = false;
 }
 
@@ -958,6 +1032,7 @@ void ProfileEditor::restoreDraft(const QVariantMap &draft)
 		impl_->dirty_.insert(path);
 	impl_->updateApplicability();
 	impl_->advanced_->setChecked(draft.value(QStringLiteral("advanced")).toBool());
+	impl_->updateBitrateHelp();
 	impl_->loading_ = false;
 }
 

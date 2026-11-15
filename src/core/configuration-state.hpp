@@ -27,6 +27,14 @@ struct ConfigurationContext {
 	bool operator==(const ConfigurationContext &) const = default;
 };
 
+// Содержит причину ошибки поля для обычного текста интерфейса, но не для журнала.
+struct ConfigurationFieldIssue {
+	// Ключ перевода, установленный только доверенным локальным валидатором.
+	QString messageKey;
+	// Структурированное пояснение сервера без сырого тела ответа и отдельного value.
+	QString detail;
+};
+
 // Содержит одну RAM-форму: серверную базу, пользовательский ввод и результат записи.
 struct ConfigurationEditorState {
 	// Контекст запрещает отправить старый ввод в другой сервер или профиль.
@@ -44,7 +52,7 @@ struct ConfigurationEditorState {
 	// Новая серверная версия для явного сравнения после 409.
 	std::optional<ConfigurationEntity> serverConflict;
 	// Безопасные пояснения ошибок по известным полям; значения запроса не хранятся здесь.
-	QMap<QString, QString> fieldIssues;
+	QMap<QString, ConfigurationFieldIssue> fieldIssues;
 	// Явные изменения участия собственных назначений Stream; успешные записи удаляются из этого набора.
 	QMap<QString, bool> destinationChanges;
 	// Исходная ревизия каждого изменённого назначения; изменяется только после адресной сверки.

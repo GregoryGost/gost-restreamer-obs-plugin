@@ -358,21 +358,36 @@ function Move-OwnedDock {
 }
 
 function Assert-DockObservations {
-    # Для пустого Isolated профиля проверяет реальные доступные подписи профиля и остановленного OBS.
-    # Это наблюдение локального жизненного цикла, не готовность backend/ingest.
+    # Проверяет единственный видимый рабочий селектор Stream и наблюдаемую остановку OBS в пустом Isolated.
+    # Пустой сервер оставляет выбор выключенным; проверяется доступность через UIA, а не возможность выбора.
     Assert-OwnedDock $dockWindow
+    # dockElement ограничивает поиск подтверждённым собственным HWND Dock.
     $dockElement = [System.Windows.Automation.AutomationElement]::FromHandle($dockWindow)
     Assert-OwnedElement $dockElement
+    # labelsCondition выбирает подписи только того же процесса; selectorCondition — только QComboBox этого Dock.
     $labelsCondition = [System.Windows.Automation.AndCondition]::new($processCondition,
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, 'QLabel'))
-    $expectedProfile = if ($russian) { 'Профиль OBS: Isolated' } else { 'OBS profile: Isolated' }
+    $selectorCondition = [System.Windows.Automation.AndCondition]::new($processCondition,
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, 'QComboBox'))
+    # expectedStream совпадает с доступным именем Settings.Stream; expectedIdle задаёт локальный статус OBS.
+    $expectedStream = if ($russian) { 'Поток для текущего профиля OBS' } else { 'Stream for the current OBS profile' }
     $expectedIdle = if ($russian) { 'Трансляция остановлена' } else { 'Streaming stopped' }
+    # Условие ожидания повторно проверяет владение найденными элементами и их фактические свойства.
     Wait-Condition {
+        Assert-OwnedDock $dockWindow
+        Assert-OwnedElement $dockElement
+        # selectors содержит только видимые ComboBox с правильным локализованным именем и типом UIA.
+        $selectors = @($dockElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $selectorCondition) |
+            ForEach-Object {
+                Assert-OwnedElement $_
+                if (-not $_.Current.IsOffscreen -and $_.Current.Name -ceq $expectedStream -and
+                    $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox) { $_ }
+            })
+        # names содержит реальные подписи того же Dock; блок обработки проверяет принадлежность каждой.
         $names = @($dockElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $labelsCondition) |
             ForEach-Object { Assert-OwnedElement $_; $_.Current.Name })
-        @($names | Where-Object { $_ -ceq $expectedProfile }).Count -eq 1 -and
-            @($names | Where-Object { $_ -ceq $expectedIdle }).Count -eq 1
-    } 'Dock не показывает наблюдаемые тестовый профиль и остановленную трансляцию OBS.'
+        $selectors.Count -eq 1 -and @($names | Where-Object { $_ -ceq $expectedIdle }).Count -eq 1
+    } 'Dock не показывает единственный селектор Stream и наблюдаемую остановку трансляции OBS.'
 }
 
 function Save-OwnedDockImage {
@@ -664,7 +679,7 @@ try {
     [pscustomobject]@{
         Check = 'ObsUi'; Locale = $Locale; ProcessId = $ObsProcessId; ManagementHandle = $managementHandle
         Launch = $Launch; DockVisibilityRestored = ($Launch -eq 2); DockPositionVerified = ($Launch -eq 2)
-        DockLeft = $dockPosition.Left; DockTop = $dockPosition.Top; DockProfileAndIdleVerified = $true
+        DockLeft = $dockPosition.Left; DockTop = $dockPosition.Top; DockStreamAndIdleVerified = $true
         DockScreenshot = $dockScreenshot
         Pages = $pages.Count; GearReuse = $true; CloseHideReopen = $true; MinimizeRestore = $minimizeVerified
         ReopenedHandle = $reopenedHandle; NativeHandleRecreated = ($reopenedHandle -ne $managementHandle)

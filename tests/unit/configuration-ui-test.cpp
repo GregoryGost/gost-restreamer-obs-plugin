@@ -13,6 +13,7 @@
 #include <QComboBox>
 #include <QFile>
 #include <QGroupBox>
+#include <QHelpEvent>
 #include <QLineEdit>
 #include <QLabel>
 #include <QListWidget>
@@ -55,6 +56,8 @@ bool choose(QComboBox *field, const QString &value)
 class ConfigurationUiTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Открывает ещё не исполнявшееся назначение в прежнем окне с парковкой черновиков и маскированием.
+	void destinationDetailsWithoutSessionPreserveDraftAndMasks();
 	// Маска не меняет точную строку Copy, включая userinfo/path/query, и не отмечает draft изменённым.
 	void maskedCopyUsesReceivedValueWithoutRevealingOrEditing();
 	// Missing и пустой допустимый ключ показываются по-разному и не подменяются фиктивным значением.
@@ -83,6 +86,26 @@ private slots:
 	void invalidStructuredInputIsNotSilentlyNormalized();
 	// Все три битрейта переводятся в кбит/с без потери последних битов исходного uint64.
 	void bitrateUnitsPreservePrecisionAndConvertExplicitInput();
+	// Задаёт обе локализации подсказки с основным и максимальным битрейтами.
+	void bitrateHelpTracksDraftWithoutChangingIt_data();
+	// Подсказка обновляется после ввода, пресета и восстановления; мышь и клавиатура не меняют профиль.
+	void bitrateHelpTracksDraftWithoutChangingIt();
+	// Задаёт обе локализации причины локального CBR-отказа.
+	void profileValidationShowsReasonOnceAndTurnsGreenAfterCorrection_data();
+	// Отказ формы и сериализатора красный, причина понятна, явное исправление позволяет подтверждённое сохранение.
+	void profileValidationShowsReasonOnceAndTurnsGreenAfterCorrection();
+	// Серверный вложенный путь и HTML-причина сохраняются обычным текстом без value и доверия к messageKey.
+	void nestedServerValidationIsPlainTextAndKeepsReasonOnce();
+	// Причина сервера сохраняется, но точные секреты текущей карточки скрываются и вне отдельного value.
+	void serverValidationRedactsSecretsEmbeddedInMessage();
+	// Задаёт подтверждённый отказ, конфликт и неопределённый исход отправленного изменения.
+	void mutationFailuresStayRedWithoutClaimingUnknownWasRejected_data();
+	// Красный цвет не превращает потерянный ответ в подтверждённый отказ и не повторяет изменение.
+	void mutationFailuresStayRedWithoutClaimingUnknownWasRejected();
+	// Очистка endpoint после потерянного PATCH сохраняет неизвестный исход и не повторяет запись.
+	void unknownDestinationValidationKeepsUnknownOutcome();
+	// Частичный успех выбора назначений не выдаётся зелёным общим результатом.
+	void partialDestinationSaveKeepsErrorTone();
 	// Типовые FPS превращаются в точные контрактные дроби, нестандартная дробь сохраняется.
 	void frameRateChoicesKeepExactRatios();
 	// Списки сохраняют неизвестные и пустые значения, а сворачивание не теряет введённый текст.
@@ -133,6 +156,11 @@ private slots:
 	void failedFirstDetailReadKeepsVisibleErrorAndReload();
 	// Успешное удаление после сохранения обновляет inline-результат даже при отсутствии draft.
 	void deletingSavedGroupShowsDeletedInsteadOfPreviousSavedMessage();
+	// Подтверждённое удаление снимает старую локальную ошибку только после начала записи.
+	// Выбирает локальную числовую ошибку профиля либо inline-ошибку адреса назначения.
+	void deletingRecordReplacesStaleValidationWhilePending_data();
+	// Проверяет отменённое и принятое удаление после локального отказа сохранения.
+	void deletingRecordReplacesStaleValidationWhilePending();
 };
 
 // Использует независимые серверные документы для проверки общего механизма выбора карточек.
@@ -495,6 +523,468 @@ void ConfigurationUiTest::bitrateUnitsPreservePrecisionAndConvertExplicitInput()
 	QCOMPARE(restored.videoEncoding.targetBitrateBps, quint64(6000000));
 	QCOMPARE(restored.audioEncoding.bitrateBps, quint64(160000));
 	QCOMPARE(restored.videoEncoding.maxBitrateBps, std::numeric_limits<quint64>::max());
+}
+
+// Проверяет две поставляемые локализации без фиксации их конкретной пунктуации.
+void ConfigurationUiTest::bitrateHelpTracksDraftWithoutChangingIt_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::newRow("russian") << QStringLiteral("ru-RU");
+	QTest::newRow("english") << QStringLiteral("en-US");
+}
+
+// Читает подсказку при скрытом максимуме, затем проверяет пользовательский ввод, пресет и восстановленный черновик.
+void ConfigurationUiTest::bitrateHelpTracksDraftWithoutChangingIt()
+{
+	// locale выбирает настоящие ресурсы; translations живёт дольше использующего его переводчика формы.
+	QFETCH(QString, locale);
+	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QLatin1Char('/') + locale +
+				       QStringLiteral(".ini"),
+			       QSettings::IniFormat);
+	// decoded/profile задают независимые точные значения в бит/с, которые UI показывает в кбит/с.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
+	QVERIFY(decoded);
+	auto profile = *decoded.value;
+	profile.videoEncoding.targetBitrateBps = 10000123;
+	profile.videoEncoding.maxBitrateBps = 12000456;
+	// editor получает реальные переводы; key адресует одну подпись в выбранном файле локализации.
+	ProfileEditor editor([&translations](const char *key) {
+		return translations.value(QString::fromUtf8(key), QString::fromUtf8(key)).toString();
+	});
+	editor.setProfile(profile);
+	editor.show();
+	// help/target/maximum/advanced адресуют подсказку, пару значений и свёрнутый по умолчанию раздел.
+	auto *help = editor.findChild<QToolButton *>(QStringLiteral("videoBitrateHelp"));
+	auto *target = editor.findChild<QLineEdit *>(QStringLiteral("video.target"));
+	auto *maximum = editor.findChild<QLineEdit *>(QStringLiteral("video.maximum"));
+	auto *advanced = editor.findChild<QToolButton *>(QStringLiteral("profileAdvanced"));
+	QVERIFY(help && target && maximum && advanced);
+	QVERIFY(!help->icon().isNull());
+	QVERIFY(help->focusPolicy() & Qt::TabFocus);
+	QVERIFY(!help->accessibleName().isEmpty());
+	QVERIFY(!help->accessibleName().startsWith(QStringLiteral("Profile.")));
+	QVERIFY(!advanced->isChecked());
+	QVERIFY(!maximum->isVisible());
+	QVERIFY(help->isVisible());
+	QVERIFY(help->toolTip().contains(QStringLiteral("10000.123")) ||
+		help->toolTip().contains(QStringLiteral("10000,123")));
+	QVERIFY(help->toolTip().contains(QStringLiteral("12000.456")) ||
+		help->toolTip().contains(QStringLiteral("12000,456")));
+	QVERIFY(help->accessibleDescription().contains(target->text()));
+	QVERIFY(help->accessibleDescription().contains(maximum->text()));
+	QVERIFY(!help->toolTip().contains(QStringLiteral("Profile.BitrateHelp")));
+	// beforeTarget/beforeMaximum и changes фиксируют неизменность значений и отсутствие сигнала редактирования.
+	const auto beforeTarget = target->text();
+	const auto beforeMaximum = maximum->text();
+	QSignalSpy changes(&editor, &ProfileEditor::changed);
+	QVERIFY(changes.isValid());
+	// hover доставляет обычный запрос tooltip непосредственно собственной кнопке offscreen-формы.
+	QHelpEvent hover(QEvent::ToolTip, help->rect().center(), help->mapToGlobal(help->rect().center()));
+	QApplication::sendEvent(help, &hover);
+	QTest::mouseClick(help, Qt::LeftButton);
+	help->setFocus();
+	QTest::keyClick(help, Qt::Key_Space);
+	QCOMPARE(changes.size(), 0);
+	QCOMPARE(target->text(), beforeTarget);
+	QCOMPARE(maximum->text(), beforeMaximum);
+	target->selectAll();
+	QTest::keyClicks(target, "9000");
+	QVERIFY(help->toolTip().contains(QStringLiteral("9000")));
+	QVERIFY(!help->toolTip().contains(QStringLiteral("10000")));
+	QVERIFY(help->toolTip().contains(QStringLiteral("12000")));
+	QCOMPARE(maximum->text(), beforeMaximum);
+	advanced->click();
+	maximum->selectAll();
+	QTest::keyClicks(maximum, "13000");
+	advanced->click();
+	QVERIFY(!maximum->isVisible());
+	QVERIFY(help->toolTip().contains(QStringLiteral("13000")));
+	// retained содержит ввод до пресета; preset заполняет всю форму известным профилем владельца.
+	const auto retained = editor.captureDraft();
+	auto *preset = editor.findChild<QComboBox *>(QStringLiteral("profilePreset"));
+	QVERIFY(choose(preset, QStringLiteral("h264-1080p60")));
+	QVERIFY(help->toolTip().contains(QStringLiteral("6000")));
+	QVERIFY(!help->toolTip().contains(QStringLiteral("9000")));
+	changes.clear();
+	editor.restoreDraft(retained);
+	QCOMPARE(changes.size(), 0);
+	QCOMPARE(target->text(), QStringLiteral("9000"));
+	QVERIFY(help->toolTip().contains(QStringLiteral("9000")));
+	QVERIFY(help->toolTip().contains(QStringLiteral("13000")));
+	// restored и error проверяют реальные значения DTO после всех чисто справочных действий.
+	GroupProfile restored;
+	QString error;
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QCOMPARE(restored.videoEncoding.targetBitrateBps, quint64(9000000));
+	QCOMPARE(restored.videoEncoding.maxBitrateBps, quint64(13000000));
+	editor.setProfile(profile);
+	QVERIFY(help->toolTip().contains(QStringLiteral("10000")));
+	QVERIFY(help->toolTip().contains(QStringLiteral("12000")));
+}
+
+// Проверяет обе локализации одной причины и общего результата сохранения.
+void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorrection_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::newRow("russian") << QStringLiteral("ru-RU");
+	QTest::newRow("english") << QStringLiteral("en-US");
+}
+
+// Ошибочный текст и CBR-расхождение не отправляют HTTP, не меняют максимум и не теряют пользовательский ввод.
+void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorrection()
+{
+	// locale/translations выбирают настоящие подписи без подмены пользовательского текста ключами API.
+	QFETCH(QString, locale);
+	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QLatin1Char('/') + locale +
+				       QStringLiteral(".ini"),
+			       QSettings::IniFormat);
+	// rig/model/encoding/video задают корректный CBR-рецепт сервера с обоими битрейтами 12 Мбит/с.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	auto model = fixture::groupProfile();
+	auto encoding = fixture::encoding();
+	encoding.insert(QStringLiteral("rate_control"), QStringLiteral("cbr"));
+	model.insert(QStringLiteral("encoding"), encoding);
+	model.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
+	auto video = model.value(QStringLiteral("video_encoding")).toObject();
+	video.insert(QStringLiteral("target_bitrate_bps"), QStringLiteral("12000000"));
+	video.insert(QStringLiteral("max_bitrate_bps"), QStringLiteral("12000000"));
+	model.insert(QStringLiteral("video_encoding"), video);
+	rig.profile.insert(QStringLiteral("profile"), model);
+	// page использует реальный редактор; key адресует локализованную подпись или причину.
+	ConfigurationEditor page(
+		rig.state, rig.configuration,
+		[&translations](const char *key) {
+			return translations.value(QString::fromUtf8(key), QString::fromUtf8(key)).toString();
+		},
+		ConfigurationKind::Profile);
+	page.show();
+	QVERIFY(rig.configuration.open(ConfigurationKind::Profile, QStringLiteral("profile")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// target/maximum/save/message адресуют пользовательский ввод, скрытый максимум, действие и inline-результат.
+	auto *target = page.findChild<QLineEdit *>(QStringLiteral("video.target"));
+	auto *maximum = page.findChild<QLineEdit *>(QStringLiteral("video.maximum"));
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QVERIFY(target && maximum && save && message);
+	QVERIFY(!maximum->isVisible());
+	target->selectAll();
+	QTest::keyClicks(target, "12x");
+	save->click();
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	QCOMPARE(message->textFormat(), Qt::PlainText);
+	QCOMPARE(target->text(), QStringLiteral("12x"));
+	QVERIFY(rig.mutations().isEmpty());
+	target->selectAll();
+	QTest::keyClicks(target, "10000");
+	save->click();
+	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected);
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	// reason/notSaved/label — независимые публичные ресурсы точной причины, общего отказа и понятного поля.
+	const auto reason = translations.value(QStringLiteral("Validation.CbrBitrateMismatch")).toString();
+	const auto notSaved = translations.value(QStringLiteral("Configuration.NotSaved")).toString();
+	const auto label = translations.value(QStringLiteral("Profile.MaxBitrate")).toString();
+	QVERIFY(!reason.isEmpty() && !notSaved.isEmpty() && !label.isEmpty());
+	QCOMPARE(message->text().count(reason), 1);
+	QCOMPARE(message->text().count(notSaved), 1);
+	QVERIFY(message->text().contains(label));
+	QVERIFY(!message->text().contains(QStringLiteral("profile.video_encoding")));
+	QCOMPARE(target->text(), QStringLiteral("10000"));
+	QCOMPARE(maximum->text(), QStringLiteral("12000"));
+	QCOMPARE(std::get<Profile>(*rig.state.configurationEditor().draft).profile.videoEncoding.targetBitrateBps,
+		 quint64(10000000));
+	QCOMPARE(std::get<Profile>(*rig.state.configurationEditor().draft).profile.videoEncoding.maxBitrateBps,
+		 quint64(12000000));
+	QVERIFY(rig.mutations().isEmpty());
+	target->selectAll();
+	QTest::keyClicks(target, "12000");
+	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
+	QVERIFY(!message->text().contains(reason));
+	save->click();
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Saved, 1000);
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("active"));
+	QVERIFY(message->text().contains(translations.value(QStringLiteral("Configuration.Saved")).toString()));
+	QVERIFY(!message->text().contains(notSaved));
+	QVERIFY(!message->text().contains(reason));
+	QCOMPARE(rig.mutations().size(), 1);
+}
+
+// Серверная причина сохраняет буквальные теги и один вложенный путь, а отдельное value не попадает в сообщение.
+void ConfigurationUiTest::nestedServerValidationIsPlainTextAndKeepsReasonOnce()
+{
+	// translations предоставляет настоящую строку формата для подписи поля и серверной причины.
+	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QStringLiteral("/en-US.ini"),
+			       QSettings::IniFormat);
+	// rig/page открывают обычный серверный профиль; key адресует поставляемую английскую подпись.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	ConfigurationEditor page(
+		rig.state, rig.configuration,
+		[&translations](const char *key) {
+			return translations.value(QString::fromUtf8(key), QString::fromUtf8(key)).toString();
+		},
+		ConfigurationKind::Profile);
+	QVERIFY(rig.configuration.open(ConfigurationKind::Profile, QStringLiteral("profile")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// Перехватчик request возвращает структурированную ошибку известного вложенного поля с недоверенным ключом.
+	rig.intercept = [](const HttpServer::Request &request) {
+		if (request.method != "PATCH")
+			return false;
+		HttpServer::reply(
+			request,
+			R"({"status":422,"title":"Validation","errors":[{"location":"body.profile.video_encoding.max_bitrate_bps","message":"<b>Maximum rejected</b>","value":"private-field-value","messageKey":"Configuration.Saved"}]})",
+			422, "application/problem+json");
+		return true;
+	};
+	// target/save/message адресуют настоящий пользовательский ввод и результат карточки.
+	auto *target = page.findChild<QLineEdit *>(QStringLiteral("video.target"));
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QVERIFY(target && save && message);
+	target->selectAll();
+	QTest::keyClicks(target, "7000");
+	save->click();
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected, 1000);
+	QCOMPARE(rig.mutations().size(), 1);
+	QCOMPARE(rig.state.configurationEditor().fieldIssues.size(), 1);
+	QVERIFY(rig.state.configurationEditor().fieldIssues.contains(
+		QStringLiteral("profile.video_encoding.max_bitrate_bps")));
+	QCOMPARE(message->textFormat(), Qt::PlainText);
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	QCOMPARE(message->text().count(QStringLiteral("<b>Maximum rejected</b>")), 1);
+	QVERIFY(message->text().contains(translations.value(QStringLiteral("Profile.MaxBitrate")).toString()));
+	QVERIFY(!message->text().contains(QStringLiteral("profile.video_encoding")));
+	QVERIFY(!message->text().contains(QStringLiteral("private-field-value")));
+	QVERIFY(!message->text().contains(QStringLiteral("Configuration.Saved")));
+	QCOMPARE(target->text(), QStringLiteral("7000"));
+	target->selectAll();
+	QTest::keyClicks(target, "6000");
+	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
+	QVERIFY(!message->text().contains(QStringLiteral("Maximum rejected")));
+}
+
+// Не даёт серверному message раскрыть точные секреты, уже полученные для открытой карточки назначения.
+void ConfigurationUiTest::serverValidationRedactsSecretsEmbeddedInMessage()
+{
+	// translations предоставляет реальный формат сообщения с причиной, исключая фиктивный перевод без %1/%2.
+	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QStringLiteral("/en-US.ini"),
+			       QSettings::IniFormat);
+	// rig/page содержат синтетические endpoint и stream_key, доступные редактору, но исключённые из диагностики.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	// Переводчик key возвращает поставляемую подпись, сохраняя подстановки редактора.
+	ConfigurationEditor page(
+		rig.state, rig.configuration,
+		[&translations](const char *key) {
+			return translations.value(QString::fromUtf8(key), QString::fromUtf8(key)).toString();
+		},
+		ConfigurationKind::Destination);
+	QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// Перехватчик request вставляет секреты в структурированную причину, а не только в отдельное value.
+	rig.intercept = [&rig](const HttpServer::Request &request) {
+		if (request.method != "PATCH")
+			return false;
+		// issue/problem моделируют обычную причину с чувствительными значениями из текущей серверной базы.
+		const QJsonObject issue{{QStringLiteral("location"), QStringLiteral("body.name")},
+					{QStringLiteral("message"),
+					 QStringLiteral("Name rejected for ") + fixture::endpoint() + QLatin1Char(' ') +
+						 rig.destination.value(QStringLiteral("stream_key")).toString()},
+					{QStringLiteral("value"), QStringLiteral("private-field-value")}};
+		const QJsonObject problem{{QStringLiteral("status"), 422},
+					  {QStringLiteral("errors"), QJsonArray{issue}}};
+		HttpServer::reply(request, fixture::bytes(problem), 422, "application/problem+json");
+		return true;
+	};
+	// name/save/message адресуют безопасное поле изменения и единственный inline-результат.
+	auto *name = page.findChild<QLineEdit *>(QStringLiteral("configurationName"));
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QVERIFY(name && save && message);
+	name->selectAll();
+	QTest::keyClicks(name, "Rejected destination name");
+	save->click();
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected, 1000);
+	QCOMPARE(message->text().count(QStringLiteral("Name rejected for")), 1);
+	QVERIFY(!message->text().contains(fixture::endpoint()));
+	QVERIFY(!message->text().contains(rig.destination.value(QStringLiteral("stream_key")).toString()));
+	QVERIFY(!message->text().contains(QStringLiteral("private-field-value")));
+	QCOMPARE(message->textFormat(), Qt::PlainText);
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+}
+
+// Потеря ответа, серверная валидация и конфликт имеют разные результаты при общем красном оформлении.
+void ConfigurationUiTest::mutationFailuresStayRedWithoutClaimingUnknownWasRejected_data()
+{
+	QTest::addColumn<int>("status");
+	QTest::addColumn<int>("outcomeValue");
+	QTest::newRow("lost-response") << 0 << static_cast<int>(ConfigurationOutcome::Unknown);
+	QTest::newRow("validation-rejected") << 422 << static_cast<int>(ConfigurationOutcome::Rejected);
+	QTest::newRow("revision-conflict") << 409 << static_cast<int>(ConfigurationOutcome::Conflict);
+}
+
+// Отправляет одно намерение и проверяет безопасную классификацию без автоматической повторной записи.
+void ConfigurationUiTest::mutationFailuresStayRedWithoutClaimingUnknownWasRejected()
+{
+	// status выбирает ответ сервера; outcomeValue задаёт независимо ожидаемую классификацию результата.
+	QFETCH(int, status);
+	QFETCH(int, outcomeValue);
+	// rig/page открывают редактируемую группу до управляемого отказа PATCH.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	ConfigurationEditor page(rig.state, rig.configuration, translatedKey, ConfigurationKind::Group);
+	QVERIFY(rig.configuration.open(ConfigurationKind::Group, QStringLiteral("group")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// Перехватчик request обрывает ответ либо возвращает отказ; при 409 обновляет независимую серверную ревизию.
+	rig.intercept = [&rig, status](const HttpServer::Request &request) {
+		if (request.method != "PATCH")
+			return false;
+		if (status == 0) {
+			if (request.socket)
+				request.socket->abort();
+		} else {
+			if (status == 409)
+				rig.group.insert(QStringLiteral("revision"), QStringLiteral("2"));
+			HttpServer::reply(request, "{}", status, "application/problem+json");
+		}
+		return true;
+	};
+	// name/save/message адресуют обычное имя группы, действие сохранения и видимый результат.
+	auto *name = page.findChild<QLineEdit *>(QStringLiteral("configurationName"));
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QVERIFY(name && save && message);
+	name->selectAll();
+	QTest::keyClicks(name, "Retained group name");
+	save->click();
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome,
+				  static_cast<ConfigurationOutcome>(outcomeValue), 1000);
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	QCOMPARE(rig.mutations().size(), 1);
+	QCOMPARE(name->text(), QStringLiteral("Retained group name"));
+	QVERIFY(!message->text().contains(QStringLiteral("Configuration.Saved")));
+	if (status == 0) {
+		QVERIFY(message->text().contains(QStringLiteral("Configuration.Unknown")));
+		QVERIFY(!message->text().contains(QStringLiteral("Configuration.Rejected")));
+		QVERIFY(rig.state.configurationEditor().reconciliationRequired);
+		QVERIFY(!save->isEnabled());
+	}
+}
+
+// Потерянный PATCH остаётся неизвестным, даже если позднее пользователь очищает обязательный адрес.
+void ConfigurationUiTest::unknownDestinationValidationKeepsUnknownOutcome()
+{
+	// rig/page открывают существующее назначение через изолированный HTTP-сервер.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	ConfigurationEditor page(rig.state, rig.configuration, translatedKey, ConfigurationKind::Destination);
+	page.show();
+	QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// name/save/message адресуют изменяемое поле и общий результат потерянного сохранения.
+	auto *name = page.findChild<QLineEdit *>(QStringLiteral("configurationName"));
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QVERIFY(name && save && message);
+	// endpointField выбирается по полученному адресу, не по порядку полей формы.
+	SecretField *endpointField = nullptr;
+	// secret перебирает поля адреса и ключа, оставляя только полученный endpoint.
+	for (auto *secret : page.findChildren<SecretField *>())
+		if (secret->received().hasValue() && *secret->received() == fixture::endpoint())
+			endpointField = secret;
+	QVERIFY(endpointField);
+	// input позволяет проверить пустой адрес, сохраняя обычный пользовательский путь ввода.
+	auto *input = endpointField->findChild<QLineEdit *>(QStringLiteral("secretReceived"));
+	QVERIFY(input);
+	// Перехватчик request обрывает единственный PATCH, не отправляя его повторно.
+	rig.intercept = [](const HttpServer::Request &request) {
+		if (request.method != "PATCH")
+			return false;
+		if (request.socket)
+			request.socket->abort();
+		return true;
+	};
+	name->selectAll();
+	QTest::keyClicks(name, "Retained destination name");
+	save->click();
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown, 1000);
+	QVERIFY(rig.state.configurationEditor().reconciliationRequired);
+	QCOMPARE(rig.mutations().size(), 1);
+	input->selectAll();
+	QTest::keyClick(input, Qt::Key_Backspace);
+	QVERIFY(input->text().isEmpty());
+	// error остаётся непосредственно у поля адреса, пока общий итог хранит неизвестность PATCH.
+	auto *error = page.findChild<QLabel *>(QStringLiteral("configurationEndpointError"));
+	QVERIFY(error);
+	QVERIFY(error->isVisible());
+	QCOMPARE(error->text(), QStringLiteral("Editor.EndpointRequired"));
+	QVERIFY(message->text().contains(QStringLiteral("Configuration.Unknown")));
+	QVERIFY(!message->text().contains(QStringLiteral("Configuration.NotSaved")));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	QCOMPARE(rig.mutations().size(), 1);
+}
+
+// Общий результат остаётся ошибкой, когда один из двух независимых PATCH назначений отклонён.
+void ConfigurationUiTest::partialDestinationSaveKeepsErrorTone()
+{
+	// rig/config/documents задают два собственных включённых назначения и полный доступный список.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	auto config = rig.state.configuration();
+	QMap<QString, QJsonObject> documents;
+	// id адресует одно назначение; document/decoded — независимые серверная и клиентская копии.
+	for (const auto &id : {QStringLiteral("a"), QStringLiteral("b")}) {
+		auto document = fixture::destination();
+		document.insert(QStringLiteral("id"), id);
+		document.insert(QStringLiteral("name"), QStringLiteral("Destination ") + id);
+		const auto decoded = decode<Destination>(fixture::bytes(document));
+		QVERIFY(decoded);
+		documents.insert(id, document);
+		config.destinations.insert(id, *decoded.value);
+	}
+	config.destinationsStatus = {RuntimeAvailability::Fresh, true, {}};
+	rig.state.setConfiguration(config);
+	// Перехватчик request обслуживает список и карточки; b отклоняется, a получает подтверждённую новую ревизию.
+	rig.intercept = [&documents](const HttpServer::Request &request) {
+		if (request.method == "GET" && (request.target.startsWith("/api/v1/destinations?") ||
+						request.target.startsWith("/api/v1/streams/stream/destinations"))) {
+			HttpServer::reply(request, fixture::page({documents.value(QStringLiteral("a")),
+								  documents.value(QStringLiteral("b"))}));
+			return true;
+		}
+		// id извлекает непрозрачную цель только для простых синтетических адресов a/b этой фикстуры.
+		const auto id =
+			QString::fromUtf8(request.target).section(QLatin1Char('/'), -1).section(QLatin1Char('?'), 0, 0);
+		if (!documents.contains(id))
+			return false;
+		if (request.method == "PATCH" && id == QStringLiteral("b")) {
+			HttpServer::reply(request, "{}", 422, "application/problem+json");
+			return true;
+		}
+		if (request.method == "PATCH") {
+			documents[id].insert(QStringLiteral("enabled"), false);
+			documents[id].insert(QStringLiteral("revision"), QStringLiteral("2"));
+		}
+		HttpServer::reply(request, fixture::bytes(documents.value(id)));
+		return true;
+	};
+	// page/message отражают публичный итог того же контроллера, который выполняет реальные петлевые HTTP-запросы.
+	ConfigurationEditor page(rig.state, rig.configuration, translatedKey, ConfigurationKind::Stream);
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QVERIFY(message);
+	QVERIFY(rig.configuration.open(ConfigurationKind::Stream, QStringLiteral("stream")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	QVERIFY(rig.configuration.setDestinationEnabled(QStringLiteral("a"), false));
+	QVERIFY(rig.configuration.setDestinationEnabled(QStringLiteral("b"), false));
+	QVERIFY(rig.configuration.save());
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 1000);
+	QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("a")),
+		 ConfigurationOutcome::Saved);
+	QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("b")),
+		 ConfigurationOutcome::Rejected);
+	QVERIFY(message->text().contains(QStringLiteral("Configuration.DestinationsPartial")));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	QCOMPARE(rig.mutations().size(), 2);
 }
 
 // Проверяет сохранение нестандартной дроби и точное преобразование трёх типовых частот.
@@ -1349,6 +1839,7 @@ void ConfigurationUiTest::failedFirstDetailReadKeepsVisibleErrorAndReload_data()
 	QTest::newRow("not-found") << 404;
 	QTest::newRow("timeout") << 0;
 }
+// Первое неуспешное чтение остаётся красным и доступным пользователю до явного повторного GET.
 void ConfigurationUiTest::failedFirstDetailReadKeepsVisibleErrorAndReload()
 {
 	// status выбирает серверный отказ; ноль означает отсутствие ответа до ограниченного timeout клиента.
@@ -1360,6 +1851,7 @@ void ConfigurationUiTest::failedFirstDetailReadKeepsVisibleErrorAndReload()
 	page.show();
 	// detailReads считает только точные GET карточки, чтобы выявить скрытые повторы после первого отказа.
 	int detailReads = 0;
+	// Перехватчик request отклоняет только первое адресное чтение; последующее обслуживает обычная фикстура.
 	rig.intercept = [&](const HttpServer::Request &request) {
 		if (request.method != "GET" || request.target != "/api/v1/destinations/destination")
 			return false;
@@ -1387,6 +1879,7 @@ void ConfigurationUiTest::failedFirstDetailReadKeepsVisibleErrorAndReload()
 	QVERIFY(!rig.state.configurationEditor().draft.has_value());
 	QCOMPARE(rig.state.configurationEditor().id, QStringLiteral("destination"));
 	QCOMPARE(message->text(), QStringLiteral("Configuration.ReadFailed"));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
 	QVERIFY(message->isVisible());
 	QVERIFY(reload->isEnabled());
 	QCOMPARE(detailReads, 1);
@@ -1402,6 +1895,7 @@ void ConfigurationUiTest::failedFirstDetailReadKeepsVisibleErrorAndReload()
 	QVERIFY(rig.mutations().isEmpty());
 }
 
+// Подтверждённые сохранение и удаление показываются зелёным, а удаление заменяет предыдущий текст Saved.
 void ConfigurationUiTest::deletingSavedGroupShowsDeletedInsteadOfPreviousSavedMessage()
 {
 	// rig/page сначала сохраняют Group, чтобы старое сообщение Saved действительно существовало до DELETE.
@@ -1420,8 +1914,10 @@ void ConfigurationUiTest::deletingSavedGroupShowsDeletedInsteadOfPreviousSavedMe
 	save->click();
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Saved, 1000);
 	QCOMPARE(message->text(), QStringLiteral("Configuration.Saved"));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("active"));
 	// deleted отражает серверное удаление: последующий список не возвращает уже удалённую Group.
 	bool deleted = false;
+	// Перехватчик request подтверждает DELETE и исключает удалённую запись из последующего серверного списка.
 	rig.intercept = [&](const HttpServer::Request &request) {
 		if (request.method == "DELETE") {
 			deleted = true;
@@ -1438,10 +1934,203 @@ void ConfigurationUiTest::deletingSavedGroupShowsDeletedInsteadOfPreviousSavedMe
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Deleted, 1000);
 	QVERIFY(!rig.state.configurationEditor().draft.has_value());
 	QCOMPARE(message->text(), QStringLiteral("Configuration.Deleted"));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("active"));
 	QVERIFY(!message->text().contains(QStringLiteral("Configuration.Saved")));
 	QCOMPARE(rig.state.selectedStreamId(), QStringLiteral("stream"));
 	QCOMPARE(rig.mutations().size(), 2);
 }
 
+// Задаёт два вида локальной валидации, которые не должны стать результатом принятого DELETE.
+void ConfigurationUiTest::deletingRecordReplacesStaleValidationWhilePending_data()
+{
+	QTest::addColumn<bool>("endpointCase");
+	QTest::newRow("profile-number") << false;
+	QTest::newRow("destination-endpoint") << true;
+}
+
+// Подтверждённый DELETE снимает прежнюю локальную ошибку при ожидании ответа и показывает зелёный результат.
+void ConfigurationUiTest::deletingRecordReplacesStaleValidationWhilePending()
+{
+	// endpointCase выбирает inline-проверку адреса вместо числового ввода профиля.
+	QFETCH(bool, endpointCase);
+	// kind/id адресуют запись; collectionPath определяет только последующее чтение её коллекции.
+	const auto kind = endpointCase ? ConfigurationKind::Destination : ConfigurationKind::Profile;
+	const auto id = endpointCase ? QStringLiteral("destination") : QStringLiteral("profile");
+	const auto collectionPath = endpointCase ? QByteArrayLiteral("/api/v1/destinations")
+						 : QByteArrayLiteral("/api/v1/transcode-profiles");
+	// rig/page открывают запись через изолированный HTTP-сервер.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	rig.configApi.setHttpTimeoutMs(2000);
+	ConfigurationEditor page(rig.state, rig.configuration, translatedKey, kind);
+	page.show();
+	QVERIFY(rig.configuration.open(kind, id));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// target адресует исходный ввод; для назначения поле выбирается по полученному endpoint.
+	QLineEdit *target = page.findChild<QLineEdit *>(QStringLiteral("video.target"));
+	if (endpointCase) {
+		// secret перебирает маскированные строки и отличает endpoint от ключа трансляции.
+		for (auto *secret : page.findChildren<SecretField *>())
+			if (secret->received().hasValue() && *secret->received() == fixture::endpoint())
+				target = secret->findChild<QLineEdit *>(QStringLiteral("secretReceived"));
+	}
+	// save/remove/message адресуют действия и общую сводку карточки.
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
+	QPushButton *remove = nullptr;
+	// button перебирает действия страницы и выбирает удаление по локализованной подписи.
+	for (auto *button : page.findChildren<QPushButton *>())
+		if (button->text() == QStringLiteral("Editor.Delete"))
+			remove = button;
+	QVERIFY(target && save && remove && message);
+	target->selectAll();
+	if (endpointCase)
+		QTest::keyClick(target, Qt::Key_Backspace);
+	else
+		QTest::keyClicks(target, "12x");
+	save->click();
+	QVERIFY(message->text().contains(QStringLiteral("Configuration.NotSaved")));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	// deleteRequest удерживает только живой сокет DELETE до явного ответа теста; deleted управляет списком после успеха.
+	HttpServer::Request deleteRequest;
+	bool deleted = false;
+	// Перехватчик сохраняет DELETE без ответа, а после подтверждения отдаёт пустой список текущего вида.
+	rig.intercept = [&deleteRequest, &deleted, collectionPath](const HttpServer::Request &request) {
+		if (request.method == "DELETE") {
+			deleteRequest = request;
+			return true;
+		}
+		if (deleted && request.method == "GET" && request.target.startsWith(collectionPath)) {
+			HttpServer::reply(request, fixture::page({}));
+			return true;
+		}
+		return false;
+	};
+	// cancelled фиксирует отказ от первой попытки удаления до отправки HTTP.
+	bool cancelled = false;
+	// Таймер выбирает No, чтобы проверить, что непринятое действие не очищает локальную ошибку.
+	QTimer::singleShot(0, &page, [&page, &cancelled] {
+		// dialog — открытое подтверждение удаления этой страницы.
+		if (auto *dialog = page.findChild<QMessageBox *>()) {
+			cancelled = true;
+			dialog->done(QMessageBox::No);
+		}
+	});
+	remove->click();
+	QVERIFY(cancelled);
+	QVERIFY(!rig.state.configurationEditor().writing);
+	// Повторная отрисовка после отмены проверяет, что причина сохранилась в локальном состоянии формы.
+	rig.state.setConfigurationEditor(rig.state.configurationEditor());
+	QVERIFY(message->text().contains(QStringLiteral("Configuration.NotSaved")));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
+	QVERIFY(rig.mutations().isEmpty());
+	// confirmed фиксирует ответ только на диалог этой страницы.
+	bool confirmed = false;
+	// Таймер выбирает Yes в настоящем модальном подтверждении, после чего UI ждёт ответ HTTP.
+	QTimer::singleShot(0, &page, [&page, &confirmed] {
+		// dialog — открытое подтверждение удаления, если обработчик успел создать его.
+		if (auto *dialog = page.findChild<QMessageBox *>()) {
+			confirmed = true;
+			dialog->done(QMessageBox::Yes);
+		}
+	});
+	remove->click();
+	QVERIFY(confirmed);
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().writing && deleteRequest.socket, 1000);
+	QCOMPARE(target->text(), endpointCase ? QString{} : QStringLiteral("12x"));
+	QVERIFY(!message->text().contains(QStringLiteral("Configuration.NotSaved")));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("pending"));
+	if (endpointCase) {
+		// inlineError больше не описывает принятое удаление, хотя пустой ввод остаётся в поле.
+		auto *inlineError = page.findChild<QLabel *>(QStringLiteral("configurationEndpointError"));
+		QVERIFY(inlineError);
+		QVERIFY(inlineError->isHidden());
+		QCOMPARE(inlineError->property("statusTone").toString(), QStringLiteral("neutral"));
+	}
+	QVERIFY(deleteRequest.socket);
+	deleted = true;
+	HttpServer::reply(deleteRequest, {}, 204, {});
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Deleted, 1000);
+	QCOMPARE(message->text(), QStringLiteral("Configuration.Deleted"));
+	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("active"));
+	QVERIFY(!message->text().contains(QStringLiteral("Configuration.NotSaved")));
+	QCOMPARE(rig.mutations().size(), 1);
+}
+
 QTEST_MAIN(ConfigurationUiTest)
 #include "configuration-ui-test.moc"
+
+// Прямой Details работает до первого эфира, хранит чужой черновик и возвращает маску при повторном переходе.
+void ConfigurationUiTest::destinationDetailsWithoutSessionPreserveDraftAndMasks()
+{
+	// rig содержит только настройки Stream/Destination: нет ни Session, ни attached Output, ни runtime.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	QVERIFY(rig.configuration.open(ConfigurationKind::Group, QStringLiteral("group")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	// groupDraft хранит несохранённое имя, которое просмотр другой карточки должен припарковать в RAM.
+	auto groupDraft = std::get<Group>(*rig.state.configurationEditor().draft);
+	groupDraft.name = QStringLiteral("Несохранённая группа");
+	QVERIFY(rig.configuration.setDraft(groupDraft, {QStringLiteral("name")}));
+	// context фиксируется до переходов; window является единственным окном управления этого сценария.
+	const auto context = rig.state.dockContext();
+	ManagementWindow window(rig.state, translatedKey, nullptr, &rig.connection, &rig.operations,
+				&rig.configuration);
+	window.show();
+	// pages/navigation дают публичный результат прямой навигации, без вызова HTTP из Dock.
+	auto *pages = window.findChild<QStackedWidget *>(QStringLiteral("managementPages"));
+	auto *navigation = window.findChild<QListWidget *>(QStringLiteral("managementNavigation"));
+	QVERIFY(pages && navigation);
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading, 1000);
+	QCOMPARE(pages->currentIndex(), 2);
+	window.selectDestination(context, QStringLiteral("destination"));
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading &&
+					 rig.state.configurationEditor().id == QStringLiteral("destination"),
+				 1000);
+	QCOMPARE(pages->currentIndex(), 1);
+	QVERIFY(rig.state.configurationEditor().draft.has_value());
+	// editor отображает назначение, а secret/received/eye проверяют маску реального endpoint карточки.
+	auto *editor = pages->widget(1)->findChild<ConfigurationEditor *>();
+	QVERIFY(editor);
+	QCOMPARE(editor->selectedDestinationId(), QStringLiteral("destination"));
+	auto *secret = editor->findChild<SecretField *>();
+	QVERIFY(secret);
+	auto *received = secret->findChild<QLineEdit *>(QStringLiteral("secretReceived"));
+	auto *eye = secret->findChild<QToolButton *>(QStringLiteral("secretEye"));
+	QVERIFY(received && eye);
+	QCOMPARE(received->text(), fixture::endpoint());
+	QCOMPARE(received->echoMode(), QLineEdit::Password);
+	eye->click();
+	QCOMPARE(received->echoMode(), QLineEdit::Normal);
+	// destinationDraft хранит независимый ввод показанной карточки при переходе через существующее окно.
+	auto destinationDraft = std::get<Destination>(*rig.state.configurationEditor().draft);
+	destinationDraft.name = QStringLiteral("Черновик площадки");
+	QVERIFY(rig.configuration.setDraft(destinationDraft, {QStringLiteral("name")}));
+	navigation->setCurrentRow(2);
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().kind, ConfigurationKind::Group, 1000);
+	QCOMPARE(std::get<Group>(*rig.state.configurationEditor().draft).name, groupDraft.name);
+	window.selectDestination(context, QStringLiteral("destination"));
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().kind, ConfigurationKind::Destination, 1000);
+	QCOMPARE(std::get<Destination>(*rig.state.configurationEditor().draft).name, destinationDraft.name);
+	QCOMPARE(received->echoMode(), QLineEdit::Password);
+	eye->click();
+	window.hide();
+	window.show();
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading, 1000);
+	QCOMPARE(received->echoMode(), QLineEdit::Password);
+	QCOMPARE(std::get<Destination>(*rig.state.configurationEditor().draft).name, destinationDraft.name);
+	navigation->setCurrentRow(2);
+	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().kind, ConfigurationKind::Group, 1000);
+	// staleContext моделирует старую ссылку Dock: он не должен менять страницу, черновик или выбранный Stream.
+	auto staleContext = context;
+	staleContext.streamId = QStringLiteral("other-stream");
+	window.selectDestination(staleContext, QStringLiteral("destination"));
+	window.selectDestination(context, QString{});
+	QCOMPARE(pages->currentIndex(), 2);
+	QCOMPARE(std::get<Group>(*rig.state.configurationEditor().draft).name, groupDraft.name);
+	QCOMPARE(rig.state.dockContext(), context);
+	QVERIFY(!rig.state.dockServer().session);
+	QVERIFY(rig.state.runtime().sessions.isEmpty());
+	QVERIFY(rig.mutations().isEmpty());
+	QCOMPARE(rig.frontend.stopRequests, 0);
+}

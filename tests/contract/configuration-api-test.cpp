@@ -27,6 +27,10 @@ private slots:
 	void invalidProfilesAreRejectedLocally_data();
 	// Некорректный полный рецепт не превращается в допустимый исходящий документ.
 	void invalidProfilesAreRejectedLocally();
+	// Задаёт допустимое равенство CBR и отклонения по обе стороны от максимального битрейта.
+	void cbrBitrateBoundaryKeepsSpecificLocalReason_data();
+	// CBR проверяется до транспорта с точным путём, причиной и без изменения введённых битрейтов.
+	void cbrBitrateBoundaryKeepsSpecificLocalReason();
 	// Задаёт все четыре семейства CRUD и их публичные маршруты.
 	void typedCrudUsesEntityStatuses_data();
 	// Create/PATCH декодируют DTO, а DELETE принимает пустой 204 без JSON/MIME.
@@ -272,6 +276,64 @@ void ConfigurationApiTest::invalidProfilesAreRejectedLocally()
 	QVERIFY(!result.error->requestSent);
 }
 
+// Равенство основного и максимального битрейтов обязательно для CBR независимо от направления расхождения.
+void ConfigurationApiTest::cbrBitrateBoundaryKeepsSpecificLocalReason_data()
+{
+	QTest::addColumn<quint64>("target");
+	QTest::addColumn<bool>("accepted");
+	QTest::newRow("below-maximum") << quint64(10000000) << false;
+	QTest::newRow("equal-maximum") << quint64(12000000) << true;
+	QTest::newRow("above-maximum") << quint64(14000000) << false;
+}
+
+// Проверяет публичное правило CBR на полном запросе, сохраняя точные значения входного DTO.
+void ConfigurationApiTest::cbrBitrateBoundaryKeepsSpecificLocalReason()
+{
+	// target задаёт основной битрейт в бит/с; accepted определяет независимый результат правила равенства CBR.
+	QFETCH(quint64, target);
+	QFETCH(bool, accepted);
+	// decoded и recipe дают известный корректный H.264-рецепт; profile получает выбранную границу CBR.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
+	const auto recipe = decode<Encoding>(fixture::bytes(fixture::encoding()));
+	QVERIFY(decoded && recipe);
+	auto profile = *decoded.value;
+	profile.liveAudioMode = {FieldState::Value, QStringLiteral("copy")};
+	profile.encoding = {FieldState::Value, *recipe.value};
+	profile.encoding->rateControl = QStringLiteral("cbr");
+	profile.videoEncoding.targetBitrateBps = target;
+	profile.videoEncoding.maxBitrateBps = 12000000;
+	// result содержит документ только для равных битрейтов; ошибка не означает отправку HTTP.
+	const auto result = encodeRequest(ProfilePatch{1, std::nullopt, profile});
+	QCOMPARE(bool(result), accepted);
+	QCOMPARE(profile.videoEncoding.targetBitrateBps, target);
+	QCOMPARE(profile.videoEncoding.maxBitrateBps, quint64(12000000));
+	if (accepted) {
+		QCOMPARE(result.value->value(QStringLiteral("profile"))
+				 .toObject()
+				 .value(QStringLiteral("video_encoding"))
+				 .toObject()
+				 .value(QStringLiteral("target_bitrate_bps"))
+				 .toString(),
+			 QStringLiteral("12000000"));
+	} else {
+		QVERIFY(result.error.has_value());
+		QVERIFY(!result.error->requestSent);
+		QVERIFY(result.error->problem.has_value());
+		QCOMPARE(result.error->problem->field, QStringLiteral("profile.video_encoding.max_bitrate_bps"));
+		QCOMPARE(result.error->problem->errors.size(), 1);
+		QCOMPARE(result.error->problem->errors.first().location,
+			 QStringLiteral("profile.video_encoding.max_bitrate_bps"));
+		if (target < 12000000)
+			QCOMPARE(result.error->problem->errors.first().messageKey,
+				 QStringLiteral("Validation.CbrBitrateMismatch"));
+		else {
+			QVERIFY(!result.error->problem->errors.first().messageKey.isEmpty());
+			QVERIFY(result.error->problem->errors.first().messageKey !=
+				QStringLiteral("Configuration.InvalidField"));
+		}
+	}
+}
+
 void ConfigurationApiTest::typedCrudUsesEntityStatuses_data()
 {
 	QTest::addColumn<int>("kind");
@@ -441,17 +503,20 @@ void ConfigurationApiTest::localValidationNeverClaimsRequestWasSent()
 	QVERIFY(server.requests.isEmpty());
 }
 
+// Серверный messageKey не получает доверия локального валидатора; message остаётся обычным контрактным текстом.
 void ConfigurationApiTest::fieldProblemsKeepLocationsWithoutEchoingValues()
 {
 	// problem содержит намеренно секретное value; result должен сохранить только контрактные поля ошибки.
 	const auto problem = QByteArray(
-		R"({"status":422,"title":"Validation","detail":"Rejected","errors":[{"location":"body.stream_key","message":"Invalid key","value":"synthetic-secret"},{"location":"body.name","message":"Required"}]})");
+		R"({"status":422,"title":"Validation","detail":"Rejected","errors":[{"location":"body.stream_key","message":"Invalid key","value":"synthetic-secret","messageKey":"Configuration.Saved"},{"location":"body.name","message":"Required"}]})");
 	const auto result = decodeProblem(422, problem);
 	QVERIFY(result.problem.has_value());
 	QCOMPARE(result.problem->errors.size(), 2);
 	QCOMPARE(result.problem->errors.first().location, QStringLiteral("body.stream_key"));
 	QCOMPARE(result.problem->errors.first().message, QStringLiteral("Invalid key"));
+	QVERIFY(result.problem->errors.first().messageKey.isEmpty());
 	QCOMPARE(result.problem->errors.last().location, QStringLiteral("body.name"));
+	QVERIFY(result.problem->errors.last().messageKey.isEmpty());
 	QVERIFY(!result.message.contains(QStringLiteral("synthetic-secret")));
 }
 

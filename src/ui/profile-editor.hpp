@@ -11,8 +11,9 @@ namespace gost {
 class ProfileEditor final : public QWidget {
 	Q_OBJECT
 public:
-	// Создаёт форму внутри существующей страницы; text переводит подписи, parent владеет виджетом.
-	explicit ProfileEditor(TextLookup text, QWidget *parent = nullptr);
+	// Создаёт форму с переводом text внутри parent. Необязательный nameInput переходит в её первую строку;
+	// виджет становится дочерним, а обработка имени остаётся у вызывающей карточки.
+	explicit ProfileEditor(TextLookup text, QWidget *parent = nullptr, QWidget *nameInput = nullptr);
 	// Освобождает описания привязок; дочерними виджетами владеет QObject.
 	~ProfileEditor() override;
 	// Отражает полный исходный DTO; creating требует явного заполнения нового медиаформата.

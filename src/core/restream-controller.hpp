@@ -48,6 +48,10 @@ public:
 	void refreshFallbackAfterConfiguration();
 	// Прикрепляет точное назначение к исходной RUNNING Session без отдельного startOutput.
 	bool addOutput(const DockContext &context, const QString &sessionId, const QString &destinationId);
+	// Принимает запуск destinationId из свежего каталога context при доказанном отсутствии активной Session.
+	// true означает принятое локальное намерение; результат квитанции/состояния публикуется отдельно.
+	// OBS и конфигурация назначения не изменяются; неизвестный отправленный запрос повторяется только явно.
+	bool startDestination(const DockContext &context, const QString &destinationId);
 	// Запускает только подтверждённый непустой набор указанной проверки при отсутствии Session.
 	bool startFallback(const DockContext &context, quint64 precheckRevision);
 	// Адресует паузу точной RUNNING Session; не запускает OBS и не меняет group source напрямую.
@@ -63,6 +67,9 @@ public:
 	bool startStopped(const DockContext &context, const QString &sessionId, const QStringList &outputIds);
 	// Фиксирует состав пакета и для каждого Output выполняет stop->оракул->start с разными ID.
 	bool restartAll(const DockContext &context, const QString &sessionId, const QStringList &outputIds);
+	// Принимает один пакет ровно по показанной проекции request; action допускает три AllOutputs.
+	// POST сериализованы, ошибки независимых строк сохраняются, OBS и Session не останавливаются.
+	bool controlOutputs(const OutputBatchRequest &request, OperationAction action);
 	// Явно повторяет только неизвестный живой шаг с прежними payload/ID и новым ограниченным сроком.
 	bool retryUnknown(const DockContext &context);
 	// Идемпотентно запрещает новые действия, отменяет принадлежащие запросы и прекращает callbacks.

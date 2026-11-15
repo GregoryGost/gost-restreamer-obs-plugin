@@ -5,9 +5,10 @@
 
 #include <QWidget>
 
+#include <optional>
+
 class QLabel;
 class QLineEdit;
-class QCheckBox;
 class QComboBox;
 class QPushButton;
 class QSpinBox;
@@ -26,24 +27,29 @@ class ConfigurationController;
 class ConfigurationEditor;
 
 /**
- * Единственное повторно используемое расширенное окно с внутренней навигацией.
- * StateStore и необязательный ConnectionController заимствованы и должны пережить окно.
+ * Предоставляет единственное расширенное окно с внутренней навигацией и формами конфигурации.
+ * StateStore и необязательные контроллеры заимствованы и должны пережить окно.
  * Все виджеты/страницы принадлежат Qt, доступ происходит в GUI-потоке. Закрытие скрывает окно
  * без удаления, завершения приложения, потери общего состояния или разрыва подписки.
  *
  * Окно отражает StateStore, а изменения передаёт контроллеру. Без контроллера остаётся представлением
  * с недоступными действиями. Обновления значений блокируют сигналы элементов ввода, чтобы отражение
- * состояния не стало новым пользовательским изменением. Черновик адреса не затирается телеметрией.
+ * состояния не стало новым пользовательским изменением. Черновики адреса и дополнительных
+ * предпочтений не затираются телеметрией и живут до явного сохранения/отмены.
  */
 class ManagementWindow final : public QWidget {
 	Q_OBJECT
 
 public:
-	// Создаёт одно окно представления; заимствованные контроллеры переживают его скрытие и закрытие.
+	// Создаёт страницы из stateStore с переводами text; parent связывает окно с OBS.
+	// Заимствованные connection/configuration переживают окно; restream сохранён в интерфейсе конструктора.
+	// Закрытие скрывает окно, а черновики настроек сохраняются до Save/Cancel или уничтожения окна.
 	ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent = nullptr,
 			 ConnectionController *connection = nullptr, RestreamController *restream = nullptr,
 			 ConfigurationController *configuration = nullptr);
-	// Открывает карточку назначения из Dock только для исходного контекста и Session.
+	// Открывает точный Destination исходного контекста, сохраняя черновики и возвращая маски секретов.
+	void selectDestination(const DockContext &context, const QString &destinationId);
+	// Преобразует прежний маршрут Output/Session в прямой адрес сохранённого назначения.
 	void selectOutput(const DockContext &context, const QString &sessionId, const QString &outputId);
 
 protected:
@@ -53,7 +59,7 @@ protected:
 	void hideEvent(QHideEvent *event) override;
 
 private:
-	// Возвращает редактор текущей страницы/вкладки либо nullptr для остальных разделов.
+	// Возвращает редактор текущей страницы либо nullptr для разделов без конфигурационной карточки.
 	ConfigurationEditor *currentEditor() const;
 	// Активирует только текущий вид карточки, не меняя рабочий Stream.
 	void activateCurrentEditor();
@@ -61,22 +67,21 @@ private:
 	void hideSecrets();
 	// Согласует переход row с изменённым черновиком и сохраняет прежний выбор при отказе.
 	void changePage(int row);
-	// Обновляет подписи/доступность/предпочтения, сохраняя пользовательский ввод и раскрытый список.
+	// Отмечает пользовательский ввод дополнительных предпочтений, включая ещё не разобранный текст spinbox.
+	void editAdvancedSettings();
+	// Обновляет диагностику, доступность действий и сообщения форм, сохраняя изменённые черновики.
 	void refresh();
-	// Перестраивает список лишь при изменении состава/выбора; сохраняет неполученный сохранённый ID
-	// как недоступный или неподтверждённый пункт, не меняя постоянную привязку.
-	void refreshStreams();
 	// stateStore_ предоставляет состояние GUI-потока, text_ переводит подписи.
 	StateStore &stateStore_;
 	TextLookup text_;
-	// connection_ меняет подключение и привязку рабочего Stream.
+	// connection_ применяет сохранённый адрес и дополнительные предпочтения подключения.
 	ConnectionController *connection_ = nullptr;
 	// configuration_ координирует CRUD независимо от очередей наблюдения и команд.
 	ConfigurationController *configuration_ = nullptr;
-	// streamEditor_ и destinationEditor_ представляют конфигурацию, а не текущие runtime-снимки.
+	// streamEditor_ редактирует конфигурацию потока; destinationEditor_ — его сохранённые назначения.
 	ConfigurationEditor *streamEditor_ = nullptr;
 	ConfigurationEditor *destinationEditor_ = nullptr;
-	// groupEditor_ и profileEditor_ размещаются на самостоятельных страницах того же окна.
+	// groupEditor_ редактирует связи групп, profileEditor_ — параметры кодирования на отдельной странице.
 	ConfigurationEditor *groupEditor_ = nullptr;
 	ConfigurationEditor *profileEditor_ = nullptr;
 	// pages_ переключает существующие страницы без дополнительных окон.
@@ -85,29 +90,32 @@ private:
 	int currentPage_ = 0;
 	// navigationChanging_ исключает повторный переход из вложенного цикла подтверждения.
 	bool navigationChanging_ = false;
-	// navigation_ переключает существующие страницы при переходе из меню дока.
+	// navigation_ содержит внутреннее меню разделов расширенного окна.
 	QListWidget *navigation_ = nullptr;
-	// apiUrl_ содержит черновик адреса; autoConnect_ задаёт автоподключение; reconnect_ — восстановление связи.
-	// sseRejectionRetries_ задаёт существующий лимит отклонённых подписок SSE.
+	// apiUrl_ содержит локальный черновик адреса, применяемый только явным сохранением.
 	QLineEdit *apiUrl_ = nullptr;
-	QCheckBox *autoConnect_ = nullptr;
-	QCheckBox *reconnect_ = nullptr;
+	// apiUrlInvalid_ отмечает отказ локальной проверки последнего сохранения и сбрасывается новым вводом/отменой.
+	bool apiUrlInvalid_ = false;
+	// sseRejectionRetries_ содержит черновик лимита отклонённых подписок SSE.
 	QSpinBox *sseRejectionRetries_ = nullptr;
 	// httpTimeout_ редактирует общий срок новых REST-запросов, logMode_ — уровень штатного журнала OBS.
 	QSpinBox *httpTimeout_ = nullptr;
 	QComboBox *logMode_ = nullptr;
-	// streams_ и displayedSelectionId_ сохраняют выбор и не пересоздают раскрытый список при телеметрии.
-	QComboBox *streams_ = nullptr;
-	QString displayedSelectionId_;
-	// connectButton_ и disconnectButton_ передают явные изменения сетевого подключения.
-	QPushButton *connectButton_ = nullptr;
-	QPushButton *disconnectButton_ = nullptr;
-	// connectionStatus_ показывает связь; connectionMessage_ — общие предупреждения подключения и выбора.
-	// advancedSettingsMessage_ отдельно показывает результат сохранения настроек на странице дополнительных параметров.
-	StatusLabel *connectionStatus_ = nullptr;
-	QLabel *connectionMessage_ = nullptr;
-	QLabel *advancedSettingsMessage_ = nullptr;
-	// profile_ и streaming_ представляют локальные наблюдения OBS на странице диагностики.
+	// settingsSaveButton_ применяет черновик адреса; settingsCancelButton_ возвращает текущий адрес без записи.
+	QPushButton *settingsSaveButton_ = nullptr;
+	QPushButton *settingsCancelButton_ = nullptr;
+	// advancedSettingsSaveButton_ применяет три предпочтения; advancedSettingsCancelButton_ отменяет их ввод.
+	QPushButton *advancedSettingsSaveButton_ = nullptr;
+	QPushButton *advancedSettingsCancelButton_ = nullptr;
+	// advancedSettingsDirty_ защищает ввод страницы от обновлений StateStore до явного Save/Cancel.
+	bool advancedSettingsDirty_ = false;
+	// advancedSettingsSaveResult_ хранит исход явного Save; nullopt означает отсутствие текущего результата.
+	std::optional<bool> advancedSettingsSaveResult_;
+	// settingsMessage_ показывает только локальную валидацию адреса и предупреждение о несохранённых настройках.
+	QLabel *settingsMessage_ = nullptr;
+	// advancedSettingsMessage_ показывает подтверждение записи или отказ смысловым цветом текущей темы.
+	StatusLabel *advancedSettingsMessage_ = nullptr;
+	// profile_ показывает имя профиля OBS, streaming_ — наблюдаемое состояние его штатной трансляции в диагностике.
 	QLabel *profile_ = nullptr;
 	StatusLabel *streaming_ = nullptr;
 };

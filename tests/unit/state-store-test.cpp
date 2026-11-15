@@ -75,6 +75,8 @@ RuntimeEvent runtimeEvent(QString owner, QString kind, QString instance, quint64
 class StateStoreTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Каталог сохраняется при смене Session, устаревает при потере наблюдений и очищается новым контекстом.
+	void destinationKnowledgeFollowsContextAndFreshness();
 	void anchorDoesNotSeedMetricsRevision();
 	void stateAndMetricsHaveIndependentWatermarks();
 	void firstObservationCreatesOnlyKnownLane();
@@ -423,3 +425,51 @@ void StateStoreTest::systemRemovalClearsOnlyMatchingGpuObservation()
 
 QTEST_GUILESS_MAIN(StateStoreTest)
 #include "state-store-test.moc"
+
+// Отделяет долговечные назначения выбранного Stream от текущего исполнения и от конфигурационного редактора.
+void StateStoreTest::destinationKnowledgeFollowsContextAndFreshness()
+{
+	// state принимает только синтетические наблюдения без файлов, сети и настоящего OBS.
+	StateStore state;
+	state.setConnection(QStringLiteral("http://127.0.0.1:8080"), ConnectionStatus::Connected);
+	state.setSelection(QStringLiteral("stream"), true, {}, {}, QStringLiteral("profile-a"));
+	// metadata подтверждает каталог без Session и без заполнения секретного ConfigurationState.
+	DockServerState metadata;
+	metadata.destinationsStatus = {RuntimeAvailability::Fresh, true, {}};
+	metadata.destinations.insert(QStringLiteral("destination"), {QStringLiteral("Сохранённое назначение")});
+	state.setDockServer(metadata);
+	QVERIFY(state.configuration().destinations.isEmpty());
+	metadata.session = DockSession{QStringLiteral("first-session"), QStringLiteral("RUNNING"), false};
+	state.setDockServer(metadata);
+	metadata.session = DockSession{QStringLiteral("second-session"), QStringLiteral("RUNNING"), false};
+	state.setDockServer(metadata);
+	QCOMPARE(state.dockServer().destinations.value(QStringLiteral("destination")).name,
+		 QStringLiteral("Сохранённое назначение"));
+	state.markRuntimeStale();
+	QCOMPARE(state.dockServer().destinationsStatus.availability, RuntimeAvailability::Stale);
+	QCOMPARE(state.dockServer().destinations.size(), 1);
+	state.setDockServer(metadata);
+	// previousGeneration и invalidated проверяют публичную границу записи, которую использует наблюдатель каталога.
+	const auto previousGeneration = state.configurationGeneration();
+	QSignalSpy invalidated(&state, &StateStore::configurationInvalidated);
+	QVERIFY(invalidated.isValid());
+	state.invalidateConfiguration();
+	QCOMPARE(state.configurationGeneration(), previousGeneration + 1);
+	QCOMPARE(invalidated.size(), 1);
+	QCOMPARE(invalidated.at(0).at(0).toULongLong(), state.configurationGeneration());
+	QCOMPARE(state.dockServer().destinations.size(), 1);
+	state.setSelection(QStringLiteral("stream"), true, {}, {}, QStringLiteral("profile-a"));
+	QCOMPARE(state.dockServer().destinations.size(), 1);
+	state.setSelection(QStringLiteral("stream"), true, {}, {}, QStringLiteral("profile-b"));
+	QVERIFY(state.dockServer().destinations.isEmpty());
+	QCOMPARE(state.dockServer().destinationsStatus.availability, RuntimeAvailability::Unknown);
+	state.setDockServer(metadata);
+	state.setSelection(QStringLiteral("other-stream"), true, {}, {}, QStringLiteral("profile-b"));
+	QVERIFY(state.dockServer().destinations.isEmpty());
+	state.setDockServer(metadata);
+	state.setConnection(QStringLiteral("http://127.0.0.1:8081"), ConnectionStatus::Connected);
+	QVERIFY(state.dockServer().destinations.isEmpty());
+	state.setDockServer(metadata);
+	state.clearServerState();
+	QVERIFY(state.dockServer().destinations.isEmpty());
+}

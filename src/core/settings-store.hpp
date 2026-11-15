@@ -69,9 +69,9 @@ public:
 	bool save();
 	// Возвращает выбранный канонический origin без ключей и адресов назначений.
 	const QString &serverOrigin() const noexcept;
-	// Возвращает предпочтение подключения API при следующем запуске OBS.
+	// Возвращает прежнее поле auto_connect для совместимости файла; штатное подключение всегда автоматически.
 	bool autoConnect() const noexcept;
-	// Возвращает разрешение восстановления REST/SSE после временного отказа.
+	// Возвращает прежнее поле reconnect для совместимости файла; восстановление REST/SSE не отключается им.
 	bool reconnect() const noexcept;
 	// Возвращает число повторов SSE либо UnlimitedSseRejectionRetries.
 	int sseRejectionRetries() const noexcept;
@@ -94,9 +94,9 @@ public:
 	// bool у методов изменения означает принятие допустимого значения в RAM, а не успешный save().
 	// Повтор прежнего значения не сохраняет файл; состояние записи проверяется через unsaved/error.
 	bool setServerOrigin(const QString &origin);
-	// Принимает enabled в RAM и сохраняет изменение предпочтения автоподключения.
+	// Сохраняет enabled в прежнем поле auto_connect; политику подключения текущего клиента не меняет.
 	void setAutoConnect(bool enabled);
-	// Принимает enabled в RAM и сохраняет разрешение восстановления связи.
+	// Сохраняет enabled в прежнем поле reconnect; политику восстановления текущего клиента не меняет.
 	void setReconnect(bool enabled);
 	// Сохраняет retries, если оно не меньше UnlimitedSseRejectionRetries.
 	void setSseRejectionRetries(int retries);
@@ -104,6 +104,10 @@ public:
 	bool setHttpTimeoutSeconds(int seconds);
 	// Сохраняет detailed как выбор обычного или подробного штатного журнала OBS.
 	void setDetailedLogging(bool detailed);
+	// Проверяет retries (-1 либо >=0) и seconds (5–60) до изменения RAM, затем применяет их вместе
+	// с detailed и один раз вызывает save(). Возвращает подтверждение записи, при отказе сохраняет
+	// рабочую RAM. Повтор тех же значений также пытается записать несохранённые настройки.
+	bool saveAdvancedPreferences(int retries, int seconds, bool detailed);
 	// Требует уже канонический origin и известный UUID. Пустой streamId удаляет привязку пары;
 	// наличие Stream на сервере здесь не проверяется, чтобы неполный список не стёр сохранённый выбор.
 	bool setSelectedStream(const QString &origin, const QString &profileUuid, const QString &streamId);
@@ -130,9 +134,9 @@ private:
 	QString filePath_;
 	// Канонический origin управляющего API, пустой до выбора сервера.
 	QString origin_;
-	// Предпочтение подключения при запуске, не команда запуска эфира.
+	// Прежнее поле auto_connect, сохраняемое для совместимости формата настроек.
 	bool autoConnect_ = true;
-	// Разрешение автоматического восстановления управляющей связи.
+	// Прежнее поле reconnect; текущее штатное восстановление от этого значения не зависит.
 	bool reconnect_ = true;
 	// Бюджет повторов после отказа подписки SSE 400/409.
 	int sseRejectionRetries_ = DefaultSseRejectionRetries;

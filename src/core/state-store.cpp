@@ -365,6 +365,7 @@ void StateStore::setDetails(DetailState details)
 	emit serverStateChanged();
 }
 
+// Сохраняет последние значения, отзывая свежесть runtime и независимо прочитанных REST-частей.
 void StateStore::markRuntimeStale()
 {
 	// Сначала даём Dock сохранить последние принятые значения. Если пометить их устаревшими раньше
@@ -372,16 +373,19 @@ void StateStore::markRuntimeStale()
 	emit runtimeAboutToBecomeStale();
 	markStale(runtime_.availability);
 	if (!pendingAnchor_)
+		// lanes содержит независимые подтверждения состояния, входа и метрик одного исполнения.
 		for (auto &lanes : watermarks_) {
 			markStale(lanes.evidence.state);
 			markStale(lanes.evidence.input);
 			markStale(lanes.evidence.metrics);
 		}
+	// stale отзывает свежесть переданного status, сохраняя известную полноту и значения.
 	auto stale = [](ReadStatus &status) {
 		markStale(status.availability);
 	};
 	stale(dockServer_.sessionStatus);
 	stale(dockServer_.outputsStatus);
+	stale(dockServer_.destinationsStatus);
 	markStale(dockServer_.fallback.availability);
 	stale(configuration_.streamsStatus);
 	stale(configuration_.destinationsStatus);
@@ -393,8 +397,10 @@ void StateStore::markRuntimeStale()
 	stale(history_.sessionsStatus);
 	stale(history_.outputsStatus);
 	stale(history_.receiptsStatus);
+	// status описывает свежесть отдельного подробного снимка метрик Session.
 	for (auto &status : details_.sessionMetricsStatus)
 		stale(status);
+	// status описывает свежесть отдельного списка подробностей Outputs.
 	for (auto &status : details_.outputsStatus)
 		stale(status);
 	emit runtimeStateChanged();

@@ -76,6 +76,9 @@ public:
 				start(nextPhase);
 		});
 		QObject::connect(&settings, &SettingsStore::changed, &owner, [this] { syncPreferences(); });
+		// Инвалидация отзывает старое чтение каталога до публикации и объединяет запрос новой версии.
+		QObject::connect(&state, &StateStore::configurationInvalidated, &owner,
+				 [this](quint64) { invalidateDockDestinations(); });
 		syncPreferences();
 		state.setConnection(settings.serverOrigin(), ConnectionStatus::Disconnected);
 	}
@@ -161,10 +164,26 @@ public:
 	// ID последней подтверждённой Session; очищается при смене контекста выбора.
 	QString dockSessionHint;
 
+	// Фиксирует контекст одного обхода каталога, независимого от Session и медленной цепочки fallback.
+	struct DestinationRead {
+		// selection задаёт точные сервер, UUID профиля и Stream исходного запроса.
+		DockContext selection;
+		// anchorVersion не позволяет чтению предыдущего snapshot обновить новый цикл наблюдения.
+		quint64 anchorVersion = 0;
+		// configurationVersion отзывает ответы, начатые до очередной конфигурационной записи или сверки.
+		quint64 configurationVersion = 0;
+		// dirty объединяет повторные запросы в один следующий обход после завершения текущего.
+		bool dirty = false;
+	};
+	// Ссылка удерживается callback; несовпадение с destinationRead запрещает применение ответа.
+	using DestinationBatch = std::shared_ptr<DestinationRead>;
+	// Единственный текущий обход каталога; остальные REST-части не задерживают его повтор.
+	DestinationBatch destinationRead;
+
 	// Проверяет полученный контекст received и разрешение текущего подключения.
 	bool current(api::RequestContext received) const { return !stopped && active && received == context; }
 
-	// Публикует предпочтения и безопасную ошибку сохранения из SettingsStore.
+	// Публикует штатное автоматическое подключение, параметры повторов и безопасную ошибку сохранения.
 	void syncPreferences()
 	{
 		// guard запрещает второе уведомление, если первое синхронно завершило владельца.
@@ -172,8 +191,8 @@ public:
 		state.setClientPreferences(settings.httpTimeoutSeconds(), settings.detailedLogging());
 		if (!guard)
 			return;
-		state.setPreferences(settings.autoConnect(), settings.reconnect(), settings.sseRejectionRetries(),
-				     settings.unsaved(), settings.error(), settings.errorKey());
+		state.setPreferences(true, true, settings.sseRejectionRetries(), settings.unsaved(), settings.error(),
+				     settings.errorKey());
 	}
 
 	// Сбрасывает бюджет отказов подписки после явного сброса или успешного открытия SSE.
@@ -195,6 +214,7 @@ public:
 		retry.stop();
 		clearSseRejection();
 		dockRead.reset();
+		destinationRead.reset();
 		api.cancelAll();
 		events.close();
 		if (!connection && active)
@@ -205,6 +225,7 @@ public:
 	void configure()
 	{
 		dockRead.reset();
+		destinationRead.reset();
 		api.configure(QUrl(state.serverOrigin()), context);
 	}
 
@@ -482,10 +503,116 @@ public:
 				      });
 	}
 
+	// Проверяет received, исходные выбор и snapshot; конфигурационная версия проверяется отдельно,
+	// чтобы завершившийся старый GET мог запустить объединённое актуальное чтение.
+	bool currentDestinationRead(const DestinationBatch &batch, api::RequestContext received) const
+	{
+		return current(received) && destinationRead == batch && batch->anchorVersion == anchorVersion &&
+		       state.connectionStatus() == ConnectionStatus::Connected &&
+		       state.dockContext() == batch->selection;
+	}
+
+	// Отзывает свежесть каталога и право старого GET на публикацию. Смена configurationGeneration
+	// происходит в StateStore до сигнала; отложенный повтор каталога не зависит от завершения fallback.
+	void invalidateDockDestinations()
+	{
+		if (stopped)
+			return;
+		if (destinationRead)
+			destinationRead->dirty = true;
+		// metadata сохраняет известные имена, но больше не подтверждает актуальный полный состав.
+		auto metadata = state.dockServer();
+		markReadUnconfirmed(metadata.destinationsStatus);
+		// expected фиксирует подключение, selection — выбор; guard защищает продолжение после сигнала.
+		const auto expected = context;
+		const auto selection = state.dockContext();
+		const QPointer<ConnectionController> guard = &owner;
+		state.setDockServer(std::move(metadata));
+		if (guard && current(expected) && state.dockContext() == selection)
+			refreshDockDestinations();
+	}
+
+	// Читает каталог независимо от наличия Session и других частей Dock. Повторные запросы
+	// объединяются в один следующий обход. Частичный валидный ответ обновляет известные ID без
+	// удаления пропущенных; ошибка или нарушение принадлежности сохраняют прежние имена как устаревшие.
+	void refreshDockDestinations()
+	{
+		if (!active || stopped || state.connectionStatus() != ConnectionStatus::Connected ||
+		    !state.dockContext().valid())
+			return;
+		if (destinationRead) {
+			destinationRead->dirty = true;
+			return;
+		}
+		// batch связывает обход с текущими выбором, snapshot и эпохой конфигурации.
+		auto batch = std::make_shared<DestinationRead>();
+		batch->selection = state.dockContext();
+		batch->anchorVersion = anchorVersion;
+		batch->configurationVersion = state.configurationGeneration();
+		destinationRead = batch;
+		// Обработчик received/result проверяет весь ответ до изменения безопасной проекции.
+		// Запоздалый конфигурационный ответ не публикуется и сразу уступает место актуальному обходу.
+		api.getAllStreamDestinations(
+			batch->selection.streamId, &owner,
+			[this, batch](auto received, api::Result<api::Collection<api::Destination>> result) {
+				if (!currentDestinationRead(batch, received))
+					return;
+				if (batch->configurationVersion != state.configurationGeneration()) {
+					destinationRead.reset();
+					refreshDockDestinations();
+					return;
+				}
+				// published заменяет только каталог, сохраняя независимо опубликованные Session/Outputs/fallback.
+				auto published = state.dockServer();
+				markReadUnconfirmed(published.destinationsStatus);
+				published.destinationsStatus.safeError =
+					QStringLiteral("Не удалось прочитать список назначений.");
+				if (result) {
+					// destinations принимает только проверенную проекцию; частичный ответ сохраняет прежние ID.
+					QMap<QString, DockDestination> destinations;
+					if (!result.value->complete)
+						destinations = published.destinations;
+					// receivedIds обнаруживает повтор ID; valid запрещает публикацию противоречивого ответа целиком.
+					QSet<QString> receivedIds;
+					bool valid = true;
+					// destination содержит исходный DTO, из которого в Dock переносится только имя.
+					for (const auto &destination : result.value->items) {
+						if (!validDockId(destination.id) ||
+						    receivedIds.contains(destination.id) ||
+						    destination.streamId != batch->selection.streamId) {
+							valid = false;
+							break;
+						}
+						receivedIds.insert(destination.id);
+						destinations.insert(destination.id, {destination.name});
+					}
+					if (valid) {
+						published.destinations = std::move(destinations);
+						published.destinationsStatus = {RuntimeAvailability::Fresh,
+										result.value->complete,
+										{}};
+					}
+				}
+				// repeat запоминает запрос следующего обхода до освобождения текущего; guard проверяет
+				// жизнь owner после синхронного уведомления об изменении каталога.
+				const bool repeat = batch->dirty;
+				const QPointer<ConnectionController> guard = &owner;
+				destinationRead.reset();
+				state.setDockServer(std::move(published));
+				if (guard && current(received) && state.dockContext() == batch->selection && repeat)
+					refreshDockDestinations();
+			});
+	}
+
 	// Запускается только после подтверждения SSE и разрешённого выбора. Предыдущие метаданные
 	// копируются как неподтверждённые, чтобы отказ чтения не выдавал фиктивное отсутствие Session/выходов.
 	void refreshDock()
 	{
+		// guard учитывает синхронный callback каталога при отказе очереди или исчерпанном бюджете.
+		const QPointer<ConnectionController> guard = &owner;
+		refreshDockDestinations();
+		if (!guard)
+			return;
 		if (!active || stopped || state.connectionStatus() != ConnectionStatus::Connected ||
 		    !state.dockContext().valid())
 			return;
@@ -535,6 +662,7 @@ public:
 		active = false;
 		retry.stop();
 		dockRead.reset();
+		destinationRead.reset();
 		api.cancelAll();
 		state.markRuntimeStale();
 		if (guard && !stopped && !active && context == expected)
@@ -562,21 +690,14 @@ public:
 	}
 
 	// Единственное место обычного планирования повторов. Паузы и лимит частоты стартов независимы:
-	// даже неограниченный режим для 400/409 не отменяет паузы. Поколение захватывается для timeout; отключённый
-	// reconnect или исчерпанный бюджет прекращают восстановление без нового запроса.
+	// даже неограниченный режим для 400/409 не отменяет паузы. Поколение захватывается для timeout;
+	// исчерпанный бюджет прекращает восстановление без нового запроса.
 	void schedule(Phase phase)
 	{
 		if (!active || stopped)
 			return;
-		if (phase == Phase::Snapshot && sseRejectionStatus &&
-		    (!settings.reconnect() || rejectionLimitReached())) {
+		if (phase == Phase::Snapshot && sseRejectionStatus && rejectionLimitReached()) {
 			stopAfterRejection();
-			return;
-		}
-		if (!settings.reconnect()) {
-			stopWithReason(ConnectionStatus::Error,
-				       QStringLiteral("Нет связи с сервером. Повторите подключение."),
-				       QStringLiteral("Error.ConnectionLost"));
 			return;
 		}
 		nextPhase = phase;
@@ -593,6 +714,7 @@ public:
 		const QPointer<ConnectionController> guard = &owner;
 		retry.start(delay);
 		dockRead.reset();
+		destinationRead.reset();
 		api.cancelAll();
 		state.markRuntimeStale();
 		if (guard && current(expected))
@@ -843,12 +965,15 @@ ConnectionController::~ConnectionController()
 void ConnectionController::observeProfile(FrontendEvent event, const ProfileDescriptor &descriptor)
 {
 	Q_ASSERT(QThread::currentThread() == thread());
+	// self предоставляет состояние текущего подключения до обработки синхронных уведомлений профиля.
 	auto &self = *impl_;
 	if (self.stopped)
 		return;
+	// wasResolved и resolution отличают смену устойчивой идентичности от переименования того же профиля.
 	const bool wasResolved = self.profileResolved;
 	const auto resolution = self.settings.observeProfile(event, descriptor);
 	self.profileResolved = resolution.resolved;
+	// selectionChanged требует смены поколения наблюдения при новом или неподтверждённом профиле.
 	const bool selectionChanged = resolution.changed || wasResolved != resolution.resolved;
 	// Подтверждённое переименование сохраняет UUID и подписку; настоящий переход меняет поколение выбора.
 	if (selectionChanged && !resolution.renamed) {
@@ -866,7 +991,7 @@ void ConnectionController::observeProfile(FrontendEvent event, const ProfileDesc
 		self.start(Impl::Phase::Handshake);
 	if (event == FrontendEvent::FinishedLoading && !self.autoStarted) {
 		self.autoStarted = true;
-		if (self.settings.autoConnect() && !self.settings.serverOrigin().isEmpty() && !self.active)
+		if (!self.settings.serverOrigin().isEmpty() && !self.active)
 			self.connectToServer(self.settings.serverOrigin());
 	}
 }
@@ -921,21 +1046,6 @@ void ConnectionController::selectStream(QString streamId)
 		self.start(Impl::Phase::Handshake);
 }
 
-void ConnectionController::setAutoConnect(bool enabled)
-{
-	if (!impl_->stopped)
-		impl_->settings.setAutoConnect(enabled);
-}
-
-void ConnectionController::setReconnect(bool enabled)
-{
-	if (impl_->stopped)
-		return;
-	impl_->settings.setReconnect(enabled);
-	if (!enabled && (impl_->retry.isActive() || impl_->state.connectionStatus() == ConnectionStatus::Reconnecting))
-		disconnectFromServer();
-}
-
 void ConnectionController::setSseRejectionRetries(int retries)
 {
 	if (!impl_->stopped)
@@ -954,6 +1064,14 @@ void ConnectionController::setDetailedLogging(bool detailed)
 {
 	if (!impl_->stopped)
 		impl_->settings.setDetailedLogging(detailed);
+}
+
+// Передаёт весь набор retries/seconds/detailed хранилищу без изменения подключения и активных запросов.
+// Результат подтверждает запись файла; отказ диска оставляет рабочие значения RAM по контракту хранилища.
+bool ConnectionController::saveAdvancedPreferences(int retries, int seconds, bool detailed)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	return !impl_->stopped && impl_->settings.saveAdvancedPreferences(retries, seconds, detailed);
 }
 
 void ConnectionController::shutdown()
