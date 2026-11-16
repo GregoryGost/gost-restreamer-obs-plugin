@@ -22,9 +22,6 @@ class StatusLabel;
 class RestreamController;
 class ConnectionController;
 
-// Формирует безопасный текст результатов команд; квитанция и состояние площадки не смешиваются.
-QString formatOperations(const OperationsState &operations, const TextLookup &text);
-
 /**
  * Показывает независимые состояния OBS/сервера и статистику общего StateStore в GUI-потоке.
  * StateStore и контроллеры заимствованы и должны пережить Dock; дочерними виджетами и моделью владеет Qt.
@@ -76,7 +73,7 @@ private:
 	void scheduleRefresh();
 	// Сначала принимает последнюю выборку, затем сбрасывает доступные baseline и перерисовывает.
 	void resetStatistics();
-	// Отражает доступность намерений и отдельные результаты команд без изменения телеметрии.
+	// Обновляет доступность команд, кнопку повтора и подсказку запуска по свежему состоянию.
 	void refreshOperations();
 	// Открывает меню у anchor для раздельных outputId/destinationId исходного context/sessionId.
 	// До вложенного цикла фиксирует ветвь запуска, после него проверяет ту же цель и время жизни Dock.
@@ -108,8 +105,6 @@ private:
 	// localStats_ содержит FPS/битрейт/время рендера, localDrops_ — отдельные потери и отправленные байты OBS.
 	QLabel *localStats_ = nullptr;
 	QLabel *localDrops_ = nullptr;
-	// localPeriod_ показывает общий период только при его совпадении у всех доступных накоплений OBS.
-	QLabel *localPeriod_ = nullptr;
 	// serverDataNotice_ отделяет недоступность серверных измерений от локальной статистики OBS.
 	QLabel *serverDataNotice_ = nullptr;
 	// session_ показывает долговечное состояние эфира; groups_ — фактические источники групп.
@@ -123,8 +118,6 @@ private:
 	QLabel *outputSummary_ = nullptr;
 	QStandardItemModel *outputs_ = nullptr;
 	QListView *outputList_ = nullptr;
-	// operationStatus_ показывает текущий и последний прерванный результат вне статистики площадок.
-	QLabel *operationStatus_ = nullptr;
 	// nativeStart_ объясняет запуск OBS и отдельного выхода после подтверждения отсутствия эфира.
 	QLabel *nativeStart_ = nullptr;
 	// pause_ включает серверную паузу; resume_ снимает её; stop_ завершает OBS и точную серверную Session.

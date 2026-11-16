@@ -152,12 +152,12 @@ QTextCursor findIngestText(QTextDocument &document, const QString &expected, con
 	return {};
 }
 
-// Возвращает совместный вид локальных метрик dock, включая обе колонки и общий период счётчиков.
+// Возвращает обе видимые колонки локальных метрик Dock для проверки показанных значений.
 QString obsStatisticsText(const gost::RestreamDock &dock)
 {
-	// result собирает все отображаемые значения; name адресует одну из трёх частей статистики.
+	// result собирает обе видимые колонки; name адресует одну из них.
 	QStringList result;
-	for (const auto *name : {"obsStatistics", "obsDropStatistics", "obsStatisticsPeriod"}) {
+	for (const auto *name : {"obsStatistics", "obsDropStatistics"}) {
 		// label содержит очередную часть; отсутствие обязательного элемента проваливает сценарий.
 		const auto *label = dock.findChild<QLabel *>(QString::fromLatin1(name));
 		if (!label) {
@@ -336,12 +336,12 @@ private slots:
 	void settingsSaveRetriesSameOriginAfterTerminalStop();
 	// Задаёт подтверждённое отсутствие эфира, завершённую Session и независимые наблюдения OBS.
 	void dockWarnsAboutContinuingObs_data();
-	// Предупреждение объясняет риск следующего эфира и штатную остановку OBS без ложной подсказки запуска.
+	// Убирает блок результатов команды, сохраняя отдельную подсказку штатного запуска OBS.
 	void dockWarnsAboutContinuingObs();
-	// Задаёт терминальные отказы в обеих локализациях без раскрытия серверного сообщения.
-	void commandFailureCodeIsPlainText_data();
-	// Код причины виден в Dock обычным текстом; редактор не показывает runtime-результат или failure.message.
-	void commandFailureCodeIsPlainText();
+	// Задаёт две терминальные причины отказа, остающиеся в общей модели команд.
+	void commandFailureRemainsInStateStore_data();
+	// Результат и причина отказа остаются в StateStore без блока отчёта в Dock.
+	void commandFailureRemainsInStateStore();
 	// До первого события StateStore не выдаёт неизвестные наблюдения OBS за полученные значения.
 	void stateStartsUnobserved();
 	// Сигнал изменения OBS доставляется после установки новых значений состояния.
@@ -2103,8 +2103,8 @@ void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources_data()
 
 void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources()
 {
-	// Общая подпись допустима, пока периоды совпадают. Замена output не сбрасывает накопления видео,
-	// а регресс сети не сбрасывает байты; точные пары и подписи строк обнаруживают смешение этих источников.
+	// Замена output не сбрасывает накопления видео, а регресс сети не сбрасывает байты.
+	// Числовые дельты остаются раздельными, хотя период больше не выводится в Dock.
 	// locale выбирает реальные подписи и числовой формат текущей локализации.
 	QFETCH(QString, locale);
 	// replaceOutput выбирает смену output либо отдельный регресс сетевого счётчика.
@@ -2178,10 +2178,13 @@ void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources()
 		   russian ? QStringLiteral("3 / 40 (7,5%)") : QStringLiteral("3 / 40 (7.5%)"),
 		   russian ? QStringLiteral("8 / 100 (8,0%)") : QStringLiteral("8 / 100 (8.0%)"),
 		   russian ? QStringLiteral("1,00 МиБ") : QStringLiteral("1.00 MiB"));
-	QCOMPARE(obsStatisticsText(dock).count(text("Dock.PeriodRun")), 1);
+	QVERIFY(!dock.findChild<QLabel *>(QStringLiteral("obsStatisticsPeriod")));
+	for (const auto *key : {"Dock.PeriodRun", "Dock.PeriodReset", "Dock.PeriodNewSample"}) {
+		// key адресует подпись baseline, которая не должна попадать в локальные значения Dock.
+		QVERIFY(!obsStatisticsText(dock).contains(text(key)));
+	}
 	reset->click();
-	QCOMPARE(obsStatisticsText(dock).count(text("Dock.PeriodReset")), 1);
-	QCOMPARE(obsStatisticsText(dock).count(text("Dock.PeriodRun")), 0);
+	QVERIFY(!obsStatisticsText(dock).contains(text("Dock.PeriodReset")));
 	QVERIFY(state.obsStatistics() == sample);
 
 	sample.render = FrameCounters{14, 160};
@@ -2194,7 +2197,6 @@ void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources()
 	QTRY_COMPARE_WITH_TIMEOUT(rows().value(text("Dock.RenderDropsLabel")), twenty, 1000);
 	verifyRows(twenty, russian ? QStringLiteral("1 / 20 (5,0%)") : QStringLiteral("1 / 20 (5.0%)"), twenty,
 		   russian ? QStringLiteral("2,00 МиБ") : QStringLiteral("2.00 MiB"));
-	QCOMPARE(obsStatisticsText(dock).count(text("Dock.PeriodReset")), 1);
 
 	sample.render = FrameCounters{18, 190};
 	sample.encode = FrameCounters{5, 80};
@@ -2206,16 +2208,16 @@ void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources()
 		sample.network = FrameCounters{2, 120};
 	}
 	state.setObsStatistics(sample);
-	// networkPeriod выбирает подпись нового исполнения output либо нового сетевого замера.
-	const auto networkPeriod = text(replaceOutput ? "Dock.PeriodRun" : "Dock.PeriodNewSample");
-	QTRY_VERIFY_WITH_TIMEOUT(obsStatisticsText(dock).contains(networkPeriod), 1000);
+	// firstNetwork задаёт точное значение после смены output либо регресса сети.
+	// Ожидание даёт Dock обработать отложенное обновление до чтения обеих ветвей.
+	const auto firstNetwork =
+		replaceOutput
+			? (russian ? QStringLiteral("3 / 50 (6,0%)") : QStringLiteral("3 / 50 (6.0%)"))
+			: text("Dock.Pair").arg(QStringLiteral("0"), QStringLiteral("0"), text("Observation.NoData"));
+	QTRY_COMPARE_WITH_TIMEOUT(rows().value(text("Dock.NetworkDropsLabel")), firstNetwork, 1000);
 	if (!replaceOutput) {
-		QCOMPARE(
-			rows().value(text("Dock.NetworkDropsLabel")),
-			text("Dock.CountPeriod")
-				.arg(text("Dock.Pair")
-					     .arg(QStringLiteral("0"), QStringLiteral("0"), text("Observation.NoData")),
-				     networkPeriod));
+		QCOMPARE(rows().value(text("Dock.NetworkDropsLabel")),
+			 text("Dock.Pair").arg(QStringLiteral("0"), QStringLiteral("0"), text("Observation.NoData")));
 		sample.network = FrameCounters{5, 130};
 		sample.sentBytes = 5242880;
 		state.setObsStatistics(sample);
@@ -2223,24 +2225,15 @@ void PluginLifecycleTest::dockCounterPeriodsFollowIndependentSources()
 										  : QStringLiteral("30.0%")),
 					 1000);
 	}
-	// sinceReset содержит подпись периода после явного локального сброса.
-	const auto sinceReset = text("Dock.PeriodReset");
-	verifyRows(
-		text("Dock.CountPeriod")
-			.arg(russian ? QStringLiteral("6 / 40 (15,0%)") : QStringLiteral("6 / 40 (15.0%)"), sinceReset),
-		text("Dock.CountPeriod")
-			.arg(russian ? QStringLiteral("2 / 40 (5,0%)") : QStringLiteral("2 / 40 (5.0%)"), sinceReset),
-		text("Dock.CountPeriod")
-			.arg(replaceOutput
-				     ? (russian ? QStringLiteral("3 / 50 (6,0%)") : QStringLiteral("3 / 50 (6.0%)"))
-				     : (russian ? QStringLiteral("3 / 10 (30,0%)") : QStringLiteral("3 / 10 (30.0%)")),
-			     networkPeriod),
-		text("Dock.CountPeriod")
-			.arg(russian ? QStringLiteral("4,00 МиБ") : QStringLiteral("4.00 MiB"),
-			     replaceOutput ? networkPeriod : sinceReset));
-	QCOMPARE(obsStatisticsText(dock).count(sinceReset), replaceOutput ? 2 : 3);
-	QCOMPARE(obsStatisticsText(dock).count(networkPeriod), replaceOutput ? 2 : 1);
-	QCOMPARE(obsStatisticsText(dock).count(text(replaceOutput ? "Dock.PeriodNewSample" : "Dock.PeriodRun")), 0);
+	verifyRows(russian ? QStringLiteral("6 / 40 (15,0%)") : QStringLiteral("6 / 40 (15.0%)"),
+		   russian ? QStringLiteral("2 / 40 (5,0%)") : QStringLiteral("2 / 40 (5.0%)"),
+		   replaceOutput ? (russian ? QStringLiteral("3 / 50 (6,0%)") : QStringLiteral("3 / 50 (6.0%)"))
+				 : (russian ? QStringLiteral("3 / 10 (30,0%)") : QStringLiteral("3 / 10 (30.0%)")),
+		   russian ? QStringLiteral("4,00 МиБ") : QStringLiteral("4.00 MiB"));
+	for (const auto *key : {"Dock.PeriodRun", "Dock.PeriodReset", "Dock.PeriodNewSample"}) {
+		// key остаётся внутренней меткой baseline и не является частью видимого значения счётчика.
+		QVERIFY(!obsStatisticsText(dock).contains(text(key)));
+	}
 	QVERIFY(state.obsStatistics() == sample);
 }
 
@@ -2299,7 +2292,7 @@ void PluginLifecycleTest::dockShowsNativeCounterLimitsIndependently()
 	// value содержит очередное ожидаемое значение отображения.
 	for (const auto &value : counterValues)
 		QCOMPARE(obsStatisticsText(dock).count(value), 1);
-	QVERIFY(obsStatisticsText(dock).contains(text("Dock.PeriodRun")));
+	QVERIFY(!dock.findChild<QLabel *>(QStringLiteral("obsStatisticsPeriod")));
 }
 
 void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext_data()
@@ -2438,7 +2431,7 @@ void PluginLifecycleTest::dockKeepsLastValuesOnlyInTheSameContext()
 	QVERIFY(rowBeforeReset.contains(QStringLiteral("13")));
 	QVERIFY(reset->isEnabled());
 	reset->click();
-	// rowAfterReset содержит представление с новым локальным периодом накоплений.
+	// rowAfterReset содержит новое числовое значение серверных накоплений без изменения источника.
 	const auto rowAfterReset = firstRow.data().toString();
 	QVERIFY(rowAfterReset.contains(text("Dock.PeriodReset")));
 	QVERIFY(!rowAfterReset.contains(QStringLiteral("11")));
@@ -3327,32 +3320,25 @@ void PluginLifecycleTest::dockWarnsAboutContinuingObs_data()
 	QTest::addColumn<bool>("obsStarting");
 	QTest::addColumn<bool>("partialStop");
 	QTest::addColumn<bool>("known");
-	QTest::addColumn<QString>("warningKey");
 	QTest::addColumn<bool>("nativeStartVisible");
 	// locale выбирает настоящий поставляемый словарь для каждого независимого сценария.
 	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")}) {
 		QTest::newRow(qPrintable(locale + QStringLiteral("-no-session-active")))
-			<< locale << QString{} << true << false << false << true
-			<< QStringLiteral("Operation.ObsStillActive") << false;
+			<< locale << QString{} << true << false << false << true << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-stopped-active")))
-			<< locale << QStringLiteral("STOPPED") << true << false << false << true
-			<< QStringLiteral("Operation.ObsStillActive") << false;
+			<< locale << QStringLiteral("STOPPED") << true << false << false << true << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-failed-active")))
-			<< locale << QStringLiteral("FAILED") << true << false << false << true
-			<< QStringLiteral("Operation.ObsStillActive") << false;
+			<< locale << QStringLiteral("FAILED") << true << false << false << true << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-interrupted-active")))
-			<< locale << QStringLiteral("INTERRUPTED") << true << false << false << true
-			<< QStringLiteral("Operation.ObsStillActive") << false;
+			<< locale << QStringLiteral("INTERRUPTED") << true << false << false << true << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-starting-false-flags")))
-			<< locale << QString{} << false << true << false << true
-			<< QStringLiteral("Operation.ObsStillActive") << false;
+			<< locale << QString{} << false << true << false << true << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-stopped-inactive")))
-			<< locale << QStringLiteral("STOPPED") << false << false << false << true << QString{} << true;
+			<< locale << QStringLiteral("STOPPED") << false << false << false << true << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-unknown-session")))
-			<< locale << QString{} << true << false << false << false << QString{} << false;
+			<< locale << QString{} << true << false << false << false << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-partial-stop-false-flags")))
-			<< locale << QStringLiteral("STOPPED") << false << false << true << true
-			<< QStringLiteral("Operation.ObsStopUnconfirmed") << true;
+			<< locale << QStringLiteral("STOPPED") << false << false << true << true << true;
 	}
 }
 
@@ -3367,8 +3353,7 @@ void PluginLifecycleTest::dockWarnsAboutContinuingObs()
 	// partialStop задаёт прежнее неподтверждённое завершение OBS; known определяет достоверность поиска Session.
 	QFETCH(bool, partialStop);
 	QFETCH(bool, known);
-	// warningKey задаёт требуемое предупреждение, nativeStartVisible — допустимость предложения штатного запуска.
-	QFETCH(QString, warningKey);
+	// nativeStartVisible задаёт допустимость предложения штатного запуска.
 	QFETCH(bool, nativeStartVisible);
 	// text использует настоящий перевод, state хранит раздельные наблюдения Session, OBS и результаты команды.
 	const auto text = localeLookup(locale);
@@ -3407,50 +3392,35 @@ void PluginLifecycleTest::dockWarnsAboutContinuingObs()
 	}
 	// dock показывает те же состояния, что и рабочий интерфейс, без сетевого контроллера.
 	gost::RestreamDock dock(state, text);
-	// nativeGuidance адресует предложение запуска; status адресует отдельное сообщение результата и риска.
+	// nativeGuidance сохраняет штатную подсказку; operationStatus удалён вместе с отчётом результатов.
 	auto *nativeGuidance = dock.findChild<QLabel *>(QStringLiteral("nativeStartGuidance"));
-	auto *status = dock.findChild<QLabel *>(QStringLiteral("operationStatus"));
-	QVERIFY(nativeGuidance && status);
-	if (!partialStop)
-		QTRY_COMPARE_WITH_TIMEOUT(!nativeGuidance->isHidden(), nativeStartVisible, 1000);
-	QCOMPARE(status->textFormat(), Qt::PlainText);
-	if (!warningKey.isEmpty()) {
-		QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(text(warningKey.toUtf8().constData())), 1000);
-		QVERIFY(!status->isHidden());
-	} else {
-		QVERIFY(!status->text().contains(text("Operation.ObsStillActive")));
-		QVERIFY(!status->text().contains(text("Operation.ObsStopUnconfirmed")));
-	}
-	if (obsActive || obsStarting)
-		QVERIFY(!status->text().contains(text("Dock.NativeStart")));
+	QVERIFY(nativeGuidance);
+	QVERIFY(!dock.findChild<QLabel *>(QStringLiteral("operationStatus")));
+	QTRY_COMPARE_WITH_TIMEOUT(!nativeGuidance->isHidden(), nativeStartVisible, 1000);
 }
 
-void PluginLifecycleTest::commandFailureCodeIsPlainText_data()
+void PluginLifecycleTest::commandFailureRemainsInStateStore_data()
 {
-	QTest::addColumn<QString>("locale");
 	QTest::addColumn<QString>("receiptStatus");
-	// locale задаёт словарь; status перебирает оба подтверждённых терминальных отказа.
-	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")})
-		for (const auto &status : {QStringLiteral("FAILED"), QStringLiteral("INTERRUPTED")})
-			QTest::newRow(qPrintable(locale + QLatin1Char('-') + status)) << locale << status;
+	// status задаёт одну из двух терминальных причин отказа, сохраняемых в StateStore.
+	for (const auto &status : {QStringLiteral("FAILED"), QStringLiteral("INTERRUPTED")})
+		QTest::newRow(qPrintable(status)) << status;
 }
 
-void PluginLifecycleTest::commandFailureCodeIsPlainText()
+void PluginLifecycleTest::commandFailureRemainsInStateStore()
 {
-	// locale выбирает реальную локализацию; receiptStatus задаёт терминальную квитанцию отказа.
-	QFETCH(QString, locale);
+	// receiptStatus задаёт терминальную квитанцию отказа.
 	QFETCH(QString, receiptStatus);
-	// text задаёт пользовательские подписи; state хранит результат команды для Dock.
-	const auto text = localeLookup(locale);
+	// state хранит проверяемый результат команды независимо от существования Dock.
 	gost::StateStore state;
-	// code содержит символы разметки для проверки буквального вывода; message моделирует запрещённый текст сервера.
+	// code и message проверяют сохранение полей отказа без их переноса в Dock.
 	const auto code = QStringLiteral("cleanup_<b>failure</b>&");
 	const auto message = QStringLiteral("private-server-message-marker");
-	// receipt хранит подтверждённый код и отдельное сообщение сервера, которое UI не должен раскрывать.
+	// receipt содержит подтверждённый код и сообщение отказа для внутреннего результата команды.
 	gost::api::Receipt receipt;
 	receipt.status = receiptStatus;
 	receipt.failure = {gost::api::FieldState::Value, {code, message}};
-	// operations/workflow содержат подтверждённый отказ, а не предположение по состоянию площадки.
+	// operations/workflow хранят подтверждённый отказ, а не предположение по состоянию площадки.
 	gost::OperationsState operations;
 	gost::WorkflowResult workflow;
 	workflow.action = gost::OperationAction::Pause;
@@ -3459,18 +3429,14 @@ void PluginLifecycleTest::commandFailureCodeIsPlainText()
 	workflow.receipt = receipt;
 	operations.current = workflow;
 	state.setOperations(operations);
-	// dock показывает результат; window содержит только редактирование конфигурации.
+	// dock не создаёт блок отчёта и не меняет результат, который хранит StateStore.
+	// text предоставляет подписи, необходимые для создания виджетов Dock.
+	const auto text = localeLookup(QStringLiteral("en-US"));
 	gost::RestreamDock dock(state, text);
-	gost::ManagementWindow window(state, text);
-	// dockStatus показывает буквальный код отказа в месте управления текущим эфиром.
-	auto *dockStatus = dock.findChild<QLabel *>(QStringLiteral("operationStatus"));
-	QVERIFY(dockStatus);
-	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("outputOperationStatus")));
-	QVERIFY(!window.findChild<QLabel *>(QStringLiteral("streamOperationStatus")));
-	QTRY_VERIFY_WITH_TIMEOUT(dockStatus->text().contains(text("Operation.FailureCode").arg(code)), 1000);
-	QCOMPARE(dockStatus->textFormat(), Qt::PlainText);
-	QVERIFY(dockStatus->text().contains(code));
-	QVERIFY(!dockStatus->text().contains(message));
+	QVERIFY(!dock.findChild<QLabel *>(QStringLiteral("operationStatus")));
+	QVERIFY(state.operations().current);
+	QCOMPARE(state.operations().current->receipt->failure->code, code);
+	QCOMPARE(state.operations().current->receipt->failure->message, message);
 }
 
 // Проверяет обе поставляемые локали, не подменяя ими правила идентичности Destination и Output.

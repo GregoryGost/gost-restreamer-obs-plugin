@@ -520,158 +520,6 @@ void updateRows(QStandardItemModel &model, const QStringList &rows)
 
 } // namespace
 
-// Форматирует operations с текущим и прерванным результатом, используя переводы text.
-// Квитанции, части строк и наблюдаемое состояние не смешиваются; ID и сырой текст отказа не выводятся.
-QString formatOperations(const OperationsState &operations, const TextLookup &text)
-{
-	// outcomeText переводит итог шага или части Stop All, сохраняя неизвестный результат явно.
-	const auto outcomeText = [&text](OperationOutcome outcome) {
-		switch (outcome) {
-		case OperationOutcome::None:
-			return text("Operation.NoResult");
-		case OperationOutcome::Pending:
-			return text("Operation.Pending");
-		case OperationOutcome::Completed:
-			return text("Operation.Completed");
-		case OperationOutcome::Failed:
-			return text("Operation.Failed");
-		case OperationOutcome::NotSent:
-			return text("Operation.NotSent");
-		case OperationOutcome::Unknown:
-			return text("Operation.Unknown");
-		}
-		return text("Operation.Unknown");
-	};
-	// actionText переводит явное намерение без раскрытия внутренних идентификаторов или маршрутов API.
-	const auto actionText = [&text](OperationAction action) {
-		switch (action) {
-		case OperationAction::CheckFallback:
-			return text("Operation.CheckFallback");
-		case OperationAction::StartFallback:
-			return text("Operation.StartFallback");
-		case OperationAction::AddOutput:
-			return text("Operation.AddOutput");
-		case OperationAction::Pause:
-			return text("Dock.Pause");
-		case OperationAction::Resume:
-			return text("Dock.Resume");
-		case OperationAction::StopAll:
-			return text("Dock.Stop");
-		case OperationAction::StartDestination:
-			return text("Operation.StartDestination");
-		case OperationAction::StartOutput:
-			return text("Operation.StartOutput");
-		case OperationAction::StopOutput:
-			return text("Operation.StopOutput");
-		case OperationAction::RestartOutput:
-			return text("Operation.RestartOutput");
-		case OperationAction::DetachOutput:
-			return text("Operation.DetachOutput");
-		case OperationAction::StartStopped:
-		case OperationAction::StartAllOutputs:
-			return text("Dock.StartOutputs");
-		case OperationAction::StopAllOutputs:
-			return text("Dock.StopOutputs");
-		case OperationAction::RestartAll:
-		case OperationAction::RestartAllOutputs:
-			return text("Dock.RestartOutputs");
-		case OperationAction::None:
-			return text("Operation.NoResult");
-		}
-		return text("Operation.Unknown");
-	};
-	// phaseText объясняет ожидание отдельно от окончательного итога команды.
-	const auto phaseText = [&text](OperationPhase phase) {
-		switch (phase) {
-		case OperationPhase::Prechecking:
-			return text("Operation.Prechecking");
-		case OperationPhase::Sending:
-			return text("Operation.Sending");
-		case OperationPhase::PollingReceipt:
-			return text("Operation.PollingReceipt");
-		case OperationPhase::ConfirmingState:
-			return text("Operation.ConfirmingState");
-		case OperationPhase::StoppingObs:
-			return text("Operation.StoppingObs");
-		case OperationPhase::Finished:
-			return text("Operation.Finished");
-		case OperationPhase::Idle:
-			return text("Operation.NoResult");
-		}
-		return text("Operation.Unknown");
-	};
-	// describe составляет одно представление workflow; вложенные обработчики вызываются синхронно.
-	const auto describe = [&](const WorkflowResult &workflow) {
-		// lines сохраняет раздельные результаты квитанции, состояния и каждого выхода пакета.
-		QStringList lines;
-		lines.append(text("Operation.Summary")
-				     .arg(actionText(workflow.action), outcomeText(workflow.outcome),
-					  phaseText(workflow.phase)));
-		if (workflow.receipt) {
-			// status берётся из проверенной квитанции; неизвестный код не выводится дословно.
-			const auto &status = workflow.receipt->status;
-			// receiptText отдельно сообщает успех исполнения команды, а не состояние видеоплощадки.
-			const auto receiptText =
-				status == QStringLiteral("SUCCEEDED")     ? text("Operation.ReceiptSucceeded")
-				: status == QStringLiteral("FAILED")      ? text("Operation.Failed")
-				: status == QStringLiteral("INTERRUPTED") ? text("Operation.ReceiptInterrupted")
-				: status == QStringLiteral("PENDING") || status == QStringLiteral("CLAIMED") ||
-						status == QStringLiteral("ISSUED")
-					? text("Operation.Pending")
-					: text("Operation.Unknown");
-			lines.append(text("Operation.Receipt").arg(receiptText));
-			// Выводится только контрактный failure.code из проверенной квитанции, без failure.message.
-			if (workflow.receipt->failure.hasValue() && !workflow.receipt->failure->code.isEmpty())
-				lines.append(text("Operation.FailureCode").arg(workflow.receipt->failure->code));
-		}
-		if (workflow.action != OperationAction::CheckFallback)
-			lines.append(text(workflow.stateConfirmed ? "Operation.StateConfirmed"
-								  : "Operation.StateUnconfirmed"));
-		if (workflow.action == OperationAction::StopAll) {
-			lines.append(text("Operation.ObsResult").arg(outcomeText(workflow.obsOutcome)));
-			lines.append(text("Operation.ServerResult").arg(outcomeText(workflow.serverOutcome)));
-			// Неопределённая остановка OBS остаётся заметной даже после подтверждённого завершения Session.
-			if (workflow.serverOutcome == OperationOutcome::Completed &&
-			    workflow.obsOutcome != OperationOutcome::Completed)
-				lines.append(text("Operation.ObsStopUnconfirmed"));
-		}
-		// output — элемент исходного фиксированного пакета; имя показывается только обычным текстом.
-		for (const auto &output : workflow.outputs) {
-			// name обозначает исходную строку; ни имя, ни оформленный итог не адресуют команды.
-			const auto name = output.name.isEmpty() ? text("Dock.UnnamedOutput") : output.name;
-			lines.append(text("Operation.OutputResult").arg(name, outcomeText(output.outcome)));
-			if (output.stopOutcome != OperationOutcome::None)
-				lines.append(
-					text("Operation.OutputStopPart").arg(name, outcomeText(output.stopOutcome)));
-			if (output.startOutcome != OperationOutcome::None)
-				lines.append(
-					text("Operation.OutputStartPart").arg(name, outcomeText(output.startOutcome)));
-			if (output.noOp)
-				lines.append(text("Operation.OutputNoOp").arg(name));
-			if (!output.messageKey.isEmpty())
-				lines.append(text("Operation.OutputReason")
-						     .arg(name, text(output.messageKey.toUtf8().constData())));
-		}
-		if (workflow.retryAvailable && !workflow.retryTargetName.isEmpty())
-			lines.append(text("Operation.RetryTarget").arg(workflow.retryTargetName));
-		if (workflow.remainingStopped)
-			lines.append(text("Operation.RemainingStopped"));
-		if (workflow.phase == OperationPhase::Finished && workflow.outcome != OperationOutcome::Completed &&
-		    !workflow.outputs.isEmpty())
-			lines.append(text("Operation.Partial"));
-		if (!workflow.messageKey.isEmpty())
-			lines.append(text(workflow.messageKey.toUtf8().constData()));
-		return lines.join(QLatin1Char('\n'));
-	};
-	// sections содержит текущую операцию и не более одного последнего прерванного намерения.
-	QStringList sections;
-	if (operations.current)
-		sections.append(describe(*operations.current));
-	if (operations.lastInterrupted)
-		sections.append(text("Operation.Previous").arg(describe(*operations.lastInterrupted)));
-	return sections.join(QStringLiteral("\n\n"));
-}
-
 struct RestreamDock::Statistics {
 	// Четыре локальные точки отсчёта OBS не зависят от выбранного сервера. Смена DockContext, Session ID
 	// или известного исполнения Session очищает весь серверный кеш; подтверждённое отсутствие Session — тоже.
@@ -795,7 +643,7 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	scroll->setMinimumHeight(fontMetrics().height() * 3);
 	// content принадлежит scroll после setWidget и содержит подробные наблюдения.
 	auto *content = new QWidget;
-	// details размещает сообщения, карточки метрик и результаты команд внутри прокрутки.
+	// details размещает сообщения, карточки метрик и кнопку повтора внутри прокрутки.
 	auto *details = new QVBoxLayout(content);
 	details->setContentsMargins(0, 0, 0, 0);
 	details->setSpacing(8);
@@ -817,8 +665,6 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	localDrops_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
 	localColumns->addWidget(localDrops_, 1);
 	localCard->addLayout(localColumns);
-	localPeriod_ = valueLabel(content, "obsStatisticsPeriod");
-	localCard->addWidget(localPeriod_);
 	// inputCard содержит формат и скорости серверного входа.
 	auto *inputCard = card(details, "inputCard", text_("Dock.InputTitle"));
 	ingest_ = valueLabel(content, "ingestStatistics");
@@ -862,8 +708,6 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	outputs_ = new QStandardItemModel(0, 1, outputList);
 	outputList->setModel(outputs_);
 	outputCard->addWidget(outputList);
-	operationStatus_ = valueLabel(content, "operationStatus");
-	details->addWidget(operationStatus_);
 	retry_ = commandButton(content, text_, "Operation.Retry", "operationRetryButton");
 	details->addWidget(retry_);
 	details->addStretch();
@@ -1007,40 +851,22 @@ void RestreamDock::refresh()
 		bitrateStatus = "Dock.ObsNotStreaming";
 	// bitRate показывает текущий локальный битрейт либо точную причину его недоступности.
 	const auto bitRate = sample.bitrate ? bitrate(locale, text_, *sample.bitrate) : text_(bitrateStatus);
-	// commonPeriod запоминает период доступного накопления, differentPeriods отмечает несовпадение периодов.
-	std::optional<StatsBaseline::Period> commonPeriod;
-	bool differentPeriods = false;
-	// baseline проходит четыре независимых накопления OBS; недоступное чтение не задаёт общий период.
-	for (const auto *baseline : {&stats.render, &stats.encode, &stats.network, &stats.sent}) {
-		// reading содержит уже вычисленную дельту и период одной точки отсчёта.
-		const auto reading = baseline->reading();
-		if (!reading.counters)
-			continue;
-		if (commonPeriod && *commonPeriod != reading.period)
-			differentPeriods = true;
-		commonPeriod = reading.period;
-	}
-	// perCounterPeriod оставляет собственный период у каждого значения при расхождении источников.
-	const bool perCounterPeriod = differentPeriods;
 	// stackedStatistics оставляет подписи и значения на отдельных строках в двух узких колонках Dock.
 	const bool stackedStatistics = width() < 600;
-	// localRows содержит только текущие измерения; dropRows — накопления с прежним форматированием.
+	// localRows содержит текущие измерения; dropRows — накопительные значения без периода.
 	const auto localRows = tableRow(text_("Dock.FpsLabel"), fps, true, stackedStatistics) +
 			       tableRow(text_("Dock.BitrateLabel"), bitRate, true, stackedStatistics) +
 			       tableRow(text_("Dock.RenderLabel"), renderTime, false, stackedStatistics);
-	const auto dropRows =
-		tableRow(text_("Dock.RenderDropsLabel"), counterText(locale, text_, stats.render, perCounterPeriod),
-			 false, stackedStatistics) +
-		tableRow(text_("Dock.EncodeDropsLabel"), counterText(locale, text_, stats.encode, perCounterPeriod),
-			 false, stackedStatistics) +
-		tableRow(text_("Dock.NetworkDropsLabel"), counterText(locale, text_, stats.network, perCounterPeriod),
-			 false, stackedStatistics) +
-		tableRow(text_("Dock.SentLabel"), bytesText(locale, text_, stats.sent, perCounterPeriod), false,
-			 stackedStatistics);
+	const auto dropRows = tableRow(text_("Dock.RenderDropsLabel"), counterText(locale, text_, stats.render, false),
+				       false, stackedStatistics) +
+			      tableRow(text_("Dock.EncodeDropsLabel"), counterText(locale, text_, stats.encode, false),
+				       false, stackedStatistics) +
+			      tableRow(text_("Dock.NetworkDropsLabel"),
+				       counterText(locale, text_, stats.network, false), false, stackedStatistics) +
+			      tableRow(text_("Dock.SentLabel"), bytesText(locale, text_, stats.sent, false), false,
+				       stackedStatistics);
 	localStats_->setText(table(localRows));
 	localDrops_->setText(table(dropRows));
-	localPeriod_->setText(commonPeriod && !differentPeriods ? text_(periodKey(*commonPeriod)) : QString{});
-	localPeriod_->setVisible(!localPeriod_->text().isEmpty());
 	localStats_->setToolTip(text_("Dock.CounterHint"));
 	localDrops_->setToolTip(text_("Dock.CounterHint"));
 	refreshServer();
@@ -1586,7 +1412,7 @@ void RestreamDock::refreshOperations()
 {
 	// server содержит свежесть точной Session и полного состава выходов.
 	const auto &server = stateStore_.dockServer();
-	// operations не подменяет runtime и показывает результат независимо от последующей телеметрии.
+	// operations задаёт доступность команд и повтора независимо от последующей телеметрии.
 	const auto &operations = stateStore_.operations();
 	// busy блокирует новые несовместимые действия; Stop All может прервать ещё не отправленный пакет.
 	const bool busy = operations.current && operations.current->phase != OperationPhase::Idle &&
@@ -1632,15 +1458,6 @@ void RestreamDock::refreshOperations()
 	startOutputs_->setEnabled(batchAvailable);
 	stopOutputs_->setEnabled(batchAvailable);
 	restartOutputs_->setEnabled(batchAvailable);
-	// operationText совмещает штатный результат и отдельный риск следующей публикации.
-	QString operationText = formatOperations(operations, text_);
-	if (knownNoActive && obsActive)
-		operationText.append(operationText.isEmpty() ? QString{} : QStringLiteral("\n\n"))
-			.append(text_("Operation.ObsStillActive"));
-	operationStatus_->setText(operationText);
-	operationStatus_->setToolTip(outputToolTip(operationText));
-	operationStatus_->setAccessibleDescription(operationText);
-	operationStatus_->setVisible(!operationStatus_->text().isEmpty());
 	// Подсказка штатного запуска нужна лишь при отсутствии серверного эфира и активной фазы OBS.
 	nativeStart_->setVisible(knownNoActive && !obsActive);
 	// retryHint указывает выбранную контроллером первую Unknown-цель, не меняя её по имени.
