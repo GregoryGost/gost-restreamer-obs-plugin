@@ -12,6 +12,7 @@
 #include "ui/management-window.hpp"
 #include "ui/restream-dock.hpp"
 
+#include <QAction>
 #include <QApplication>
 #include <QDebug>
 #include <QPointer>
@@ -67,9 +68,11 @@ public:
 		apiClient->setDiagnosticCallback(diagnostic);
 		commandApi->setDiagnosticCallback(diagnostic);
 		configurationApi->setDiagnosticCallback(diagnostic);
-		// Обработчики журнала фиксируют лишь изменения состояния, не повторяя записи при каждой метрике SSE.
+		// Изменение состояния связи вызывает logConnection; повтор той же фазы не создаёт запись.
 		connect(stateStore.get(), &StateStore::serverStateChanged, this, [this] { logConnection(); });
+		// Изменение workflow передаётся logOperation без повторных записей при обновлении метрик.
 		connect(stateStore.get(), &StateStore::operationsChanged, this, [this] { logOperation(); });
+		// Результат редактора передаётся logConfiguration без записи содержимого полей.
 		connect(stateStore.get(), &StateStore::configurationEditorChanged, this,
 			[this] { logConfiguration(); });
 		logConnection();
@@ -84,7 +87,7 @@ public:
 		delete managementWindow.data();
 	}
 
-	// Передаёт безопасное message в адаптер; отказ журнала не выпускает исключение в event loop Qt.
+	// Передаёт безопасное message с уровнем severity в адаптер; отказ журнала не выходит в event loop Qt.
 	void writeLog(LogSeverity severity, const QString &message) const noexcept
 	{
 		if (!logSink)
@@ -152,7 +155,7 @@ public:
 		return QStringLiteral("other");
 	}
 
-	// Пишет HTTP-отказы в обоих режимах; успешные запросы и числовые подробности — только в detailed.
+	// Пишет HTTP-отказ из event в обоих режимах; успешные запросы и числовые подробности — только в detailed.
 	void logHttp(const api::HttpDiagnostic &event) const
 	{
 		if (!event.error && !settings->detailedLogging())
@@ -255,6 +258,9 @@ public:
 	// Оба окна могут быть удалены родителем OBS; QPointer не продлевает их жизнь.
 	QPointer<RestreamDock> dock;
 	QPointer<ManagementWindow> managementWindow;
+	// managementAction отслеживает пункт меню OBS; shutdown удаляет его до освобождения Runtime.
+	// Удаление меню самим OBS обнуляет указатель и не оставляет второго владельца QAction.
+	QPointer<QAction> managementAction;
 };
 
 PluginLifecycle::PluginLifecycle(Frontend &frontend, TextLookup text, PluginOptions options)
@@ -290,9 +296,6 @@ bool PluginLifecycle::load()
 		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_, nullptr, options_.version,
 							   runtime_->restream.get(), runtime_->connection.get());
 		runtime_->dock = dock.get();
-		// Обработчик шестерёнки показывает только одно окно и прекращается вместе с Runtime.
-		connect(dock.get(), &RestreamDock::managementRequested, runtime_.get(),
-			[this] { openManagementWindow(); });
 		// Маршрут Details передаёт только исходный context и Destination ID, без требования Session.
 		connect(dock.get(), &RestreamDock::destinationDetailsRequested, runtime_.get(),
 			[this](DockContext context, QString destinationId) {
@@ -317,6 +320,15 @@ bool PluginLifecycle::load()
 		// Только успешная регистрация передаёт виджет OBS; при отказе его удаляет локальный unique_ptr.
 		dock.release();
 		dockRegistered_ = true;
+		runtime_->managementAction = frontend_.addToolsMenuAction(text_("Plugin.Name"));
+		if (!runtime_->managementAction) {
+			shutdown();
+			return false;
+		}
+		runtime_->managementAction->setObjectName(QStringLiteral("gostRestreamerManagementAction"));
+		// Пункт «Сервис» открывает прежнее единственное окно; удаление Runtime отключает обработчик.
+		connect(runtime_->managementAction.data(), &QAction::triggered, runtime_.get(),
+			[this] { openManagementWindow(); });
 		frontend_.addEventCallback(&PluginLifecycle::frontendEvent, this);
 		callbackRegistered_ = true;
 		return true;
@@ -350,6 +362,10 @@ void PluginLifecycle::shutdown() noexcept
 			qWarning("Не удалось снять обработчик событий GOST Restreamer.");
 		}
 	}
+	// Пункт исчезает из меню синхронно, пока ещё допустима работа с GUI OBS.
+	// QPointer также допускает, что родитель уже удалил меню вместе с главным окном.
+	if (runtime_)
+		delete runtime_->managementAction.data();
 	// Обработчик OBS снят до удаления Dock; его сигналы также не должны повторно открыть окно.
 	if (runtime_ && runtime_->dock) {
 		QObject::disconnect(runtime_->dock.data(), nullptr, nullptr, nullptr);

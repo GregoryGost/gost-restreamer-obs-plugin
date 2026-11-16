@@ -569,7 +569,7 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	auto *layout = new QVBoxLayout(this);
 	layout->setContentsMargins(10, 10, 10, 10);
 	layout->setSpacing(8);
-	// header располагает рабочий Stream, подключение и единственную кнопку открытия управления.
+	// header располагает рабочий Stream и состояние подключения к серверу.
 	auto *header = new QHBoxLayout;
 	streams_ = new QComboBox(this);
 	streams_->setObjectName(QStringLiteral("streamSelector"));
@@ -583,13 +583,6 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	server_->setMinimumWidth(0);
 	server_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 	header->addWidget(server_, 1);
-	// gear открывает существующее расширенное окно и доступна с клавиатуры.
-	auto *gear = new QToolButton(this);
-	gear->setObjectName(QStringLiteral("managementButton"));
-	gear->setText(QString::fromUtf8("⚙"));
-	gear->setToolTip(text_("Management.Open"));
-	gear->setAccessibleName(text_("Management.Open"));
-	header->addWidget(gear);
 	layout->addLayout(header);
 
 	// state содержит независимые оси OBS, входа, Session, групп и заглушки.
@@ -724,9 +717,6 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 	commands->addWidget(resume_, 0, 1);
 	commands->addWidget(stop_, 1, 0, 1, 2);
 	layout->addLayout(commands);
-	nativeStart_ = valueLabel(this, "nativeStartGuidance");
-	nativeStart_->setText(text_("Dock.NativeStart"));
-	layout->addWidget(nativeStart_);
 	// footer оставляет сброс локальных счётчиков рядом с версией плагина.
 	auto *footer = new QHBoxLayout;
 	reset_ = new QPushButton(text_("Dock.ResetShort"), this);
@@ -744,7 +734,6 @@ RestreamDock::RestreamDock(StateStore &stateStore, TextLookup text, QWidget *par
 		footer->addWidget(versionLabel);
 	}
 	layout->addLayout(footer);
-	connect(gear, &QToolButton::clicked, this, &RestreamDock::managementRequested);
 	connect(reset_, &QPushButton::clicked, this, &RestreamDock::resetStatistics);
 	// activated передаёт только пользовательский выбор; index адресует точный itemData, а не имя Stream.
 	connect(streams_, &QComboBox::activated, this, [this](int index) {
@@ -909,6 +898,8 @@ void RestreamDock::refreshObservations()
 	// observedConnection оставляет отсутствие сервера отдельным от состояния отключения.
 	const auto observedConnection = stateStore_.serverOrigin().isEmpty() ? std::nullopt : std::optional{connection};
 	server_->setConnectionStatus(text_, observedConnection);
+	// Только статус связи в шапке использует прописные буквы; остальные оси сохраняют свои переводы.
+	server_->setText(server_->text().toUpper());
 	if (displayedSelectionId_ != stateStore_.selectedStreamId())
 		refreshStreams();
 	// streamsComplete различает полное чтение и полученную часть конфигурационного списка.
@@ -1426,12 +1417,6 @@ void RestreamDock::refreshOperations()
 	// active не трактует terminal Session как продолжающийся эфир.
 	const bool active = current && (running || server.session->state == QStringLiteral("STARTING") ||
 					server.session->state == QStringLiteral("STOPPING"));
-	// obsStatistics содержит последнюю локальную фазу OBS, независимо от простого флага активности.
-	const auto &obsStatistics = stateStore_.obsStatistics();
-	// obsActive сохраняет наблюдаемую фазу перехода, даже если простой булевый статус ещё не обновился.
-	const bool obsActive = stateStore_.streamingActive().value_or(false) ||
-			       (obsStatistics.observed && obsStatistics.phase != ObsStreamingPhase::Unknown &&
-				obsStatistics.phase != ObsStreamingPhase::Stopped);
 	pause_->setEnabled(running && !busy && !server.session->desiredPaused);
 	resume_->setEnabled(running && !busy && server.session->desiredPaused);
 	stop_->setEnabled(active &&
@@ -1458,8 +1443,6 @@ void RestreamDock::refreshOperations()
 	startOutputs_->setEnabled(batchAvailable);
 	stopOutputs_->setEnabled(batchAvailable);
 	restartOutputs_->setEnabled(batchAvailable);
-	// Подсказка штатного запуска нужна лишь при отсутствии серверного эфира и активной фазы OBS.
-	nativeStart_->setVisible(knownNoActive && !obsActive);
 	// retryHint указывает выбранную контроллером первую Unknown-цель, не меняя её по имени.
 	const auto retryHint = operations.current && !operations.current->retryTargetName.isEmpty()
 				       ? text_("Operation.RetryTarget").arg(operations.current->retryTargetName)

@@ -128,7 +128,8 @@ $russian = $Locale -eq 'ru-RU'
 $foregroundBeforeDock = $null
 $dockMenuExpandPattern = $null
 $dockMenuExpandState = $null
-$gearName = if ($russian) { 'Открыть управление и настройки' } else { 'Open management and settings' }
+# toolsMenuNames задаёт штатные имена меню OBS с отображаемой мнемоникой и без неё.
+$toolsMenuNames = if ($russian) { @('Сервис (T)', 'Сервис') } else { @('Tools') }
 $title = if ($russian) { 'GOST Restreamer — Управление и настройки' } else { 'GOST Restreamer — Management and settings' }
 # pages задаёт независимый порядок восьми разделов, включая самостоятельные группы и профили.
 $pages = if ($russian) {
@@ -138,32 +139,11 @@ $pages = if ($russian) {
 }
 $processCondition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ObsProcessId)
-$gearCondition = [System.Windows.Automation.AndCondition]::new(
-    [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $gearName),
-    [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button))
 
 Assert-OwnedProcess
 $main = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new($MainWindowHandle))
 Assert-OwnedElement $main
 if ($main.Current.ClassName -cne 'OBSBasic') { throw 'Переданный дескриптор не относится к главному окну OBS.' }
-
-function Get-Gears {
-    # Плавающий Dock может стать отдельным корнем UI Automation; GetRuntimeId() исключает двойной учёт элемента.
-    $roots = @($main) + @([System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-        [System.Windows.Automation.TreeScope]::Children, $processCondition) | Where-Object { $_.Current.Name -ceq 'GOST Restreamer' })
-    $seen = @{}
-    foreach ($root in $roots) {
-        Assert-OwnedElement $root
-        foreach ($gear in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $gearCondition)) {
-            $identity = $gear.GetRuntimeId() -join ':'
-            if (-not $gear.Current.IsOffscreen -and -not $seen.ContainsKey($identity)) {
-                $seen[$identity] = $true
-                Write-Output $gear
-            }
-        }
-    }
-}
 
 function Get-ManagementWindows {
     # Окно Qt может быть отдельным корнем или потомком окна-владельца. Объединение поиска с RuntimeId
@@ -243,13 +223,43 @@ function Write-UiDiagnostics {
         DockMenuExpandState = $currentDockMenuState } | ConvertTo-Json -Depth 5 -Compress
 }
 
-function Invoke-Gear {
-    # Использует InvokePattern единственной видимой кнопки, а не координатный клик в активном окне.
-    $gears = @(Get-Gears)
-    if ($gears.Count -ne 1) { throw 'Не найдена единственная локализованная шестерёнка Dock.' }
-    Assert-OwnedElement $gears[0]
-    $invoke = $gears[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-    $invoke.Invoke()
+# Открывает только штатное меню «Сервис» собственного главного окна и вызывает единственный пункт плагина.
+# Перед каждым открытием подтверждает foreground; результат активации ManagementWindow наблюдается отдельно.
+function Invoke-ToolsMenuManagement {
+    Assert-OwnedElement $main
+    $main.SetFocus()
+    # foreground фиксирует подтверждение собственного главного окна до любого действия над меню.
+    $foreground = Prepare-OwnedMainForeground
+    if (-not $foreground.Verified) {
+        throw 'Не подтверждено foreground-предусловие собственного меню Сервис.'
+    }
+    # menuCondition ограничивает оба этапа поиска пунктами меню, исключая Dock и другие элементы с тем же названием.
+    $menuCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem)
+    # toolsMenus содержит только видимое штатное меню собственного главного окна.
+    $toolsMenus = @($main.FindAll([System.Windows.Automation.TreeScope]::Descendants, $menuCondition) |
+        Where-Object { $_.Current.Name -cin $toolsMenuNames -and -not $_.Current.IsOffscreen })
+    if ($toolsMenus.Count -ne 1) { throw 'Не найдено единственное штатное меню Сервис.' }
+    Assert-OwnedElement $toolsMenus[0]
+    # expand открывает подтверждённое меню по UIA без глобальных клавиш или координатных щелчков.
+    $expand = $toolsMenus[0].GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $expand.Expand()
+    # actionCondition ищет пункт плагина исключительно внутри открытого меню «Сервис».
+    $actionCondition = [System.Windows.Automation.AndCondition]::new($menuCondition,
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'GOST Restreamer'))
+    Wait-Condition {
+        Assert-OwnedElement $toolsMenus[0]
+        @($toolsMenus[0].FindAll([System.Windows.Automation.TreeScope]::Descendants, $actionCondition)).Count -eq 1
+    } 'В меню Сервис не появился единственный пункт GOST Restreamer.'
+    # actions содержит проверенный единственный пункт; повторный поиск исключает сохранение устаревшего элемента.
+    $actions = @($toolsMenus[0].FindAll([System.Windows.Automation.TreeScope]::Descendants, $actionCondition))
+    if ($actions.Count -ne 1) { throw 'Состав пунктов GOST Restreamer в меню Сервис изменился.' }
+    Assert-OwnedElement $actions[0]
+    if ($actions[0].Current.IsOffscreen -or -not $actions[0].Current.IsEnabled) {
+        throw 'Пункт GOST Restreamer в меню Сервис недоступен пользователю.'
+    }
+    $actions[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    return $foreground
 }
 
 function Assert-OwnedDock {
@@ -372,6 +382,20 @@ function Assert-DockObservations {
     # expectedStream совпадает с доступным именем Settings.Stream; expectedIdle задаёт локальный статус OBS.
     $expectedStream = if ($russian) { 'Поток для текущего профиля OBS' } else { 'Stream for the current OBS profile' }
     $expectedIdle = if ($russian) { 'Трансляция остановлена' } else { 'Streaming stopped' }
+    # expectedConnection задаёт верхний регистр отсутствующего наблюдения сервера в чистой конфигурации.
+    $expectedConnection = if ($russian) { 'НЕТ ДАННЫХ' } else { 'NO DATA' }
+    # settingsCondition обнаруживает прежнюю кнопку по имени и objectName только внутри подтверждённого Dock.
+    $settingsCondition = [System.Windows.Automation.AndCondition]::new($processCondition,
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button))
+    # settingsButtons перебирает реальные кнопки Dock, исключая совпадения в меню или другом окне.
+    $settingsButtons = @($dockElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $settingsCondition) |
+        Where-Object {
+            Assert-OwnedElement $_
+            $_.Current.AutomationId -ceq 'managementButton' -or
+                $_.Current.Name -cin @('Открыть управление и настройки', 'Open management and settings')
+        })
+    if ($settingsButtons.Count -ne 0) { throw 'В Dock осталась кнопка управления и настроек.' }
     # Условие ожидания повторно проверяет владение найденными элементами и их фактические свойства.
     Wait-Condition {
         Assert-OwnedDock $dockWindow
@@ -386,8 +410,9 @@ function Assert-DockObservations {
         # names содержит реальные подписи того же Dock; блок обработки проверяет принадлежность каждой.
         $names = @($dockElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $labelsCondition) |
             ForEach-Object { Assert-OwnedElement $_; $_.Current.Name })
-        $selectors.Count -eq 1 -and @($names | Where-Object { $_ -ceq $expectedIdle }).Count -eq 1
-    } 'Dock не показывает единственный селектор Stream и наблюдаемую остановку трансляции OBS.'
+        $selectors.Count -eq 1 -and @($names | Where-Object { $_ -ceq $expectedIdle }).Count -eq 1 -and
+            @($names | Where-Object { $_ -ceq $expectedConnection }).Count -eq 1
+    } 'Dock не показывает селектор Stream, остановку OBS и состояние подключения в верхнем регистре.'
 }
 
 function Save-OwnedDockImage {
@@ -505,7 +530,10 @@ if ($Launch -eq 1) {
     Assert-OwnedElement $dockAction
     $dockAction.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
-Wait-Condition { @(Get-Gears).Count -eq 1 } 'Видимая шестерёнка Dock не появилась или не восстановилась.'
+# Ожидание проверяет собственный видимый Dock по HWND и владельцу, независимо от удалённой кнопки настроек.
+Wait-Condition {
+    try { $null = Get-OwnedDock; return $true } catch { return $false }
+} 'Собственный видимый Dock не появился или не восстановился.'
 $dockWindow = Get-OwnedDock
 if ($Launch -eq 1) {
     $dockPosition = Move-OwnedDock $dockWindow
@@ -518,8 +546,9 @@ if ($Launch -eq 1) {
 }
 Assert-DockObservations
 $dockScreenshot = Save-OwnedDockImage
-if (@(Get-ManagementWindows).Count -ne 0) { throw 'Расширенное окно создано до нажатия шестерёнки.' }
-Invoke-Gear
+if (@(Get-ManagementWindows).Count -ne 0) { throw 'Расширенное окно создано до выбора пункта меню Сервис.' }
+# foregroundBeforeInitialToolsMenu сохраняет проверенное предусловие первого открытия из меню.
+$foregroundBeforeInitialToolsMenu = Invoke-ToolsMenuManagement
 Wait-Condition { @(Get-VisibleManagementWindows).Count -eq 1 } 'Расширенное окно не открылось.'
 $management = @(Get-VisibleManagementWindows)[0]
 Assert-OwnedElement $management
@@ -529,12 +558,15 @@ $runtimeId = $management.GetRuntimeId() -join ':'
 if ($managementHandle -eq 0) { throw 'Не подтверждён собственный дескриптор расширенного окна.' }
 
 function Assert-SameManagementWindow {
-    # При повторной шестерёнке или восстановлении сравниваются HWND и UIA RuntimeId. После скрытия и показа Qt
+    # При повторном выборе пункта меню или восстановлении сравниваются HWND и UIA RuntimeId. После скрытия и показа Qt
     # вправе пересоздать нативный дескриптор: тот сценарий ниже проверяет единственность и сохранение раздела.
+    # Stage называет повторное действие, для которого сравниваются идентичности окна.
     param([Parameter(Mandatory)][string] $Stage)
+    # windows содержит все видимые экземпляры управления того же процесса без повторного учёта UIA.
     $windows = @(Get-VisibleManagementWindows)
     if ($windows.Count -ne 1 -or $windows[0].Current.NativeWindowHandle -ne $managementHandle -or
         ($windows[0].GetRuntimeId() -join ':') -ne $runtimeId) {
+        # actual сохраняет идентичности обнаруженных окон для диагностики исходного несоответствия.
         $actual = @($windows | ForEach-Object {
             Assert-OwnedElement $_
             [pscustomobject]@{ Handle = $_.Current.NativeWindowHandle; RuntimeId = ($_.GetRuntimeId() -join ':')
@@ -593,10 +625,11 @@ $names = @($navigation | ForEach-Object { $_.Current.Name })
 if ($names.Count -ne $pages.Count -or ($names -join '|') -cne ($pages -join '|')) {
     throw 'Не подтверждены локализованные разделы расширенного окна.'
 }
-$foregroundBeforeGear = Prepare-OwnedMainForeground
-Invoke-Gear
-Assert-SameManagementWindow 'secondGear'
-$activationAfterGear = Observe-ManagementActivation
+# foregroundBeforeToolsMenu фиксирует подготовку главного окна отдельно от наблюдения активации управления.
+$foregroundBeforeToolsMenu = Invoke-ToolsMenuManagement
+Assert-SameManagementWindow 'secondToolsMenu'
+# activationAfterToolsMenu наблюдает результат действия плагина без принудительного фокуса окна управления.
+$activationAfterToolsMenu = Observe-ManagementActivation
 $windowPattern = $management.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
 $minimizeVerified = $false
 $activationAfterRestore = $null
@@ -605,9 +638,8 @@ if ($windowPattern.Current.CanMinimize) {
     Assert-OwnedElement $management
     $windowPattern.SetWindowVisualState([System.Windows.Automation.WindowVisualState]::Minimized)
     Wait-Condition { $windowPattern.Current.WindowVisualState -eq [System.Windows.Automation.WindowVisualState]::Minimized } 'Окно не свернулось.'
-    $foregroundBeforeRestore = Prepare-OwnedMainForeground
-    Invoke-Gear
-    Wait-Condition { $windowPattern.Current.WindowVisualState -eq [System.Windows.Automation.WindowVisualState]::Normal } 'Шестерёнка не восстановила свёрнутое окно.'
+    $foregroundBeforeRestore = Invoke-ToolsMenuManagement
+    Wait-Condition { $windowPattern.Current.WindowVisualState -eq [System.Windows.Automation.WindowVisualState]::Normal } 'Пункт меню Сервис не восстановил свёрнутое окно.'
     Assert-SameManagementWindow 'minimizeRestore'
     $activationAfterRestore = Observe-ManagementActivation
     $minimizeVerified = $true
@@ -621,8 +653,8 @@ Wait-Condition { $selection.Current.IsSelected } 'Не удалось выбра
 Close-OwnedManagementWindow
 Wait-Condition { @(Get-VisibleManagementWindows).Count -eq 0 } 'Закрытие не скрыло расширенное окно.'
 Assert-OwnedElement $main
-if (@(Get-Gears).Count -ne 1) { throw 'Закрытие расширенного окна удалило шестерёнку Dock.' }
-Invoke-Gear
+# foregroundBeforeReopen подтверждает, что после скрытия пункт штатного меню остаётся доступен.
+$foregroundBeforeReopen = Invoke-ToolsMenuManagement
 Wait-Condition { @(Get-VisibleManagementWindows).Count -eq 1 } 'Повторное открытие скрытого окна не завершилось.'
 $reopened = @(Get-VisibleManagementWindows)[0]
 Assert-OwnedElement $reopened
@@ -681,14 +713,15 @@ try {
         Launch = $Launch; DockVisibilityRestored = ($Launch -eq 2); DockPositionVerified = ($Launch -eq 2)
         DockLeft = $dockPosition.Left; DockTop = $dockPosition.Top; DockStreamAndIdleVerified = $true
         DockScreenshot = $dockScreenshot
-        Pages = $pages.Count; GearReuse = $true; CloseHideReopen = $true; MinimizeRestore = $minimizeVerified
+        Pages = $pages.Count; ToolsMenuReuse = $true; DockSettingsAbsent = $true; CloseHideReopen = $true; MinimizeRestore = $minimizeVerified
         ReopenedHandle = $reopenedHandle; NativeHandleRecreated = ($reopenedHandle -ne $managementHandle)
         SelectedSectionPreserved = $true
-        ActivationAfterGear = $activationAfterGear; ActivationAfterRestore = $activationAfterRestore
-        ForegroundBeforeGear = $foregroundBeforeGear; ForegroundBeforeRestore = $foregroundBeforeRestore
+        ActivationAfterToolsMenu = $activationAfterToolsMenu; ActivationAfterRestore = $activationAfterRestore
+        ForegroundBeforeToolsMenu = $foregroundBeforeToolsMenu; ForegroundBeforeRestore = $foregroundBeforeRestore
         ForegroundBeforeDock = $foregroundBeforeDock; DockMenuExpandState = $dockMenuExpandState
-        ActivationSetupVerified = ($foregroundBeforeGear.Verified -and ($null -eq $foregroundBeforeRestore -or $foregroundBeforeRestore.Verified))
-        ActivationVerified = ($foregroundBeforeGear.Verified -and $activationAfterGear -and
+        ForegroundBeforeInitialToolsMenu = $foregroundBeforeInitialToolsMenu; ForegroundBeforeReopen = $foregroundBeforeReopen
+        ActivationSetupVerified = ($foregroundBeforeToolsMenu.Verified -and ($null -eq $foregroundBeforeRestore -or $foregroundBeforeRestore.Verified))
+        ActivationVerified = ($foregroundBeforeToolsMenu.Verified -and $activationAfterToolsMenu -and
             ($null -eq $foregroundBeforeRestore -or ($foregroundBeforeRestore.Verified -and $activationAfterRestore)))
         PluginPath = $pluginModules[0].FileName; PluginSHA256 = $actualPluginHash
         QtRuntime = @($runtime | ForEach-Object { @{ Path = $_.FileName; Version = $_.FileVersionInfo.ProductVersion } })

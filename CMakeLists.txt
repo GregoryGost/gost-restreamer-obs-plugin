@@ -95,6 +95,24 @@ set_target_properties(gost-restreamer-core PROPERTIES AUTOMOC ON CXX_EXTENSIONS 
 
 # Нативный адаптер и точки входа OBS остаются в загружаемом модуле, отдельно от тестируемого ядра.
 add_library(${CMAKE_PROJECT_NAME} MODULE)
+
+# Заголовок хранит отображаемую версию отдельно от числовой версии ресурсов Windows.
+# gost_build_version_header указывает на общий для конфигураций файл в каталоге сборки.
+set(gost_build_version_header "${CMAKE_CURRENT_BINARY_DIR}/generated/gost-build-version.hpp")
+# Проверка HEAD выполняется при каждой сборке модуля, включая сборку без повторного configure.
+# Скрипт меняет заголовок только при изменении версии, сохраняя обычную инкрементальную сборку.
+add_custom_target(
+  gost-restreamer-build-version
+  COMMAND
+    "${CMAKE_COMMAND}" "-DGOST_VERSION_SOURCE_DIR:PATH=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DGOST_VERSION_BASE:STRING=${CMAKE_PROJECT_VERSION}" "-DGOST_VERSION_HEADER:FILEPATH=${gost_build_version_header}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/build-version.cmake"
+  BYPRODUCTS "${gost_build_version_header}"
+  COMMENT "Обновляем отображаемую версию GOST Restreamer"
+  VERBATIM
+)
+add_dependencies(${CMAKE_PROJECT_NAME} gost-restreamer-build-version)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp src/obs/obs-frontend.cpp src/obs/obs-frontend.hpp)
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_20)
 target_link_libraries(

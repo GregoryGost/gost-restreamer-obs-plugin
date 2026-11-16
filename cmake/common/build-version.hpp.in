@@ -1,0 +1,4 @@
+#pragma once
+
+// Отображаемая версия сборки: числовая версия продукта и короткий HEAD либо unknown.
+#define GOST_BUILD_VERSION "@GOST_VERSION_BASE@+@GOST_BUILD_COMMIT@"

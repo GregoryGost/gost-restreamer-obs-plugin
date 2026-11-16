@@ -25,6 +25,8 @@ public:
 	~OBSFrontend() override;
 	// Возвращает заимствованный указатель на главное окно OBS.
 	QWidget *mainWindow() const override;
+	// Добавляет title через Frontend API и возвращает QAction меню OBS без передачи владения.
+	QAction *addToolsMenuAction(const QString &title) override;
 	// Регистрирует виджет как Dock id/title; при успехе владение получает OBS.
 	bool addDock(const char *id, const QString &title, QWidget *widget) override;
 	// Удаляет Dock id через Frontend API вместе с его виджетом.
@@ -70,7 +72,7 @@ private:
 	signal_handler_t *videoSignals_ = nullptr;
 	// Обработчик сигналов текущего выхода; connect_ref удерживает его до disconnect.
 	signal_handler_t *outputSignals_ = nullptr;
-	// Обработчики сигналов статистики меняют только атомарные поколения, не обращаясь к объектам Qt.
+	// videoIdentity_ различает поколения видеоподсистемы; обработчик video_reset меняет его без обращения к Qt.
 	std::atomic<quint64> videoIdentity_ = 1;
 	// Слабая ссылка сохраняет идентичность выхода между выборками, не удерживая работающий выход.
 	std::unique_ptr<obs_weak_output_t, decltype(&obs_weak_output_release)> output_{nullptr,

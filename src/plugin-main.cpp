@@ -1,5 +1,6 @@
 #include <obs-module.h>
 #include <plugin-support.h>
+#include <gost-build-version.hpp>
 #include <util/bmem.h>
 
 #include "core/plugin-lifecycle.hpp"
@@ -29,12 +30,12 @@ bool obs_module_load(void)
 			return true;
 		}
 		frontend = std::make_unique<gost::OBSFrontend>();
-		// Путь выделяет OBS; QString копирует значение до освобождения через bfree.
+		// settingsPath удерживает выделенный OBS путь; QString копирует его до освобождения через bfree.
 		const std::unique_ptr<char, decltype(&bfree)> settingsPath(obs_module_config_path("settings.json"),
 									   &bfree);
 		// options передаёт Runtime версию, собственный путь настроек и безопасный адаптер журнала.
 		gost::PluginOptions options;
-		options.version = QString::fromUtf8(PLUGIN_VERSION);
+		options.version = QString::fromUtf8(GOST_BUILD_VERSION);
 		options.settingsFile = settingsPath ? QString::fromUtf8(settingsPath.get()) : QString{};
 		// Обработчик severity/message направляет готовую безопасную запись в штатный журнал OBS.
 		// Он не устанавливает глобальный Qt-handler и не обращается к содержимому HTTP-запросов.
@@ -46,6 +47,7 @@ bool obs_module_load(void)
 			const auto bytes = message.toUtf8();
 			obs_log(level, "%s", bytes.constData());
 		};
+		// Переводчик получает ключ key из ядра и копирует локализованный текст OBS в QString.
 		lifecycle = std::make_unique<gost::PluginLifecycle>(
 			*frontend, [](const char *key) { return QString::fromUtf8(obs_module_text(key)); },
 			std::move(options));
@@ -55,7 +57,7 @@ bool obs_module_load(void)
 			obs_log(LOG_ERROR, "Не удалось загрузить GOST Restreamer.");
 			return false;
 		}
-		obs_log(LOG_INFO, "GOST Restreamer загружен (версия %s).", PLUGIN_VERSION);
+		obs_log(LOG_INFO, "GOST Restreamer загружен (версия %s).", GOST_BUILD_VERSION);
 		return true;
 	} catch (...) {
 		lifecycle.reset();

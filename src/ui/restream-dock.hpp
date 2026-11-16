@@ -26,7 +26,7 @@ class ConnectionController;
  * Показывает независимые состояния OBS/сервера и статистику общего StateStore в GUI-потоке.
  * StateStore и контроллеры заимствованы и должны пережить Dock; дочерними виджетами и моделью владеет Qt.
  * HTTP напрямую не выполняется: данные приходят через сигналы, выбор Stream передаётся
- * ConnectionController, открытие управления — владельцу Dock.
+ * ConnectionController, открытие карточки выхода — владельцу Dock.
  *
  * Statistics принадлежит представлению и хранит последние показанные значения и точки отсчёта.
  * Новый выбор сервера/профиля/Stream, новая Session или её новое известное исполнение очищает
@@ -48,8 +48,6 @@ public:
 	~RestreamDock() override;
 
 signals:
-	// Просит владельца показать единственное расширенное окно.
-	void managementRequested();
 	// Просит открыть сохранённое назначение исходной строки в том же расширенном окне.
 	void destinationDetailsRequested(DockContext context, QString destinationId);
 	// Совместимый маршрут прежних потребителей по точному выходу исходной Session.
@@ -73,7 +71,7 @@ private:
 	void scheduleRefresh();
 	// Сначала принимает последнюю выборку, затем сбрасывает доступные baseline и перерисовывает.
 	void resetStatistics();
-	// Обновляет доступность команд, кнопку повтора и подсказку запуска по свежему состоянию.
+	// Обновляет доступность команд и кнопку повтора с подсказкой её цели по свежему состоянию.
 	void refreshOperations();
 	// Открывает меню у anchor для раздельных outputId/destinationId исходного context/sessionId.
 	// До вложенного цикла фиксирует ветвь запуска, после него проверяет ту же цель и время жизни Dock.
@@ -94,7 +92,7 @@ private:
 	ConnectionController *connection_ = nullptr;
 	// statistics_ хранит только состояние представления и точки отсчёта счётчиков.
 	std::unique_ptr<Statistics> statistics_;
-	// server_ показывает подключение без точки; streams_ выбирает рабочий Stream по точному itemData.
+	// server_ показывает подключение прописными буквами без точки; streams_ выбирает Stream по точному itemData.
 	StatusLabel *server_ = nullptr;
 	QComboBox *streams_ = nullptr;
 	// displayedSelectionId_ отличает смену выбора от телеметрии, которая не пересоздаёт раскрытый список.
@@ -118,8 +116,6 @@ private:
 	QLabel *outputSummary_ = nullptr;
 	QStandardItemModel *outputs_ = nullptr;
 	QListView *outputList_ = nullptr;
-	// nativeStart_ объясняет запуск OBS и отдельного выхода после подтверждения отсутствия эфира.
-	QLabel *nativeStart_ = nullptr;
 	// pause_ включает серверную паузу; resume_ снимает её; stop_ завершает OBS и точную серверную Session.
 	QPushButton *pause_ = nullptr;
 	QPushButton *resume_ = nullptr;

@@ -2,6 +2,7 @@
 
 #include <util/bmem.h>
 
+#include <QAction>
 #include <QByteArray>
 #include <QWidget>
 
@@ -75,6 +76,14 @@ OBSFrontend::~OBSFrontend()
 QWidget *OBSFrontend::mainWindow() const
 {
 	return static_cast<QWidget *>(obs_frontend_get_main_window());
+}
+
+// Создаёт пункт title в штатном меню «Сервис»; OBS владеет им до явного удаления или уничтожения меню.
+QAction *OBSFrontend::addToolsMenuAction(const QString &title)
+{
+	// utf8 сохраняет строку названия до завершения синхронного копирования в QAction OBS.
+	const auto utf8 = title.toUtf8();
+	return static_cast<QAction *>(obs_frontend_add_tools_menu_qaction(utf8.constData()));
 }
 
 bool OBSFrontend::addDock(const char *id, const QString &title, QWidget *widget)

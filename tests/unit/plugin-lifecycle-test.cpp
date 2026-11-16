@@ -335,9 +335,9 @@ private slots:
 	// Повторное сохранение запускает новый handshake, сохраняя автоматическую терминальную политику.
 	void settingsSaveRetriesSameOriginAfterTerminalStop();
 	// Задаёт подтверждённое отсутствие эфира, завершённую Session и независимые наблюдения OBS.
-	void dockWarnsAboutContinuingObs_data();
-	// Убирает блок результатов команды, сохраняя отдельную подсказку штатного запуска OBS.
-	void dockWarnsAboutContinuingObs();
+	void dockOmitsStartupGuidance_data();
+	// Проверяет отсутствие подсказки запуска и отчёта при разных состояниях OBS и Session.
+	void dockOmitsStartupGuidance();
 	// Задаёт две терминальные причины отказа, остающиеся в общей модели команд.
 	void commandFailureRemainsInStateStore_data();
 	// Результат и причина отказа остаются в StateStore без блока отчёта в Dock.
@@ -362,13 +362,17 @@ private slots:
 	void bothViewsFollowObservations_data();
 	// Dock и диагностика отражают общий StateStore; имя профиля остаётся буквальным текстом диагностики.
 	void bothViewsFollowObservations();
+	// Задаёт все фазы подключения и отсутствие данных в обеих поставляемых локалях.
+	void dockConnectionStatusUsesUppercase_data();
+	// Только шапка Dock использует верхний регистр, сохраняя смысл, PlainText и отсутствие индикатора.
+	void dockConnectionStatusUsesUppercase();
 	// Цвет статуса реагирует на изменение смысла и палитры приложения.
 	void statusAppearanceFollowsStateAndPalette();
 	// Задаёт обе локализации повторного открытия единственного окна управления.
 	void managementWindowIsLazyAndReused_data();
 	// Окно создаётся лениво, переживает закрытие и повторно используется без новых общих сервисов.
 	void managementWindowIsLazyAndReused();
-	// Компактный Dock содержит одну шестерёнку и не превращается в окно настроек.
+	// Компактный Dock не содержит настройки и не превращается в окно управления.
 	void dockStaysCompact();
 	// Задаёт обе локали постоянного списка назначений и независимых Output.
 	void outputRowsKeepDestinationAndExecutionIdentities_data();
@@ -403,7 +407,7 @@ private slots:
 	void dockCardsFitNarrowWidths_data();
 	// Карточки и команды помещаются в узкий Dock без горизонтальной прокрутки или исполнения разметки имён.
 	void dockCardsFitNarrowWidths();
-	// Без выбранного Stream команды недоступны, а клавиатура открывает единственное окно управления; общей кнопки запуска OBS нет.
+	// Без выбранного Stream команды недоступны; клавиатура открывает управление из меню «Сервис».
 	void dockActionsRemainLocalAndKeyboardAccessible();
 	// Задаёт несовпадающие состояния Session и Output с ожидаемыми смысловыми цветами.
 	void dockStatusAxesRemainIndependent_data();
@@ -429,7 +433,7 @@ private slots:
 	void managementNavigationHasLocalizedPagesAndIcons();
 	// Отказ регистрации Dock освобождает частично созданные ресурсы без передачи владения OBS.
 	void failedDockRegistrationReleasesResources();
-	// Задаёт исключение до передачи Dock и после неё при регистрации callback.
+	// Задаёт отказы регистрации Dock, пункта меню и callback.
 	void registrationExceptionReleasesAcquiredResources_data();
 	// Откат загрузки освобождает только действительно приобретённые ресурсы каждого этапа.
 	void registrationExceptionReleasesAcquiredResources();
@@ -439,6 +443,8 @@ private slots:
 	void exitCleansSynchronouslyAndLeavesInertShell();
 	// Поставленное в очередь открытие окна не создаёт сервисы заново после EXIT.
 	void queuedOpenCannotResurrectRuntime();
+	// Отложенный сигнал QAction теряет получателя при завершении runtime.
+	void queuedToolsMenuSignalCannotResurrectRuntime();
 	// Событие рабочего потока, ожидающее GUI, не обращается к Frontend после EXIT.
 	void queuedFrontendEventIsDiscardedOnExit();
 	// Предварительное удаление окон родителем OBS не вызывает повторное освобождение при завершении плагина.
@@ -1033,33 +1039,45 @@ void PluginLifecycleTest::stateChangesAreObservable()
 	QVERIFY(!state.streamingActive().value());
 }
 
+// Меню и Dock доступны до FinishedLoading; повторный load не дублирует регистрацию и не читает OBS.
 void PluginLifecycleTest::registersBeforeFrontendReady()
 {
+	// frontend удерживает настоящее дерево Qt и считает обращения к ещё не готовому OBS.
 	FakeFrontend frontend;
+	// lifecycle владеет runtime, но передаёт виджеты и QAction главному окну frontend.
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
-	// Регистрация допустима до готовности OBS, а чтение профиля и выхода должно ждать FinishedLoading.
 	QVERIFY(lifecycle.load());
 	QCOMPARE(frontend.dockAdds, 1);
+	QCOMPARE(frontend.toolsMenuAdds, 1);
 	QCOMPARE(frontend.callbackAdds, 1);
+	QCOMPARE(frontend.registrationOrder,
+		 QStringList({QStringLiteral("dock"), QStringLiteral("toolsMenu"), QStringLiteral("callback")}));
 	QCOMPARE(frontend.dockId, QStringLiteral("gost-restreamer-obs-plugin"));
 	QCOMPARE(frontend.dockTitle, QStringLiteral("GOST Restreamer"));
-	QVERIFY(frontend.activeCallback);
-	QVERIFY(frontend.activeCookie);
-	QVERIFY(frontend.content);
-	QVERIFY(frontend.dock);
+	QCOMPARE(frontend.toolsMenuTitle, QStringLiteral("GOST Restreamer"));
+	QVERIFY(frontend.activeCallback && frontend.activeCookie && frontend.content && frontend.dock);
+	QVERIFY(frontend.toolsMenu && frontend.managementAction);
+	QCOMPARE(frontend.toolsMenu->actions().size(), 1);
+	QCOMPARE(frontend.toolsMenu->actions().front(), frontend.managementAction.data());
+	QCOMPARE(frontend.managementAction->objectName(), QStringLiteral("gostRestreamerManagementAction"));
+	QVERIFY(frontend.managementAction->isEnabled());
 	QVERIFY(!frontend.dock->isVisible());
-	QCOMPARE(frontend.profileReads, 0);
-	QCOMPARE(frontend.streamingReads, 0);
-	QVERIFY(lifecycle.stateStore());
-	QVERIFY(!lifecycle.stateStore()->profileName().has_value());
-	QVERIFY(!lifecycle.stateStore()->streamingActive().has_value());
 	QVERIFY(lifecycle.load());
 	QCOMPARE(frontend.dockAdds, 1);
+	QCOMPARE(frontend.toolsMenuAdds, 1);
 	QCOMPARE(frontend.callbackAdds, 1);
+	QVERIFY(managementWindows().isEmpty());
+	frontend.managementAction->trigger();
+	QCOMPARE(managementWindows().size(), 1);
 	frontend.emitEvent(gost::FrontendEvent::ProfileChanged);
 	frontend.emitEvent(gost::FrontendEvent::StreamingStarted);
 	QCOMPARE(frontend.profileReads, 0);
+	QCOMPARE(frontend.profilePathReads, 0);
+	QCOMPARE(frontend.inventoryReads, 0);
 	QCOMPARE(frontend.streamingReads, 0);
+	QCOMPARE(frontend.statisticsReads, 0);
+	QVERIFY(lifecycle.stateStore());
+	QVERIFY(!lifecycle.stateStore()->profileName().has_value());
 	QVERIFY(!lifecycle.stateStore()->streamingActive().has_value());
 }
 
@@ -1229,6 +1247,7 @@ void PluginLifecycleTest::bothViewsFollowObservations_data()
 	QTest::newRow("english") << QStringLiteral("en-US");
 }
 
+// Проверяет общие наблюдения Dock и диагностики с отдельным регистром текста подключения.
 void PluginLifecycleTest::bothViewsFollowObservations()
 {
 	// Оба окна используют один StateStore, даже когда ManagementWindow скрыто. Имя с HTML-подобным
@@ -1258,8 +1277,9 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 	auto *stream = frontend.content->findChild<QComboBox *>(QStringLiteral("streamSelector"));
 	QVERIFY(windowProfile && dockStreaming && windowStreaming && server && stream);
 	// label адресует очередную проверяемую подпись без изменения её состояния.
-	for (auto *label : {windowProfile, dockStreaming, windowStreaming, server})
+	for (auto *label : {windowProfile, dockStreaming, windowStreaming})
 		QCOMPARE(label->text(), text("Observation.NoData"));
+	QCOMPARE(server->text(), text("Observation.NoData").toUpper());
 	QVERIFY(stream->currentData().toString().isEmpty());
 	frontend.profile = QStringLiteral("<b>Профиль & OBS</b>");
 	frontend.streaming = true;
@@ -1275,8 +1295,91 @@ void PluginLifecycleTest::bothViewsFollowObservations()
 	QCOMPARE(windowProfile->text(), frontend.profile);
 	QCOMPARE(dockStreaming->text(), text("Dock.ObsStopped"));
 	QCOMPARE(windowStreaming->text(), text("OBS.StreamingInactive"));
-	QCOMPARE(server->text(), text("Observation.NoData"));
+	QCOMPARE(server->text(), text("Observation.NoData").toUpper());
 	QVERIFY(stream->currentData().toString().isEmpty());
+}
+
+// Независимые буквальные ожидания проверяют регистр каждой локализованной фазы и отсутствие origin.
+void PluginLifecycleTest::dockConnectionStatusUsesUppercase_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::addColumn<int>("status");
+	QTest::addColumn<bool>("hasOrigin");
+	QTest::addColumn<QString>("expected");
+	QTest::addColumn<QString>("ordinary");
+	QTest::addColumn<QString>("tone");
+	// locale выбирает набор буквальных переводов; status адресует значение публичного перечисления.
+	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")}) {
+		// russian выбирает точные ожидаемые строки поставляемой локализации.
+		const bool russian = locale == QStringLiteral("ru-RU");
+		// expected и ordinary содержат независимые видимые ожидания Dock и общего StatusLabel по порядку enum.
+		const QStringList expected =
+			russian ? QStringList{QStringLiteral("ОТКЛЮЧЁН"), QStringLiteral("ПОДКЛЮЧЕНИЕ"),
+					      QStringLiteral("ПОДКЛЮЧЁН"), QStringLiteral("ВОССТАНОВЛЕНИЕ СВЯЗИ"),
+					      QStringLiteral("ОШИБКА ПОДКЛЮЧЕНИЯ · НЕТ АКТУАЛЬНЫХ ДАННЫХ")}
+				: QStringList{QStringLiteral("DISCONNECTED"), QStringLiteral("CONNECTING"),
+					      QStringLiteral("CONNECTED"), QStringLiteral("RECONNECTING"),
+					      QStringLiteral("CONNECTION ERROR · CURRENT DATA UNAVAILABLE")};
+		const QStringList ordinary =
+			russian ? QStringList{QStringLiteral("Отключён"), QStringLiteral("Подключение"),
+					      QStringLiteral("Подключён"), QStringLiteral("Восстановление связи"),
+					      QStringLiteral("Ошибка подключения · нет актуальных данных")}
+				: QStringList{QStringLiteral("Disconnected"), QStringLiteral("Connecting"),
+					      QStringLiteral("Connected"), QStringLiteral("Reconnecting"),
+					      QStringLiteral("Connection error · current data unavailable")};
+		// tones задаёт смысл подключения независимо от регистра и оформления текущей темы.
+		const QStringList tones{QStringLiteral("neutral"), QStringLiteral("pending"), QStringLiteral("active"),
+					QStringLiteral("pending"), QStringLiteral("error")};
+		// status перебирает пять фаз; без origin каждая обязана показывать отсутствие наблюдения.
+		for (int status = 0; status < expected.size(); ++status) {
+			QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(locale).arg(status)))
+				<< locale << status << true << expected.at(status) << ordinary.at(status)
+				<< tones.at(status);
+			QTest::newRow(qPrintable(QStringLiteral("%1-%2-without-origin").arg(locale).arg(status)))
+				<< locale << status << false
+				<< (russian ? QStringLiteral("НЕТ ДАННЫХ") : QStringLiteral("NO DATA"))
+				<< (russian ? QStringLiteral("Нет данных") : QStringLiteral("No data"))
+				<< QStringLiteral("neutral");
+		}
+		QTest::newRow(qPrintable(locale + QStringLiteral("-unobserved")))
+			<< locale << -1 << false << (russian ? QStringLiteral("НЕТ ДАННЫХ") : QStringLiteral("NO DATA"))
+			<< (russian ? QStringLiteral("Нет данных") : QStringLiteral("No data"))
+			<< QStringLiteral("neutral");
+	}
+}
+
+// Проверяет все фазы, сохраняя исходное enum в StateStore и обычный регистр общего StatusLabel.
+void PluginLifecycleTest::dockConnectionStatusUsesUppercase()
+{
+	// locale выбирает перевод; status и hasOrigin задают подтверждённость наблюдения подключения.
+	QFETCH(QString, locale);
+	QFETCH(int, status);
+	QFETCH(bool, hasOrigin);
+	// expected задаёт точный текст Dock, ordinary — обычного StatusLabel, tone — независимый смысл статуса.
+	QFETCH(QString, expected);
+	QFETCH(QString, ordinary);
+	QFETCH(QString, tone);
+	// state хранит независимое наблюдение, text читает настоящие локализации поставки.
+	gost::StateStore state;
+	const auto text = localeLookup(locale);
+	// dock показывает шапку, common проверяет неизменную семантику общей подписи вне Dock.
+	gost::RestreamDock dock(state, text);
+	gost::StatusLabel common(nullptr);
+	// connection сохраняет исходную фазу только для сценариев с заданным наблюдением.
+	const auto connection = static_cast<gost::ConnectionStatus>(qMax(status, 0));
+	if (status >= 0)
+		state.setConnection(hasOrigin ? QStringLiteral("http://127.0.0.1:8080") : QString{}, connection);
+	common.setConnectionStatus(text, hasOrigin ? std::optional{connection} : std::nullopt);
+	// label адресует только верхнюю подпись подключения, не статусы OBS, входа или Session.
+	const auto *label = dock.findChild<QLabel *>(QStringLiteral("serverObservation"));
+	QVERIFY(label);
+	QCOMPARE(label->text(), expected);
+	QCOMPARE(label->textFormat(), Qt::PlainText);
+	QCOMPARE(label->contentsMargins().left(), 0);
+	QCOMPARE(label->property("statusTone").toString(), tone);
+	QCOMPARE(common.text(), ordinary);
+	if (status >= 0)
+		QCOMPARE(state.connectionStatus(), connection);
 }
 
 void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
@@ -1355,60 +1458,62 @@ void PluginLifecycleTest::statusAppearanceFollowsStateAndPalette()
 	}
 }
 
+// Пункт «Сервис» повторно показывает единственное окно после минимизации или скрытия, сохраняя runtime.
 void PluginLifecycleTest::managementWindowIsLazyAndReused()
 {
-	// QPointer и сравнение адресов различают показ существующего окна и незаметное пересоздание.
-	// Проверяются повторная шестерёнка, минимизация, закрытие и повторный показ без новых Dock/callback.
+	// locale выбирает поставляемые подписи русского или английского интерфейса.
 	QFETCH(QString, locale);
+	// frontend создаёт меню с настоящим QAction и главное окно-владельца.
 	FakeFrontend frontend;
+	// lifecycle объединяет один runtime с лениво создаваемым окном управления.
 	gost::PluginLifecycle lifecycle(frontend, localeLookup(locale));
 	QVERIFY(lifecycle.load());
 	QVERIFY(managementWindows().isEmpty());
+	// state, dock и action позволяют обнаружить пересоздание общих ресурсов при повторном открытии.
 	QPointer<gost::StateStore> state = lifecycle.stateStore();
 	QPointer<QWidget> dock = frontend.content;
+	QPointer<QAction> action = frontend.managementAction;
+	QVERIFY(action);
+	QCOMPARE(action->text(), QStringLiteral("GOST Restreamer"));
 	frontend.emitEvent(gost::FrontendEvent::FinishedLoading);
-	auto *gear = dock->findChild<QToolButton *>();
-	QVERIFY(gear);
-	QTest::mouseClick(gear, Qt::LeftButton);
+	action->trigger();
 	QCOMPARE(managementWindows().size(), 1);
+	// window отслеживает именно первый экземпляр, включая закрытие без удаления.
 	QPointer<gost::ManagementWindow> window = managementWindows().front();
-	QVERIFY(window->isWindow());
-	QVERIFY(window->isVisible());
+	QVERIFY(window->isWindow() && window->isVisible());
 	QVERIFY(!window->testAttribute(Qt::WA_DeleteOnClose));
 	QVERIFY(!window->testAttribute(Qt::WA_QuitOnClose));
-	QTest::mouseClick(gear, Qt::LeftButton);
+	action->trigger();
 	QCOMPARE(managementWindows().size(), 1);
 	QCOMPARE(managementWindows().front(), window.data());
 	window->showMinimized();
 	QTRY_VERIFY_WITH_TIMEOUT(window->isMinimized(), 1000);
-	QTest::mouseClick(gear, Qt::LeftButton);
+	action->trigger();
 	QTRY_VERIFY_WITH_TIMEOUT(!window->isMinimized(), 1000);
 	QVERIFY(window->isVisible());
 	QCOMPARE(managementWindows().size(), 1);
 	QCOMPARE(managementWindows().front(), window.data());
 	window->close();
 	dispatchQueuedEvents();
-	// Закрытие скрывает окно; общее состояние, Dock и подписка продолжают жить до завершения плагина.
-	QVERIFY(window);
+	QVERIFY(window && state && dock && action);
 	QVERIFY(!window->isVisible());
-	QVERIFY(state);
-	QVERIFY(dock);
 	QCOMPARE(lifecycle.stateStore(), state.data());
 	QCOMPARE(state->profileName().value(), frontend.profile);
 	frontend.profile = QStringLiteral("Профиль после закрытия");
 	frontend.emitEvent(gost::FrontendEvent::ProfileChanged);
 	QCOMPARE(state->profileName().value(), frontend.profile);
-	QTest::mouseClick(gear, Qt::LeftButton);
+	action->trigger();
 	QCOMPARE(managementWindows().size(), 1);
 	QCOMPARE(managementWindows().front(), window.data());
 	QVERIFY(window->isVisible());
 	QCOMPARE(frontend.dockAdds, 1);
+	QCOMPARE(frontend.toolsMenuAdds, 1);
 	QCOMPARE(frontend.callbackAdds, 1);
 }
-
+// Сохраняет компактный Dock без входа в настройки, форм и внутренней навигации.
 void PluginLifecycleTest::dockStaysCompact()
 {
-	// Здесь проверяется граница назначения Dock: одна шестерёнка и отсутствие навигации/форм.
+	// Проверяется удаление входа в настройки из Dock и отсутствие навигации/форм.
 	// Геометрия, тема и читаемость на реальном Windows-дисплее этим набором типов не доказываются.
 	// frontend моделирует принадлежащие OBS события и владение Dock без настоящего процесса OBS.
 	FakeFrontend frontend;
@@ -1417,7 +1522,8 @@ void PluginLifecycleTest::dockStaysCompact()
 	QVERIFY(lifecycle.load());
 	// dock показывает настоящий Widgets-интерфейс на общем состоянии.
 	const auto *dock = frontend.content.data();
-	QCOMPARE(dock->findChildren<QToolButton *>(QStringLiteral("managementButton")).size(), 1);
+	QVERIFY(dock->findChildren<QToolButton *>(QStringLiteral("managementButton")).isEmpty());
+	QVERIFY(dock->findChildren<QAction *>(QStringLiteral("gostRestreamerManagementAction")).isEmpty());
 	QVERIFY(dock->findChildren<QTabWidget *>().isEmpty());
 	QVERIFY(dock->findChildren<QLineEdit *>().isEmpty());
 	QCOMPARE(dock->findChildren<QComboBox *>().size(), 1);
@@ -1452,6 +1558,7 @@ void PluginLifecycleTest::dockCardsFitNarrowWidths_data()
 }
 
 // Проверяет ширину карточек, буквальные серверные строки и три подписанных столбца статистики потока.
+// Проверяет компоновку оставшихся карточек, состояний и команд в узком Dock.
 void PluginLifecycleTest::dockCardsFitNarrowWidths()
 {
 	// Настоящие layout и QTextDocument проверяют переносы и доступность областей без снимка экрана.
@@ -1536,9 +1643,8 @@ void PluginLifecycleTest::dockCardsFitNarrowWidths()
 	auto *outputs = dock.findChild<QListView *>(QStringLiteral("outputList"));
 	// reset выполняет локальный сброс отображаемых накоплений.
 	auto *reset = dock.findChild<QPushButton *>(QStringLiteral("statsResetButton"));
-	// gear открывает единственное окно управления.
-	auto *gear = dock.findChild<QToolButton *>(QStringLiteral("managementButton"));
-	QVERIFY(details && outputs && reset && gear);
+	QVERIFY(details && outputs && reset);
+	QVERIFY(!dock.findChild<QToolButton *>(QStringLiteral("managementButton")));
 	QTRY_COMPARE_WITH_TIMEOUT(outputs->model()->rowCount(), qMax(outputCount, 1), 1000);
 	QCOMPARE(dock.width(), width);
 	QCOMPARE(dock.height(), 560);
@@ -1586,7 +1692,7 @@ void PluginLifecycleTest::dockCardsFitNarrowWidths()
 		QVERIFY(card->width() > 0 && card->width() <= dock.width());
 	}
 	// widget адресует очередную постоянную кнопку для проверки её доступности.
-	for (auto *widget : {static_cast<QWidget *>(gear), static_cast<QWidget *>(reset)}) {
+	for (auto *widget : {static_cast<QWidget *>(reset)}) {
 		// mapped содержит прямоугольник кнопки в координатах Dock.
 		const QRect mapped(widget->mapTo(&dock, QPoint{}), widget->size());
 		QVERIFY(dock.rect().contains(mapped));
@@ -1862,10 +1968,11 @@ void PluginLifecycleTest::dockCardsFitNarrowWidths()
 }
 
 // Проверяет отсутствие Dock Start и недоступность команд без Stream, сохраняя клавиатурный доступ к управлению.
+// Проверяет запрет медиакоманд без выбора и открытие единственного окна клавиатурой через меню.
 void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 {
 	// Без выбранного Stream команды недоступны и мышью, и клавиатурой. Проверяется реальная граница
-	// lifecycle с локальным HTTP-сервером; работающая шестерёнка открывает тот же экземпляр управления.
+	// lifecycle с локальным HTTP-сервером; меню «Сервис» открывает тот же экземпляр управления.
 	// temp изолирует настройки lifecycle внутри workspace.
 	WorkspaceTemp temp(QStringLiteral("dock-local-actions"));
 	QVERIFY(temp.isValid());
@@ -1922,21 +2029,24 @@ void PluginLifecycleTest::dockActionsRemainLocalAndKeyboardAccessible()
 	QCOMPARE(server.requests.size(), requests);
 	QVERIFY(lifecycle.stateStore()->obsStatistics() == sample);
 	QVERIFY(!frontend.streaming);
-	// gear открывает единственное расширенное окно; reset остаётся локальным действием.
-	auto *gear = dock->findChild<QToolButton *>(QStringLiteral("managementButton"));
+	// menu и action обозначают штатное меню и его единственный пункт открытия управления.
+	auto *menu = frontend.toolsMenu.data();
+	auto *action = frontend.managementAction.data();
 	// reset адресует кнопку локального baseline, не сетевую команду.
 	auto *reset = dock->findChild<QPushButton *>(QStringLiteral("statsResetButton"));
-	QVERIFY(gear && reset);
-	QVERIFY(gear->focusPolicy() != Qt::NoFocus);
+	QVERIFY(menu && action && reset);
+	QVERIFY(!dock->findChild<QToolButton *>(QStringLiteral("managementButton")));
 	QVERIFY(reset->focusPolicy() != Qt::NoFocus);
-	gear->setFocus();
-	QTest::keyClick(gear, Qt::Key_Space);
+	menu->popup(frontend.host->mapToGlobal(QPoint{}));
+	menu->setActiveAction(action);
+	QTest::keyClick(menu, Qt::Key_Return);
 	QTRY_COMPARE_WITH_TIMEOUT(managementWindows().size(), 1, 1000);
 	// window фиксирует экземпляр ManagementWindow, который должен пережить закрытие.
 	auto *window = managementWindows().front();
 	window->close();
-	gear->setFocus();
-	QTest::keyClick(gear, Qt::Key_Space);
+	menu->popup(frontend.host->mapToGlobal(QPoint{}));
+	menu->setActiveAction(action);
+	QTest::keyClick(menu, Qt::Key_Return);
 	QCOMPARE(managementWindows().size(), 1);
 	QCOMPARE(managementWindows().front(), window);
 	QVERIFY(window->isVisible());
@@ -2585,70 +2695,93 @@ void PluginLifecycleTest::failedDockRegistrationReleasesResources()
 	QVERIFY(managementWindows().isEmpty());
 }
 
+// EXIT удаляет QAction до Dock и runtime; удаление и поздние события не создают окно заново.
 void PluginLifecycleTest::exitCleansSynchronouslyAndLeavesInertShell()
 {
-	// До dispatchQueuedEvents все QPointer уже обязаны обнулиться. Порядок callback -> Dock
-	// проверяется отдельно; последующие открытие окна, shutdown и сохранённый обработчик не воскрешают Runtime.
+	// frontend сохраняет порядок удаления и последнюю пару callback/cookie только до жизни lifecycle.
 	FakeFrontend frontend;
 	{
+		// lifecycle остаётся инертной оболочкой после синхронной обработки Exit.
 		gost::PluginLifecycle lifecycle(frontend, localeLookup());
 		QVERIFY(lifecycle.load());
-		lifecycle.openManagementWindow();
+		frontend.managementAction->trigger();
 		QCOMPARE(managementWindows().size(), 1);
 		QVERIFY(frontend.lastCallback);
+		// state, dock, window и action отслеживают освобождение ресурсов до следующего оборота событий.
 		QPointer<gost::StateStore> state = lifecycle.stateStore();
 		QPointer<QWidget> dock = frontend.content;
 		QPointer<gost::ManagementWindow> window = managementWindows().front();
-		// Ресурсы должны исчезнуть внутри Exit: проверяем это до обработки отложенных событий.
+		QPointer<QAction> action = frontend.managementAction;
+		// unrelated представляет соседний пункт другого плагина, который очистка GOST Restreamer обязана сохранить.
+		auto *unrelated = frontend.toolsMenu->addAction(QStringLiteral("Other plugin"));
+		// Обработчик удаления пробует повторно открыть окно в середине shutdown.
+		QObject::connect(action.data(), &QObject::destroyed, &lifecycle,
+				 [&lifecycle] { lifecycle.openManagementWindow(); });
 		frontend.emitEvent(gost::FrontendEvent::Exit);
-		QVERIFY(!state);
-		QVERIFY(!dock);
-		QVERIFY(!window);
-		QVERIFY(!lifecycle.stateStore());
-		QVERIFY(!frontend.activeCallback);
+		QVERIFY(!state && !dock && !window && !action);
+		QVERIFY(!lifecycle.stateStore() && !frontend.activeCallback);
+		QCOMPARE(frontend.toolsMenu->actions(), QList<QAction *>{unrelated});
 		QCOMPARE(frontend.callbackRemoves, 1);
+		QCOMPARE(frontend.toolsMenuRemoves, 1);
 		QCOMPARE(frontend.dockRemoves, 1);
 		QCOMPARE(frontend.removedId, QStringLiteral("gost-restreamer-obs-plugin"));
-		QCOMPARE(frontend.cleanupOrder, QStringList({QStringLiteral("callback"), QStringLiteral("dock")}));
+		QCOMPARE(frontend.cleanupOrder, QStringList({QStringLiteral("callback"), QStringLiteral("toolsMenu"),
+							     QStringLiteral("dock")}));
 		lifecycle.shutdown();
 		lifecycle.openManagementWindow();
+		QVERIFY(!lifecycle.load());
 		frontend.lastCallback(gost::FrontendEvent::ProfileChanged, frontend.lastCookie);
 		frontend.lastCallback(gost::FrontendEvent::Exit, frontend.lastCookie);
 		dispatchQueuedEvents();
 		QVERIFY(managementWindows().isEmpty());
 		QCOMPARE(frontend.callbackRemoves, 1);
+		QCOMPARE(frontend.toolsMenuRemoves, 1);
 		QCOMPARE(frontend.dockRemoves, 1);
 	}
 	QCOMPARE(frontend.callsAfterExit, 0);
 	QCOMPARE(frontend.invalidCallbackOperations, 0);
 }
 
+// Охватывает отказ до передачи Dock, null/исключение меню и исключение после создания QAction.
 void PluginLifecycleTest::registrationExceptionReleasesAcquiredResources_data()
 {
-	QTest::addColumn<bool>("throwOnDock");
-	QTest::newRow("dock-registration") << true;
-	QTest::newRow("callback-registration") << false;
+	QTest::addColumn<QString>("failure");
+	QTest::newRow("dock-exception") << QStringLiteral("dock");
+	QTest::newRow("menu-null") << QStringLiteral("menu-null");
+	QTest::newRow("menu-exception") << QStringLiteral("menu-exception");
+	QTest::newRow("callback-exception") << QStringLiteral("callback");
 }
 
+// Отказ каждого этапа освобождает только приобретённые ресурсы и не оставляет пункт меню в OBS.
 void PluginLifecycleTest::registrationExceptionReleasesAcquiredResources()
 {
-	// Отказ до передачи Dock и отказ после его передачи требуют разных путей очистки. Счётчики
-	// проверяют освобождение только реально приобретённых ресурсов, без снятия неустановленного callback.
-	QFETCH(bool, throwOnDock);
+	// failure выбирает управляемую точку отказа без настоящего OBS.
+	QFETCH(QString, failure);
+	// frontend удерживает меню даже после отката, позволяя проверить удаление QAction из actions().
 	FakeFrontend frontend;
-	frontend.throwOnDockAdd = throwOnDock;
-	frontend.throwOnCallbackAdd = !throwOnDock;
+	frontend.throwOnDockAdd = failure == QStringLiteral("dock");
+	frontend.acceptToolsMenu = failure != QStringLiteral("menu-null");
+	frontend.throwOnToolsMenuAdd = failure == QStringLiteral("menu-exception");
+	frontend.throwOnCallbackAdd = failure == QStringLiteral("callback");
 	{
+		// lifecycle создаёт ресурсы поэтапно и должен синхронно откатить любую неуспешную загрузку.
 		gost::PluginLifecycle lifecycle(frontend, localeLookup());
 		QVERIFY(!lifecycle.load());
 		QVERIFY(!lifecycle.stateStore());
-		QVERIFY(!frontend.content);
-		QVERIFY(!frontend.dock);
+		QVERIFY(!frontend.content && !frontend.dock && !frontend.managementAction);
 		QVERIFY(!frontend.activeCallback);
-		QCOMPARE(frontend.dockRemoves, throwOnDock ? 0 : 1);
+		QCOMPARE(frontend.toolsMenuAdds, frontend.throwOnDockAdd ? 0 : 1);
+		QCOMPARE(frontend.dockRemoves, frontend.throwOnDockAdd ? 0 : 1);
+		QCOMPARE(frontend.toolsMenuRemoves, frontend.throwOnCallbackAdd ? 1 : 0);
+		if (frontend.toolsMenu)
+			QVERIFY(frontend.toolsMenu->actions().isEmpty());
+		if (frontend.throwOnCallbackAdd)
+			QCOMPARE(frontend.cleanupOrder,
+				 QStringList({QStringLiteral("toolsMenu"), QStringLiteral("dock")}));
 		lifecycle.shutdown();
 	}
-	QCOMPARE(frontend.dockRemoves, throwOnDock ? 0 : 1);
+	QCOMPARE(frontend.dockRemoves, frontend.throwOnDockAdd ? 0 : 1);
+	QCOMPARE(frontend.toolsMenuRemoves, frontend.throwOnCallbackAdd ? 1 : 0);
 	QCOMPARE(frontend.callbackRemoves, 0);
 	QVERIFY(managementWindows().isEmpty());
 }
@@ -2674,37 +2807,70 @@ void PluginLifecycleTest::callbackExceptionDoesNotEscape()
 	QCOMPARE(frontend.callsAfterExit, 0);
 }
 
+// Отложенное обращение к ещё живой оболочке lifecycle не создаёт окно после завершения runtime.
 void PluginLifecycleTest::queuedOpenCannotResurrectRuntime()
 {
+	// frontend считает обращения за допустимой фазой Exit без настоящего OBS.
 	FakeFrontend frontend;
+	// lifecycle переживает собственный runtime и остаётся получателем отложенного вызова.
 	gost::PluginLifecycle lifecycle(frontend, localeLookup());
 	QVERIFY(lifecycle.load());
-	// Вызов адресован живой оболочке, но после Exit он уже не должен создавать рабочие объекты.
+	// Callback обращается к живой оболочке лишь после синхронного завершения runtime.
 	QVERIFY(QMetaObject::invokeMethod(
 		&lifecycle, [&lifecycle] { lifecycle.openManagementWindow(); }, Qt::QueuedConnection));
 	frontend.emitEvent(gost::FrontendEvent::Exit);
 	dispatchQueuedEvents();
 	QVERIFY(managementWindows().isEmpty());
+	QCOMPARE(frontend.toolsMenuRemoves, 1);
 	QCOMPARE(frontend.callsAfterExit, 0);
 }
 
+// Доставленный после EXIT сигнал QAction не пересоздаёт runtime и не обращается к уже недоступному OBS.
+void PluginLifecycleTest::queuedToolsMenuSignalCannotResurrectRuntime()
+{
+	// frontend удерживает QAction до синхронного Exit и считает поздние вызовы OBS.
+	FakeFrontend frontend;
+	// lifecycle сохраняет инертную оболочку после удаления получателя queued-сигнала.
+	gost::PluginLifecycle lifecycle(frontend, localeLookup());
+	QVERIFY(lifecycle.load());
+	// action используется только до Exit: вызов triggered от рабочего потока ставит реальное соединение в очередь GUI.
+	auto *action = frontend.managementAction.data();
+	QVERIFY(action);
+	// delivery испускает только сигнал без вызова методов виджета вне GUI-потока.
+	std::thread delivery([action] { action->triggered(false); });
+	delivery.join();
+	QVERIFY(managementWindows().isEmpty());
+	frontend.emitEvent(gost::FrontendEvent::Exit);
+	dispatchQueuedEvents();
+	QVERIFY(managementWindows().isEmpty());
+	QCOMPARE(frontend.toolsMenuRemoves, 1);
+	QCOMPARE(frontend.callsAfterExit, 0);
+}
+
+// Удаление главным окном меню, Dock и ManagementWindow не приводит к повторному освобождению.
 void PluginLifecycleTest::hostDestructionDoesNotDoubleDelete()
 {
+	// frontend позволяет удалить Qt-родителя раньше завершения плагина.
 	FakeFrontend frontend;
 	{
+		// lifecycle переживает родителя виджетов и должен безопасно освободить оставшийся runtime.
 		gost::PluginLifecycle lifecycle(frontend, localeLookup());
 		QVERIFY(lifecycle.load());
-		lifecycle.openManagementWindow();
+		frontend.managementAction->trigger();
+		// dock, action и window наблюдают удаление родителем; state остаётся собственностью runtime.
 		QPointer<QWidget> dock = frontend.content;
+		QPointer<QAction> action = frontend.managementAction;
+		QPointer<gost::ManagementWindow> window = managementWindows().front();
 		QPointer<gost::StateStore> state = lifecycle.stateStore();
-		// Родитель OBS может удалить окна раньше плагина; наблюдатели должны исключить повторное удаление.
 		frontend.host.reset();
-		QVERIFY(!dock);
+		QVERIFY(!dock && !action && !window);
 		QVERIFY(state);
+		QCOMPARE(frontend.toolsMenuRemoves, 1);
 		frontend.emitEvent(gost::FrontendEvent::Exit);
 		QVERIFY(!state);
 		QVERIFY(managementWindows().isEmpty());
 	}
+	QCOMPARE(frontend.toolsMenuRemoves, 1);
 	QCOMPARE(frontend.callsAfterExit, 0);
 	QCOMPARE(frontend.invalidCallbackOperations, 0);
 }
@@ -3312,7 +3478,7 @@ QTEST_MAIN(PluginLifecycleTest)
 
 #include "plugin-lifecycle-test.moc"
 
-void PluginLifecycleTest::dockWarnsAboutContinuingObs_data()
+void PluginLifecycleTest::dockOmitsStartupGuidance_data()
 {
 	QTest::addColumn<QString>("locale");
 	QTest::addColumn<QString>("sessionState");
@@ -3320,29 +3486,28 @@ void PluginLifecycleTest::dockWarnsAboutContinuingObs_data()
 	QTest::addColumn<bool>("obsStarting");
 	QTest::addColumn<bool>("partialStop");
 	QTest::addColumn<bool>("known");
-	QTest::addColumn<bool>("nativeStartVisible");
 	// locale выбирает настоящий поставляемый словарь для каждого независимого сценария.
 	for (const auto &locale : {QStringLiteral("ru-RU"), QStringLiteral("en-US")}) {
 		QTest::newRow(qPrintable(locale + QStringLiteral("-no-session-active")))
-			<< locale << QString{} << true << false << false << true << false;
+			<< locale << QString{} << true << false << false << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-stopped-active")))
-			<< locale << QStringLiteral("STOPPED") << true << false << false << true << false;
+			<< locale << QStringLiteral("STOPPED") << true << false << false << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-failed-active")))
-			<< locale << QStringLiteral("FAILED") << true << false << false << true << false;
+			<< locale << QStringLiteral("FAILED") << true << false << false << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-interrupted-active")))
-			<< locale << QStringLiteral("INTERRUPTED") << true << false << false << true << false;
+			<< locale << QStringLiteral("INTERRUPTED") << true << false << false << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-starting-false-flags")))
-			<< locale << QString{} << false << true << false << true << false;
+			<< locale << QString{} << false << true << false << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-stopped-inactive")))
-			<< locale << QStringLiteral("STOPPED") << false << false << false << true << true;
+			<< locale << QStringLiteral("STOPPED") << false << false << false << true;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-unknown-session")))
-			<< locale << QString{} << true << false << false << false << false;
+			<< locale << QString{} << true << false << false << false;
 		QTest::newRow(qPrintable(locale + QStringLiteral("-partial-stop-false-flags")))
-			<< locale << QStringLiteral("STOPPED") << false << false << true << true << true;
+			<< locale << QStringLiteral("STOPPED") << false << false << true << true;
 	}
 }
 
-void PluginLifecycleTest::dockWarnsAboutContinuingObs()
+void PluginLifecycleTest::dockOmitsStartupGuidance()
 {
 	// locale выбирает словарь поставки; sessionState задаёт точную сохранённую Session либо полное отсутствие.
 	QFETCH(QString, locale);
@@ -3353,8 +3518,6 @@ void PluginLifecycleTest::dockWarnsAboutContinuingObs()
 	// partialStop задаёт прежнее неподтверждённое завершение OBS; known определяет достоверность поиска Session.
 	QFETCH(bool, partialStop);
 	QFETCH(bool, known);
-	// nativeStartVisible задаёт допустимость предложения штатного запуска.
-	QFETCH(bool, nativeStartVisible);
 	// text использует настоящий перевод, state хранит раздельные наблюдения Session, OBS и результаты команды.
 	const auto text = localeLookup(locale);
 	gost::StateStore state;
@@ -3392,11 +3555,8 @@ void PluginLifecycleTest::dockWarnsAboutContinuingObs()
 	}
 	// dock показывает те же состояния, что и рабочий интерфейс, без сетевого контроллера.
 	gost::RestreamDock dock(state, text);
-	// nativeGuidance сохраняет штатную подсказку; operationStatus удалён вместе с отчётом результатов.
-	auto *nativeGuidance = dock.findChild<QLabel *>(QStringLiteral("nativeStartGuidance"));
-	QVERIFY(nativeGuidance);
+	QVERIFY(!dock.findChild<QLabel *>(QStringLiteral("nativeStartGuidance")));
 	QVERIFY(!dock.findChild<QLabel *>(QStringLiteral("operationStatus")));
-	QTRY_COMPARE_WITH_TIMEOUT(!nativeGuidance->isHidden(), nativeStartVisible, 1000);
 }
 
 void PluginLifecycleTest::commandFailureRemainsInStateStore_data()

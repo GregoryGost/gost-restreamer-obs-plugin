@@ -4,6 +4,9 @@
 
 #include <QDockWidget>
 #include <QMainWindow>
+#include <QMenu>
+#include <QMenuBar>
+#include <QAction>
 #include <QPointer>
 #include <QStringList>
 #include <functional>
@@ -11,12 +14,15 @@
 #include <memory>
 #include <stdexcept>
 
-// Управляемая граница Frontend с настоящими QWidget/QDockWidget и владением Qt, а не заглушкой UI.
+// Управляемая граница Frontend с настоящими QWidget/QDockWidget, меню QAction и владением Qt.
 // Поля statistics/profile/streaming задают наблюдения, флаги отказов — точки отката. Счётчики
 // доказывают отсутствие ранних/поздних вызовов API и порядок очистки. Нужен QApplication GUI-потока.
 // host принадлежит фикстуре; Dock и его содержимое — host/Qt. Заимствованные cookie не удерживаются живыми.
 class FakeFrontend final : public gost::Frontend {
 public:
+	// Удаляет главное окно до полей журнала, которые используются наблюдателем удаления QAction.
+	~FakeFrontend() override { host.reset(); }
+
 	// Возвращает заимствованное главное окно host и отмечает недопустимый поздний вызов.
 	QWidget *mainWindow() const override
 	{
@@ -31,6 +37,7 @@ public:
 		// поэтому отказ addDock не делает фикстуру вторым владельцем ещё локального unique_ptr виджета.
 		recordCall();
 		++dockAdds;
+		registrationOrder.append(QStringLiteral("dock"));
 		dockId = QString::fromUtf8(id);
 		dockTitle = title;
 		content = widget;
@@ -42,6 +49,28 @@ public:
 		dock->setWidget(widget);
 		host->addDockWidget(Qt::LeftDockWidgetArea, dock);
 		return true;
+	}
+
+	// Добавляет title в настоящее меню «Сервис»; отказ не передаёт вызывающему коду частичный QAction.
+	QAction *addToolsMenuAction(const QString &title) override
+	{
+		recordCall();
+		++toolsMenuAdds;
+		registrationOrder.append(QStringLiteral("toolsMenu"));
+		toolsMenuTitle = title;
+		if (throwOnToolsMenuAdd)
+			throw std::runtime_error("Ошибка регистрации меню Сервис.");
+		if (!acceptToolsMenu)
+			return nullptr;
+		if (!toolsMenu)
+			toolsMenu = host->menuBar()->addMenu(QStringLiteral("Сервис"));
+		managementAction = toolsMenu->addAction(title);
+		// Наблюдатель фиксирует синхронное удаление пункта, в том числе при уничтожении главного окна.
+		QObject::connect(managementAction.data(), &QObject::destroyed, [this] {
+			++toolsMenuRemoves;
+			cleanupOrder.append(QStringLiteral("toolsMenu"));
+		});
+		return managementAction.data();
 	}
 
 	// Синхронно удаляет Dock id вместе с дочерним содержимым и записывает порядок очистки.
@@ -59,6 +88,7 @@ public:
 	{
 		recordCall();
 		++callbackAdds;
+		registrationOrder.append(QStringLiteral("callback"));
 		if (throwOnCallbackAdd)
 			throw std::runtime_error("Ошибка регистрации callback.");
 		if (activeCallback)
@@ -175,6 +205,14 @@ public:
 	QPointer<QDockWidget> dock;
 	// Заимствованное содержимое позволяет наблюдать передачу владения без второго владельца.
 	QPointer<QWidget> content;
+	// Меню принадлежит главному окну; наблюдатель не мешает его синхронному удалению родителем.
+	QPointer<QMenu> toolsMenu;
+	// Зарегистрированный пункт управления принадлежит меню, а фикстура только отслеживает его жизнь.
+	QPointer<QAction> managementAction;
+	// Последняя подпись, переданная на регистрацию в «Сервис».
+	QString toolsMenuTitle;
+	// Порядок приобретения Dock, пункта меню и подписки.
+	QStringList registrationOrder;
 	// Отображаемое имя текущего профиля для сценариев переключения и переименования.
 	QString profile = QStringLiteral("Основной профиль");
 	// Каталог профиля, отличающий его идентичность от отображаемого имени.
@@ -187,7 +225,7 @@ public:
 	QString dockTitle;
 	// Идентификатор, переданный последнему removeDock.
 	QString removedId;
-	// Порядок снятия callback и удаления Dock для проверки lifecycle.
+	// Порядок снятия callback, удаления пункта меню и Dock для проверки lifecycle.
 	QStringList cleanupOrder;
 	// Независимая выборка OBS с управляемыми доступностью и накоплениями.
 	gost::ObsStatisticsSample statistics;
@@ -205,6 +243,14 @@ public:
 	std::function<void()> onStopRequest;
 	// false моделирует отказ регистрации Dock без исключения.
 	bool acceptDock = true;
+	// false моделирует отсутствие QAction при отказе регистрации меню.
+	bool acceptToolsMenu = true;
+	// Исключение на границе регистрации меню проверяет откат уже переданного Dock.
+	bool throwOnToolsMenuAdd = false;
+	// Количество попыток добавить пункт меню управления.
+	int toolsMenuAdds = 0;
+	// Количество фактических удалений QAction, включая удаление родителем.
+	int toolsMenuRemoves = 0;
 	// true после Exit обнаруживает обращения за пределами допустимого lifecycle.
 	bool frontendUnavailable = false;
 	// Исключение до передачи владения проверяет откат загрузки.
