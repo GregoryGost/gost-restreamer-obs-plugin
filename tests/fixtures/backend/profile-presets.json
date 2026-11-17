@@ -4,7 +4,9 @@
     "route": "/api/v1/transcode-profiles?limit=499",
     "retrieved_at_utc": "2026-11-14 12:33:48 UTC",
     "contract_source_commit": "067388bc1e36ac5220e001c72c47220ef0b72173",
-    "complete": true
+    "complete": true,
+    "adapted_contract_source_commit": "252669d054401f8c6081be49521f1c7f44410bec",
+    "adaptation": "Три профиля владельца сохранены с прежними значениями; числовые поля переведены в JSON-числа, encoding.version удалён. Происхождение исходных параметров выше относится к dev.7, а не к новому чтению сервера."
   },
   "items": [
     {
@@ -44,18 +46,17 @@
           }
         },
         "video_encoding": {
-          "target_bitrate_bps": "10000000",
-          "max_bitrate_bps": "10000000",
-          "buffer_bits": "20000000",
+          "target_bitrate_bps": 10000000,
+          "max_bitrate_bps": 10000000,
+          "buffer_bits": 20000000,
           "gop_frames": 120,
           "max_b_frames": 0,
           "closed_gop": true
         },
         "audio_encoding": {
-          "bitrate_bps": "160000"
+          "bitrate_bps": 160000
         },
         "encoding": {
-          "version": 2,
           "video_encoder": "libsvtav1",
           "audio_encoder": "aac",
           "rate_control": "cbr",
@@ -108,18 +109,17 @@
           }
         },
         "video_encoding": {
-          "target_bitrate_bps": "12000000",
-          "max_bitrate_bps": "12000000",
-          "buffer_bits": "24000000",
+          "target_bitrate_bps": 12000000,
+          "max_bitrate_bps": 12000000,
+          "buffer_bits": 24000000,
           "gop_frames": 120,
           "max_b_frames": 0,
           "closed_gop": true
         },
         "audio_encoding": {
-          "bitrate_bps": "160000"
+          "bitrate_bps": 160000
         },
         "encoding": {
-          "version": 2,
           "video_encoder": "h264_nvenc",
           "audio_encoder": "aac",
           "rate_control": "cbr",
@@ -175,18 +175,17 @@
           }
         },
         "video_encoding": {
-          "target_bitrate_bps": "6000000",
-          "max_bitrate_bps": "6000000",
-          "buffer_bits": "12000000",
+          "target_bitrate_bps": 6000000,
+          "max_bitrate_bps": 6000000,
+          "buffer_bits": 12000000,
           "gop_frames": 120,
           "max_b_frames": 0,
           "closed_gop": true
         },
         "audio_encoding": {
-          "bitrate_bps": "160000"
+          "bitrate_bps": 160000
         },
         "encoding": {
-          "version": 2,
           "video_encoder": "h264_nvenc",
           "audio_encoder": "aac",
           "rate_control": "cbr",

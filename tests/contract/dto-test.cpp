@@ -1,4 +1,5 @@
 #include "api/json-decoder.hpp"
+#include "api/json-encoder.hpp"
 #include "fixtures/api-json.hpp"
 
 #include <QTest>
@@ -14,165 +15,209 @@ using namespace gost::api;
 class DtoTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Ограниченный parser сохраняет старое значение при синтаксическом/ресурсном отказе.
+	void exactParserRejectsMalformedAndDeepDocuments();
+	// Задаёт точные U64 границы и эквивалентные целочисленные лексемы.
 	void decimalBoundaries_data();
+	// Читает U64 без double и сохраняет исходную числовую лексему.
 	void decimalBoundaries();
+	// Задаёт строки, дроби, отрицательный ноль и переполнения U64.
 	void nonCanonicalDecimals_data();
+	// Отклоняет недопустимый U64 без изменения прежнего значения.
 	void nonCanonicalDecimals();
+	// Проверяет физические пределы U8/I64 и signed отрицательный ноль.
 	void decimalsRejectJsonNumbersAndNull();
+	// Сохраняет Duration выше2^53 и наносекундный timestamp без округления.
 	void nanosecondsAndTimestampsStayExact();
-	void rationalFpsAndBinaryProfileText();
+	// Сохраняет рациональный FPS и UTF-8 строку с Unicode и NUL.
+	void rationalFpsAndUnicodeProfileText();
+	// Задаёт неподдержанные типы публичного строкового ProfileText.
 	void invalidProfileText_data();
+	// Отклоняет числовой/null ProfileText и бинарную оболочку.
 	void invalidProfileText();
+	// Различает Missing, Null и числовой ноль JsonField.
 	void fieldStatesRemainDistinct();
-	void legacyAndExplicitAudioEncoding();
+	// Требует полный encoding и явный LIVE audio mode в ответе профиля.
+	void responsesRequireCompleteEncodingAndAudio();
+	// Задаёт неизвестные режимы и несовместимое video/audio сочетание.
 	void invalidAudioModes_data();
+	// Сохраняет неизвестную строку ответа, блокируя недопустимую полную замену.
 	void invalidAudioModes();
+	// Читает точные endpoint/ключи, различая Missing и пустую строку.
 	void keysAndEndpointAreExact();
+	// Не восстанавливает секрет по configured и отвергает неверный тип поля.
 	void incompatibleSecretsAreUnavailableOrRejected();
+	// Сохраняет независимые Session/Output снимки после изменения текущей конфигурации.
 	void historicalSnapshotsOwnTheirValues();
+	// Сохраняет предельные ACK U64, отличая null скорости от нуля.
 	void ackMetricsRemainExactAndUnavailableIsNotZero();
+	// Отклоняет повреждённый JSON и UTF-8 без публикации частичного DTO.
 	void malformedJsonAndUnicodeAreRejected();
 	// Проверяет точный снимок схемы и различает источник контракта от неизвестного binary commit сервера.
 	void pinnedSchemaAndProvenanceDescribeReadbackContract();
+	// Принимает пустую неприменимую role, сохраняя точную worker identity.
 	void unnamedFfmpegRoleIsAValidPublicObservation();
+	// Проверяет форму системного removed без Session и GPU payload.
 	void systemRemovalHasNoSessionOrGpuPayload();
 };
 
+// Числовая JSON-лексема читается без double, включая эквивалентные целочисленные формы.
 void DtoTest::decimalBoundaries_data()
 {
 	QTest::addColumn<QString>("text");
 	QTest::addColumn<quint64>("expected");
 	QTest::newRow("zero") << QStringLiteral("0") << quint64(0);
-	// Число на единицу больше 2^53 выявляет потерю точности при промежуточном преобразовании через double.
 	QTest::newRow("above-double") << QStringLiteral("9007199254740993") << quint64(9007199254740993ULL);
 	QTest::newRow("max") << QStringLiteral("18446744073709551615") << std::numeric_limits<quint64>::max();
+	QTest::newRow("decimal-integral") << QStringLiteral("9007199254740993.000") << quint64(9007199254740993ULL);
+	QTest::newRow("exponent-integral") << QStringLiteral("900719925474099300e-2") << quint64(9007199254740993ULL);
+	QTest::newRow("max-exponent")
+		<< QStringLiteral("184467440737095516150e-1") << std::numeric_limits<quint64>::max();
 }
+// Проверяет числовой тип и ожидаемое значение независимо от сериализатора продукта.
 void DtoTest::decimalBoundaries()
 {
+	// text задаёт исходный токен; expected — точное независимо заданное целое.
 	QFETCH(QString, text);
 	QFETCH(quint64, expected);
+	// json хранит исходную лексему; result и error принимают итог чтения.
+	JsonValue json;
 	quint64 result = 42;
 	Error error;
-	QVERIFY(fromJson(QJsonValue(text), result, error));
+	QVERIFY(parseJson(text.toUtf8(), json));
+	QVERIFY(fromJson(json, result, error));
 	QCOMPARE(result, expected);
+	QCOMPARE(serializeJson(json), text.toUtf8());
 }
+// Задаёт неверные типы, дроби и значения за физическим пределом U64.
 void DtoTest::nonCanonicalDecimals_data()
 {
-	// Внешне числовые строки со знаком, пробелом, экспонентой и Unicode-цифрой запрещены:
-	// контракт требует одну каноническую десятичную запись uint64, а не общее преобразование числа.
 	QTest::addColumn<QString>("text");
-	for (const auto *value : {"", "00", "01", "+1", "-1", "1.0", "1e3", " 1", "1 ", "18446744073709551616",
-				  "999999999999999999999999999999999999999999"})
-		QTest::newRow(value) << QString::fromLatin1(value);
-	QTest::newRow("unicode-digit") << QStringLiteral("١");
+	// token содержит независимый контрпример, в том числе округляемую double дробь.
+	for (const auto *token : {"\"1\"", "-0", "-1", "0.0000000000000000001", "9007199254740993.1",
+				  "18446744073709551616", "1e1000000000", "1e-1000000000", "true", "null"})
+		QTest::newRow(token) << QString::fromLatin1(token);
 }
+// Синтаксически корректный JSON не делает дробь, строку или отрицательный ноль допустимым U64.
 void DtoTest::nonCanonicalDecimals()
 {
+	// text задаёт контрпример; json хранит его тип; result сохраняет прежнее значение; error принимает отказ.
 	QFETCH(QString, text);
+	JsonValue json;
 	quint64 result = 42;
 	Error error;
-	QVERIFY(!fromJson(QJsonValue(text), result, error));
+	QVERIFY(parseJson(text.toUtf8(), json));
+	QVERIFY(!fromJson(json, result, error));
+	QCOMPARE(result, quint64(42));
 }
+// Узкие физические границы не округляются и не переполняются.
 void DtoTest::decimalsRejectJsonNumbersAndNull()
 {
-	// Даже представимое без потерь JSON-число 0 недопустимо для строкового uint64. Это проверка
-	// формы контракта, а не только переполнения на большом значении.
-	for (const auto &input : {QJsonValue(0), QJsonValue(9007199254740992.0), QJsonValue(true),
-				  QJsonValue(QJsonValue::Null), QJsonValue(QJsonValue::Undefined)}) {
-		quint64 result = 42;
-		Error error;
-		QVERIFY(!fromJson(input, result, error));
-	}
+	// error принимает отказ чтения; small проверяет U8; signedValue — весь I64 и signed -0.
+	Error error;
+	quint8 small = 0;
+	qint64 signedValue = 0;
+	QVERIFY(fromJson(JsonValue::number("255.0"), small, error));
+	QCOMPARE(small, quint8(255));
+	QVERIFY(!fromJson(JsonValue::number("256"), small, error));
+	QVERIFY(fromJson(JsonValue::number("-9223372036854775808"), signedValue, error));
+	QCOMPARE(signedValue, std::numeric_limits<qint64>::min());
+	QVERIFY(fromJson(JsonValue::number("9223372036854775807"), signedValue, error));
+	QCOMPARE(signedValue, std::numeric_limits<qint64>::max());
+	QVERIFY(!fromJson(JsonValue::number("9223372036854775808"), signedValue, error));
+	QVERIFY(fromJson(JsonValue::number("-0"), signedValue, error));
+	QCOMPARE(signedValue, qint64(0));
 }
+// Duration ограничен I64.max, timestamp остаётся строкой наносекундной точности.
 void DtoTest::nanosecondsAndTimestampsStayExact()
 {
-	const auto policy = fixture::object(R"({"asset_id":"asset","watchdog":{"video_timeout_ns":"9007199254740993",
-"audio_timeout_ns":"1234567890123456789","recovery_window_ns":"0","keyframe_timeout_ns":"18446744073709551615"}})");
-	const auto result = decode<Policy>(fixture::bytes(policy));
+	// policy задаёт raw wire без промежуточного дерева QJson.
+	const QByteArray policy = R"({"asset_id":"asset","watchdog":{"video_timeout_ns":9007199254740993,
+"audio_timeout_ns":1234567890123456789,"recovery_window_ns":1,"keyframe_timeout_ns":9223372036854775807}})";
+	// result подтверждает верхнюю допустимую Duration и значения выше 2^53.
+	const auto result = decode<Policy>(policy);
 	QVERIFY(result);
 	QCOMPARE(result.value->watchdog.videoTimeoutNs, quint64(9007199254740993ULL));
 	QCOMPARE(result.value->watchdog.audioTimeoutNs, quint64(1234567890123456789ULL));
-	QCOMPARE(result.value->watchdog.keyframeTimeoutNs, std::numeric_limits<quint64>::max());
+	QCOMPARE(result.value->watchdog.recoveryWindowNs, quint64(1));
+	QCOMPARE(result.value->watchdog.keyframeTimeoutNs, quint64(9223372036854775807ULL));
+	QVERIFY(!decode<Policy>(QByteArray(policy).replace("\"recovery_window_ns\":1", "\"recovery_window_ns\":0")));
+	QVERIFY(!decode<Policy>(QByteArray(policy).replace("9223372036854775807", "9223372036854775808")));
+	// record сохраняет календарную строку без преобразования в миллисекунды.
 	const auto record = decode<Record>(fixture::bytes(fixture::record(QStringLiteral("record"))));
 	QVERIFY(record);
 	QCOMPARE(record.value->createdAt, QStringLiteral("2026-11-10T01:02:03.123456789Z"));
 }
-void DtoTest::rationalFpsAndBinaryProfileText()
+// UTF-8 ProfileText и исходная дробь FPS сохраняются независимо.
+void DtoTest::rationalFpsAndUnicodeProfileText()
 {
-	// 60000/1001 сохраняется дробью; двоичный ProfileText включает NUL и не-UTF-8 байты.
-	// Соседнее строковое поле с эмодзи проверяет, что текст и двоичная оболочка не смешиваются.
+	// json и video задают Unicode-строку с NUL, которая допустима как JSON string.
 	auto json = fixture::format();
 	auto video = json.value(QStringLiteral("video")).toObject();
-	video.insert(QStringLiteral("codec_profile"), fixture::object(R"({"encoding":"base64","value":"AP+AQQ=="})"));
-	video.insert(QStringLiteral("level"), QStringLiteral("уровень 😀"));
+	video.insert(QStringLiteral("codec_profile"), QString::fromUtf8("профиль 😀") + QChar(0));
 	json.insert(QStringLiteral("video"), video);
+	// result проверяет структурное чтение, не валидность неизвестного desired профиля.
 	const auto result = decode<Format>(fixture::bytes(json));
 	QVERIFY(result);
 	QCOMPARE(result.value->video.frameRate.numerator, quint32(60000));
 	QCOMPARE(result.value->video.frameRate.denominator, quint32(1001));
-	QCOMPARE(result.value->video.codecProfile.bytes, QByteArray::fromHex("00ff8041"));
-	QCOMPARE(result.value->video.level.bytes, QStringLiteral("уровень 😀").toUtf8());
-	Error error;
+	QCOMPARE(result.value->video.codecProfile.bytes, QString::fromUtf8("профиль 😀").toUtf8() + '\0');
+	// invalid и error получают отказ нулевого знаменателя.
 	FrameRate invalid;
-	QVERIFY(!fromJson(fixture::object(R"({"numerator":60,"denominator":0})"), invalid, error));
+	Error error;
+	QVERIFY(!fromJson(fixture::wire(fixture::object(R"({"numerator":60,"denominator":0})")), invalid, error));
 }
+// Публичный ProfileText допускает строку, но не прежнюю бинарную оболочку.
 void DtoTest::invalidProfileText_data()
 {
-	// Zh== имеет неканонические значимые биты заполнения; Zg без заполнения и лишние ключи оболочки
-	// также отвергаются, хотя либеральные base64-декодеры могут принять часть таких значений.
 	QTest::addColumn<QJsonValue>("input");
 	QTest::newRow("null") << QJsonValue(QJsonValue::Null);
 	QTest::newRow("number") << QJsonValue(123);
-	for (const auto *json : {R"({"encoding":"base64","value":"Zh=="})", R"({"encoding":"base64","value":"Zg"})",
-				 R"({"encoding":"base64","value":"Zg==!"})", R"({"encoding":"hex","value":"00"})",
-				 R"({"encoding":"base64","value":"AA==","extra":true})"})
-		QTest::newRow(json) << QJsonValue(fixture::object(json));
+	QTest::newRow("binary-envelope") << QJsonValue(fixture::object(R"({"encoding":"base64","value":"AA=="})"));
 }
+// Отказ неверного типа не превращает его в пустую допустимую строку.
 void DtoTest::invalidProfileText()
 {
+	// input задаёт неподдержанный тип; value и error принимают результат.
 	QFETCH(QJsonValue, input);
 	ProfileText value;
 	Error error;
-	QVERIFY(!fromJson(input, value, error));
+	QVERIFY(!fromJson(fixture::wire(input), value, error));
 }
+// Missing, Null и числовой ноль имеют отдельные состояния.
 void DtoTest::fieldStatesRemainDistinct()
 {
-	// Один и тот же JsonField последовательно получает Missing, Null и Value(0). Логическое состояние
-	// не должно зависеть от физического содержимого value или истинности самого числа.
+	// error принимает отказ; value сохраняет присутствие отдельно от физического числа.
 	Error error;
 	JsonField<quint64> value;
-	QVERIFY(fromJson(QJsonValue(QJsonValue::Undefined), value, error));
+	QVERIFY(fromJson(JsonValue{}, value, error));
 	QVERIFY(value.isMissing());
-	QVERIFY(fromJson(QJsonValue(QJsonValue::Null), value, error));
+	QVERIFY(fromJson(JsonValue(nullptr), value, error));
 	QVERIFY(value.isNull());
-	QVERIFY(fromJson(QJsonValue(QStringLiteral("0")), value, error));
+	QVERIFY(fromJson(JsonValue(0), value, error));
 	QVERIFY(value.hasValue());
 	QCOMPARE(value.value, quint64(0));
 }
-void DtoTest::legacyAndExplicitAudioEncoding()
+// Ответ полного профиля не получает клиентские legacy defaults.
+void DtoTest::responsesRequireCompleteEncodingAndAudio()
 {
-	// Чтение старого профиля не должно подставлять новый режим аудио или преобразовывать encoding=null.
+	// json задаёт полноценный профиль; modern сохраняет его исходный lossless документ.
 	auto json = fixture::groupProfile();
-	const auto legacy = decode<GroupProfile>(fixture::bytes(json));
-	QVERIFY(legacy);
-	QVERIFY(legacy.value->liveAudioMode.isMissing());
-	QVERIFY(legacy.value->encoding.isNull());
-	json.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
-	json.insert(QStringLiteral("encoding"), fixture::encoding());
 	const auto modern = decode<GroupProfile>(fixture::bytes(json));
 	QVERIFY(modern);
-	QVERIFY(modern.value->liveAudioMode.hasValue());
 	QCOMPARE(modern.value->liveAudioMode.value, QStringLiteral("copy"));
 	QVERIFY(modern.value->encoding.hasValue());
-	QCOMPARE(modern.value->encoding.value.version, 2);
-	QCOMPARE(modern.value->encoding.value.nvenc.value.lookaheadFrames, 16);
-	QCOMPARE(modern.value->encoding.value.audioCustom, QStringLiteral("aac_coder=twoloop"));
-	json.insert(QStringLiteral("live_audio_mode"), QStringLiteral("transcode"));
-	const auto audio = decode<GroupProfile>(fixture::bytes(json));
-	QVERIFY(audio);
-	QCOMPARE(audio.value->liveAudioMode.value, QStringLiteral("transcode"));
-	QCOMPARE(legacy.value->liveAudioMode.state, FieldState::Missing);
+	QVERIFY(!modern.value->originalDocument.isUndefined());
+	QCOMPARE(modern.value->encoding->nvenc->lookaheadFrames, 16);
+	json.remove(QStringLiteral("live_audio_mode"));
+	QVERIFY(!decode<GroupProfile>(fixture::bytes(json)));
+	json = fixture::groupProfile();
+	json.remove(QStringLiteral("encoding"));
+	QVERIFY(!decode<GroupProfile>(fixture::bytes(json)));
+	json.insert(QStringLiteral("encoding"), QJsonValue::Null);
+	QVERIFY(!decode<GroupProfile>(fixture::bytes(json)));
 }
+// Задаёт отсутствие обязательного режима звука и неизвестные либо несовместимые строковые значения.
 void DtoTest::invalidAudioModes_data()
 {
 	QTest::addColumn<QString>("mode");
@@ -183,14 +228,24 @@ void DtoTest::invalidAudioModes_data()
 	QTest::newRow("copy-video-transcode-audio")
 		<< QStringLiteral("copy") << QJsonValue(QStringLiteral("transcode"));
 }
+// Сохраняет неизвестные строковые значения ответа, но запрещает отправку несовместимого полного рецепта.
 void DtoTest::invalidAudioModes()
 {
+	// mode задаёт обработку видео; audio — исходное значение обязательного режима LIVE audio.
 	QFETCH(QString, mode);
 	QFETCH(QJsonValue, audio);
+	// json содержит полный профиль, в котором изменены только два проверяемых режима.
 	auto json = fixture::groupProfile();
 	json.insert(QStringLiteral("mode"), mode);
 	json.insert(QStringLiteral("live_audio_mode"), audio);
-	QVERIFY(!decode<GroupProfile>(fixture::bytes(json)));
+	// decoded сохраняет неизвестную строковую настройку; полная замена требует общей проверки матрицы.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(json));
+	if (audio.isNull())
+		QVERIFY(!decoded);
+	else {
+		QVERIFY(decoded);
+		QVERIFY(!encodeProfile(*decoded.value));
+	}
 }
 void DtoTest::keysAndEndpointAreExact()
 {
@@ -259,7 +314,7 @@ void DtoTest::historicalSnapshotsOwnTheirValues()
 	QCOMPARE(history.value->stream.publicationKey.value, QStringLiteral("publish+%2F/ключ"));
 	QCOMPARE(output.value->destination.endpoint.value, fixture::endpoint());
 	QCOMPARE(output.value->destination.streamKey.value, QStringLiteral("key/%2F+="));
-	QCOMPARE(output.value->profile.profile.liveAudioMode.state, FieldState::Missing);
+	QCOMPARE(output.value->profile.profile.liveAudioMode.value, QStringLiteral("copy"));
 }
 void DtoTest::ackMetricsRemainExactAndUnavailableIsNotZero()
 {
@@ -299,7 +354,7 @@ void DtoTest::pinnedSchemaAndProvenanceDescribeReadbackContract()
 		 provenance.value(QStringLiteral("schema_sha256")).toString().toLatin1());
 	QVERIFY(provenance.value(QStringLiteral("commit")).isNull());
 	QCOMPARE(provenance.value(QStringLiteral("contract_source_commit")).toString(),
-		 QStringLiteral("067388bc1e36ac5220e001c72c47220ef0b72173"));
+		 QStringLiteral("252669d054401f8c6081be49521f1c7f44410bec"));
 	QCOMPARE(provenance.value(QStringLiteral("binary_hash_verified")), QJsonValue(false));
 	// schema адресует определения DTO без изменения исходного документа.
 	const auto schema = fixture::object(bytes)
@@ -322,7 +377,7 @@ void DtoTest::pinnedSchemaAndProvenanceDescribeReadbackContract()
 	QVERIFY(required("OutputMetricsDTO", "ack_ahead_bytes_last"));
 	QVERIFY(required("OutputMetricsDTO", "ack_ahead_bytes_max"));
 	QVERIFY(required("OutputMetricsDTO", "ack_last_anomaly_at"));
-	QVERIFY(!required("GroupProfileDTO", "live_audio_mode"));
+	QVERIFY(required("GroupProfileDTO", "live_audio_mode"));
 	QVERIFY(schema.value(QStringLiteral("GroupProfileDTO"))
 			.toObject()
 			.value(QStringLiteral("properties"))
@@ -368,6 +423,24 @@ void DtoTest::systemRemovalHasNoSessionOrGpuPayload()
 	invalid = *result.value;
 	invalid.gpu.state = FieldState::Value;
 	QVERIFY(!validateRuntimeEvent(invalid));
+}
+
+// Синтаксическая корректность, UTF-8 и глубина проверяются до публикации дерева.
+void DtoTest::exactParserRejectsMalformedAndDeepDocuments()
+{
+	// original/parsed различают прежнее дерево и неуспешный вход; token задаёт независимую ошибку JSON.
+	const JsonValue original(QStringLiteral("unchanged"));
+	JsonValue parsed = original;
+	for (const auto &token :
+	     {QByteArray("01"), QByteArray("1."), QByteArray("1e+"), QByteArray("[1,]"), QByteArray("{\"x\":1}{}"),
+	      QByteArray("\"\\ud800\""), QByteArray("\"") + QByteArray::fromHex("ff") + '"'}) {
+		QVERIFY(!parseJson(token, parsed));
+		QCOMPARE(parsed, original);
+	}
+	// deep превышает документированный бюджет вложенности, не требуя большого тела.
+	const QByteArray deep = QByteArray(130, '[') + "0" + QByteArray(130, ']');
+	QVERIFY(!parseJson(deep, parsed));
+	QCOMPARE(parsed, original);
 }
 
 QTEST_GUILESS_MAIN(DtoTest)

@@ -48,47 +48,16 @@ QSet<QString> editableFields(ConfigurationKind kind)
 	return {};
 }
 
-// Скрывает точные секреты текущей карточки в структурированной причине; сырые тела не читает.
-// detail остаётся обычным текстом, model задаёт только draft/base текущей формы.
-QString issueDetail(QString detail, const ConfigurationEditorState &model)
-{
-	// secrets содержит непустые секретные строки обеих версий; длинные заменяются первыми.
-	QStringList secrets;
-	// entity адресует одну из версий карточки, которая может отсутствовать до создания.
-	for (const auto *entity : {&model.draft, &model.base}) {
-		if (!*entity)
-			continue;
-		// stream и destination предоставляют только поля, которые маскируются самой формой.
-		if (const auto *stream = std::get_if<api::Stream>(&**entity)) {
-			if (stream->publicationKey.hasValue() && !stream->publicationKey->isEmpty())
-				secrets.append(*stream->publicationKey);
-		}
-		if (const auto *destination = std::get_if<api::Destination>(&**entity)) {
-			if (destination->endpoint.hasValue() && !destination->endpoint->isEmpty())
-				secrets.append(*destination->endpoint);
-			if (destination->streamKey.hasValue() && !destination->streamKey->isEmpty())
-				secrets.append(*destination->streamKey);
-		}
-	}
-	// Компаратор ставит длинный секрет left раньше right, исключая его частичную замену короткой строкой.
-	std::sort(secrets.begin(), secrets.end(),
-		  [](const QString &left, const QString &right) { return left.size() > right.size(); });
-	// secret заменяется только точным совпадением; остальная причина сохраняет исходный смысл.
-	for (const auto &secret : secrets)
-		detail.replace(secret, QStringLiteral("[…]"));
-	return detail.left(2048);
-}
-
-// Сохраняет причины только известных корней текущей формы; вложенные пути не обрезает.
-// local разрешает доверенные ключи валидатора, серверные сообщения всегда остаются текстом.
-void collectFieldIssues(ConfigurationEditorState &model, const api::Problem &problem, bool local)
+// Сохраняет только доверенные локальные ключи известных полей. Серверные причины получает popup,
+// а форма сохраняет собственную валидацию и полный вложенный путь профиля.
+void collectFieldIssues(ConfigurationEditorState &model, const api::Problem &problem)
 {
 	// allowed ограничивает корни видом карточки; неизменяемый ключ Stream доступен лишь при создании.
 	auto allowed = editableFields(model.kind);
 	if (model.creating && model.kind == ConfigurationKind::Stream)
 		allowed.insert(QStringLiteral("publication_key"));
-	// append проверяет путь issue, удаляет body-префикс и сохраняет пояснение без отдельного value.
-	const auto append = [&model, &allowed, local](const api::FieldError &issue) {
+	// append проверяет путь issue и удаляет body-префикс перед сохранением локального ключа.
+	const auto append = [&model, &allowed](const api::FieldError &issue) {
 		// location сохраняет полный путь после единственного известного префикса тела.
 		QString location = issue.location;
 		if (location.startsWith(QStringLiteral("body.")))
@@ -97,18 +66,9 @@ void collectFieldIssues(ConfigurationEditorState &model, const api::Problem &pro
 		const auto root = location.section(QLatin1Char('.'), 0, 0);
 		if (!allowed.contains(root) || (!model.creating && !model.dirtyFields.contains(root)))
 			return;
-		// fieldIssue объединяет несколько структурированных причин одного полного пути.
+		// fieldIssue хранит доверенный локальный ключ полного пути без серверного пояснения.
 		auto &fieldIssue = model.fieldIssues[location];
-		if (local) {
-			fieldIssue.messageKey = issue.messageKey;
-			return;
-		}
-		// detail содержит ограниченное пояснение с замаскированными секретами текущей карточки.
-		const auto detail = issueDetail(issue.message, model);
-		if (fieldIssue.detail.isEmpty())
-			fieldIssue.detail = detail;
-		else if (!detail.isEmpty() && fieldIssue.detail != detail)
-			fieldIssue.detail = (fieldIssue.detail + QLatin1Char('\n') + detail).left(2048);
+		fieldIssue.messageKey = issue.messageKey;
 	};
 	// issue содержит только структурированные location/message, без серверного value.
 	for (const auto &issue : problem.errors)
@@ -201,6 +161,9 @@ public:
 	quint64 detailGeneration = 0;
 	// Поколение записи запрещает завершение отменённого намерения.
 	quint64 mutationGeneration = 0;
+	// notifiedMutation и notifiedStep подавляют повтор события одного шага, не накапливая историю отказов.
+	quint64 notifiedMutation = 0;
+	QString notifiedStep;
 	// shutdown необратимо запрещает новые действия.
 	bool stopped = false;
 	// Явное отключение запрещает новые CRUD до нового подключения.
@@ -479,7 +442,7 @@ public:
 		}
 	}
 
-	// Читает точную сущность, сохраняя несохранённый ввод; conflict запрашивает отдельную серверную версию при 409.
+	// Читает точную сущность, сохраняя несохранённый ввод; conflict сравнивает версию после revision_conflict.
 	// Явная сверка Unknown отзывает старые чтения конфигурации до публикации результата и обновляет Dock.
 	// Успех GET и 404 подтверждают только нынешнее состояние, не успех потерянной записи.
 	template<class T> void readTyped(bool conflict)
@@ -540,14 +503,10 @@ public:
 			// value сохраняет DTO до уведомлений кеша.
 			const auto value = *result.value;
 			if (conflict) {
-				if (model.base && value.revision > record(*model.base).revision) {
-					model.serverConflict = ConfigurationEntity(value);
-					model.outcome = ConfigurationOutcome::Conflict;
-					model.messageKey = QStringLiteral("Configuration.Conflict");
-				} else {
-					model.outcome = ConfigurationOutcome::Rejected;
-					model.messageKey = QStringLiteral("Configuration.Rejected");
-				}
+				// Причина уже установлена кодом revision_conflict исходного ответа, а не порядком ревизий GET.
+				model.serverConflict = ConfigurationEntity(value);
+				model.outcome = ConfigurationOutcome::Conflict;
+				model.messageKey = QStringLiteral("Configuration.Conflict");
 			} else if (model.dirtyFields.isEmpty() && model.outcome != ConfigurationOutcome::Unknown) {
 				model.base = value;
 				model.draft = value;
@@ -736,29 +695,56 @@ public:
 		return guard && editorGeneration == acceptedGeneration;
 	}
 
-	// Сохраняет отказ либо неопределённость без повтора CRUD; подтверждённый 409 запускает сравнение.
+	// Передаёт HTTP-отказ текущего CRUD-шага. Сигнал не меняет модель формы и не хранит тело ответа.
+	// Возвращает false, если обработчик завершил сервис либо сменил исходный контекст/намерение.
+	bool notifyFailure(const api::Error &error, const QString &stepIdentity)
+	{
+		if (!mutationRejected(error))
+			return true;
+		if (stopped || disconnected || model.context != context)
+			return false;
+		if (notifiedMutation == mutationGeneration && notifiedStep == stepIdentity)
+			return true;
+		notifiedMutation = mutationGeneration;
+		notifiedStep = stepIdentity;
+		// failure содержит краткоживущую диагностику только исходного серверного отказа.
+		auto failure = operationFailure(error);
+		failure.source = OperationFailureSource::Configuration;
+		failure.context = {context.origin, context.profileUuid, context.workingStreamId};
+		failure.generation = mutationGeneration;
+		failure.stepIdentity = stepIdentity;
+		// guard отслеживает уничтожение фасада; expected/sequence запрещают продолжение чужой карточки.
+		const QPointer<ConfigurationController> guard = &owner;
+		const auto expected = context;
+		const auto sequence = mutationGeneration;
+		emit owner.operationFailed(failure);
+		return guard && !stopped && !disconnected && context == expected && mutationGeneration == sequence;
+	}
+
+	// Сохраняет отказ либо неопределённость без повтора CRUD; только revision_conflict запускает сравнение.
 	void failed(const api::Error &error)
 	{
+		if (!notifyFailure(error, model.id))
+			return;
 		model.writing = false;
-		model.outcome = !error.requestSent || error.httpStatus == 400 || error.httpStatus == 404 ||
-						error.httpStatus == 409 || error.httpStatus == 422
-					? ConfigurationOutcome::Rejected
-					: ConfigurationOutcome::Unknown;
+		model.outcome = !error.requestSent || mutationRejected(error) ? ConfigurationOutcome::Rejected
+									      : ConfigurationOutcome::Unknown;
 		model.reconciliationRequired = model.outcome == ConfigurationOutcome::Unknown;
 		model.messageKey = model.reconciliationRequired ? QStringLiteral("Configuration.Unknown")
 								: QStringLiteral("Configuration.Rejected");
 		model.fieldIssues.clear();
-		if (error.problem && (error.httpStatus == 400 || error.httpStatus == 422))
-			collectFieldIssues(model, *error.problem, false);
+		// expected и sequence не позволяют публикациям эпохи перенести отказ в другой контекст.
+		const auto expected = context;
+		const auto sequence = mutationGeneration;
 		// guard запрещает продолжение при уничтожении контроллера из сигнала.
 		const QPointer<ConfigurationController> guard = &owner;
 		state.invalidateConfiguration();
-		if (!guard)
+		if (!guard || context != expected || sequence != mutationGeneration)
 			return;
 		publish();
-		if (!guard)
+		if (!guard || context != expected || sequence != mutationGeneration)
 			return;
-		if (error.httpStatus == 409)
+		if (revisionConflict(error))
 			reload(true);
 	}
 
@@ -816,7 +802,7 @@ public:
 			model.messageKey = QStringLiteral("Configuration.NotSaved");
 			model.fieldIssues.clear();
 			if (encoded.error && encoded.error->problem)
-				collectFieldIssues(model, *encoded.error->problem, true);
+				collectFieldIssues(model, *encoded.error->problem);
 			publish();
 			return false;
 		}
@@ -992,13 +978,12 @@ public:
 					model.destinationOutcomes.insert(id, ConfigurationOutcome::Saved);
 				} else {
 					// rejected отделяет известный серверный отказ от возможной уже выполненной записи.
-					const bool rejected =
-						result.error &&
-						(!result.error->requestSent || result.error->httpStatus == 400 ||
-						 result.error->httpStatus == 404 || result.error->httpStatus == 409 ||
-						 result.error->httpStatus == 422);
+					const bool rejected = result.error && (!result.error->requestSent ||
+									       mutationRejected(*result.error));
+					if (result.error && !notifyFailure(*result.error, id))
+						return;
 					// outcome относится только к этому назначению, не к соседним шагам пакета.
-					const auto outcome = result.error && result.error->httpStatus == 409
+					const auto outcome = result.error && revisionConflict(*result.error)
 								     ? ConfigurationOutcome::Conflict
 							     : rejected ? ConfigurationOutcome::Rejected
 									: ConfigurationOutcome::Unknown;

@@ -43,6 +43,12 @@ private:
 class ApiNetworkTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Разделяет предельные HTTP отказы до открытия SSE, malformed body,204 и бюджет ожидания тела.
+	void preopenSseRejection_data();
+	// Проверяет один ограниченный итог попытки до открытия подписки.
+	void preopenSseRejection();
+	// Отмена при частично полученном Problem запрещает все последующие callbacks этой подписки.
+	void preopenSseCancellationIsSilent();
 	// Описывает все типизированные команды и точные ожидаемые маршруты независимо от транспорта.
 	void typedCommands_data();
 	// Проверяет POST, MIME и JSON request_id/destination_ids, включая непрозрачные ID пути.
@@ -506,6 +512,7 @@ void ApiNetworkTest::activeAndQueuedRequestsAreBounded()
 	QCOMPARE(server.requests.size(), 2);
 }
 
+// Задаёт независимые нарушения HTTP, MIME и идентичности события SSE.
 void ApiNetworkTest::sseValidatesStatusMediaAndIdentity_data()
 {
 	QTest::addColumn<int>("failure");
@@ -515,32 +522,44 @@ void ApiNetworkTest::sseValidatesStatusMediaAndIdentity_data()
 	QTest::newRow("id-cursor") << 3;
 	QTest::newRow("invalid-json") << 4;
 }
+// Отбрасывает каждый несовместимый ответ до доставки и подтверждения cursor.
 void ApiNetworkTest::sseValidatesStatusMediaAndIdentity()
 {
 	// Каждая строка ломает один слой: статус, MIME, SSE event, SSE id или JSON. Ни один плохой кадр
 	// не должен дойти до потребителя/подтвердить cursor; несовместимость события требует повторной синхронизации.
+	// failure выбирает единственный нарушенный слой протокола в текущей строке данных.
 	QFETCH(int, failure);
+	// server обслуживает только loopback; его callback завершает ошибочные HTTP ответы до срока теста.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [&](const auto &request) {
+		// frame нарушает выбранный слой SSE; остальные идентификаторы остаются контрактными.
 		const auto frame = failure == 4 ? QByteArray("event: state\nid: x\ndata: {\n\n")
 						: fixture::frame(fixture::event(),
 								 failure == 2 ? QByteArray("metrics") : QByteArray{},
 								 failure == 3 ? QByteArray("different") : QByteArray{});
-		HttpServer::stream(request, frame, failure == 0 ? 503 : 200,
-				   failure == 1 ? QByteArray("application/json")
-						: QByteArray("text/event-stream; charset=utf-8"));
+		if (failure == 0) {
+			HttpServer::reply(request, "{}", 503, "application/problem+json");
+			return;
+		}
+		if (failure == 1)
+			HttpServer::reply(request, frame, 200, "application/json");
+		else
+			HttpServer::stream(request, frame, 200, "text/event-stream; charset=utf-8");
 	};
+	// client использует Qt Network; deliveries считает доставку, error/resync сохраняют итог отказа.
 	EventClient client;
 	int deliveries = 0;
 	std::optional<Error> error;
 	bool resync = false;
 	client.subscribe(
 		server.origin(), QStringLiteral("anchor"), {1, 2}, this,
+		// Обработчик доставки отмечает недопустимое принятие несовместимого кадра.
 		[&](auto, const auto &) {
 			++deliveries;
 			return true;
 		},
+		// Обработчик отказа сохраняет ошибку value и необходимость новой синхронизации required.
 		[&](auto, auto value, bool required) {
 			error = value;
 			resync = required;
@@ -758,11 +777,11 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 		body.insert(QStringLiteral("asset_id"), QStringLiteral("asset"));
 		body.insert(QStringLiteral("kind"), QStringLiteral("image"));
 		body.insert(QStringLiteral("status"), QStringLiteral("READY"));
-		body.insert(QStringLiteral("size_bytes"), QStringLiteral("9007199254740993"));
+		body.insert(QStringLiteral("size_bytes"), QJsonValue(qint64(9007199254740993)));
 		body.insert(QStringLiteral("failure"), QJsonValue::Null);
 		break;
 	case 8:
-		body = fixture::object(R"({"revision":"9007199254740993","fallback":null})");
+		body = fixture::object(R"({"revision":9007199254740993,"fallback":null})");
 		break;
 	case 9:
 		body = fixture::object(R"({"availability":"unavailable","reason":"not_observed","snapshot":null})");
@@ -1064,6 +1083,165 @@ void ApiNetworkTest::explicitServerConnectionBypassesApplicationProxyFactory()
 	QCOMPARE(server.requests.size(), 3);
 	for (const auto &request : server.requests)
 		QCOMPARE(request.method, QByteArray("GET"));
+}
+
+// Каждый отказ относится к HTTP попытке; его тело никогда не становится прикладным SSE событием.
+void ApiNetworkTest::preopenSseRejection_data()
+{
+	QTest::addColumn<int>("scenario");
+	QTest::newRow("fragmented-problem") << 0;
+	QTest::newRow("malformed-body") << 1;
+	QTest::newRow("body-limit") << 2;
+	QTest::newRow("terminal-204") << 3;
+	QTest::newRow("body-deadline") << 4;
+}
+// Qt errorOccurred/finished сводятся в один отказ с сохранением контекста и ограниченной диагностикой.
+void ApiNetworkTest::preopenSseRejection()
+{
+	// scenario выбирает отрицательную ветвь; server содержит только loopback-сокеты текущего теста.
+	QFETCH(int, scenario);
+	HttpServer server;
+	QVERIFY(server.listen());
+	// limits отделяет предел тела ответа от срока текущей попытки; client использует настоящий Qt Network.
+	Limits limits;
+	limits.restBodyBytes = 512;
+	limits.sseHandshakeMs = 200;
+	limits.sseIdleMs = 200;
+	EventClient client(limits);
+	// expected задаёт контекст; actual принимает контекст отказа; error сохраняет один итог;
+	// failures/opened/deliveries выявляют лишние callbacks.
+	const RequestContext expected{31, 47};
+	std::optional<Error> error;
+	int failures = 0;
+	int opened = 0;
+	int deliveries = 0;
+	RequestContext actual;
+	// handler отправляет HTTP заголовки и первую часть тела отдельно от завершающего фрагмента.
+	server.handler = [scenario, &server](const HttpServer::Request &request) {
+		if (scenario == 3) {
+			HttpServer::reply(request, {}, 204, {});
+			return;
+		}
+		if (scenario == 1) {
+			HttpServer::reply(request, "malformed-synthetic-diagnostic", 409, "application/problem+json");
+			return;
+		}
+		if (scenario == 2) {
+			HttpServer::reply(request, QByteArray(513, 'x'), 409, "application/problem+json");
+			return;
+		}
+		if (scenario == 4) {
+			HttpServer::stream(request, "{", 409, "application/problem+json");
+			return;
+		}
+		HttpServer::stream(request, R"({"status":409,"code":"resource_in_use","detail":"<b>busy</b>",)", 409,
+				   "application/problem+json");
+		// pending защищает сокет от удаления; callback завершает body только в следующем обороте Qt.
+		const auto pending = request.socket;
+		QTimer::singleShot(0, &server, [pending] {
+			if (pending) {
+				pending->write(
+					R"("action":"stop session","field":"profile","context":{"session_id":"session","password":"discard"}})");
+				pending->disconnectFromHost();
+			}
+		});
+	};
+	client.subscribe(
+		server.origin(), QStringLiteral("unchanged-anchor"), expected, this,
+		// Обработчик доставки отмечает ошибочное прохождение HTTP тела в parser событий.
+		[&](RequestContext, const RuntimeEvent &) {
+			++deliveries;
+			return true;
+		},
+		// Обработчик отказа сохраняет failure и context для проверки однократности текущей попытки.
+		[&](RequestContext context, Error failure, bool) {
+			actual = context;
+			error = std::move(failure);
+			++failures;
+		},
+		// Обработчик открытия выявляет ошибочное признание HTTP отказа рабочей подпиской.
+		[&](RequestContext) { ++opened; });
+	QTRY_COMPARE_WITH_TIMEOUT(failures, 1, 1500);
+	QCOMPARE(actual, expected);
+	QCOMPARE(opened, 0);
+	QCOMPARE(deliveries, 0);
+	QCOMPARE(client.confirmedCursor(), QStringLiteral("unchanged-anchor"));
+	QVERIFY(error);
+	if (scenario == 0) {
+		QVERIFY(error->problem);
+		QCOMPARE(error->problem->code, QStringLiteral("resource_in_use"));
+		QCOMPARE(error->problem->detail, QStringLiteral("<b>busy</b>"));
+		QCOMPARE(error->problem->action, QStringLiteral("stop session"));
+		QCOMPARE(error->problem->context.value(QStringLiteral("session_id")), QStringLiteral("session"));
+		QVERIFY(!error->problem->context.contains(QStringLiteral("password")));
+		QVERIFY(error->diagnosticBody.contains("resource_in_use"));
+	} else if (scenario == 2) {
+		QCOMPARE(error->httpStatus, 409);
+		QVERIFY(!error->problem);
+		QVERIFY(error->diagnosticBody.size() <= limits.restBodyBytes);
+	} else if (scenario == 3)
+		QCOMPARE(error->httpStatus, 204);
+	else if (scenario == 4) {
+		QCOMPARE(error->httpStatus, 409);
+		QVERIFY(!error->problem);
+	} else {
+		QCOMPARE(error->httpStatus, 409);
+		QVERIFY(!error->problem);
+		QVERIFY(error->diagnosticBody.contains("malformed-synthetic-diagnostic"));
+	}
+	client.shutdown();
+	QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	QCoreApplication::processEvents();
+	QCOMPARE(failures, 1);
+	QCOMPARE(server.requests.size(), 1);
+}
+
+// Закрытие после начала HTTP Problem не открывает подписку и подавляет отказ даже после EOF и deadline.
+void ApiNetworkTest::preopenSseCancellationIsSilent()
+{
+	// server и partial удерживают незавершённый HTTP ответ только на loopback.
+	HttpServer server;
+	QVERIFY(server.listen());
+	HttpServer::Request partial;
+	// handler передаёт начало Problem без EOF; окончание контролирует сам тест после close().
+	server.handler = [&](const HttpServer::Request &request) {
+		partial = request;
+		HttpServer::stream(request, R"({"status":409,"code":"resource_in_use",)", 409,
+				   "application/problem+json");
+	};
+	// limits задаёт срок старой попытки; client должен снять его при явном закрытии.
+	Limits limits;
+	limits.sseHandshakeMs = 200;
+	EventClient client(limits);
+	// callbacks учитывает все три вида доставки; каждый обработчик выявляет нарушение отмены.
+	int callbacks = 0;
+	client.subscribe(
+		server.origin(), QStringLiteral("cancel-anchor"), {3, 5}, this,
+		[&](RequestContext, const RuntimeEvent &) {
+			++callbacks;
+			return true;
+		},
+		[&](RequestContext, Error, bool) { ++callbacks; }, [&](RequestContext) { ++callbacks; });
+	QTRY_VERIFY_WITH_TIMEOUT(partial.socket, 1000);
+	QTRY_VERIFY_WITH_TIMEOUT(partial.socket && partial.socket->bytesToWrite() == 0, 1000);
+	// partialDelivered подтверждает прохождение следующего оборота Qt после отправки фрагмента.
+	bool partialDelivered = false;
+	QTimer::singleShot(0, &client, [&] { partialDelivered = true; });
+	QTRY_VERIFY_WITH_TIMEOUT(partialDelivered, 1000);
+	QCOMPARE(callbacks, 0);
+	client.close();
+	if (partial.socket) {
+		partial.socket->write(R"("detail":"cancelled response"})");
+		partial.socket->disconnectFromHost();
+	}
+	// deadlinePassed ограниченно пропускает срок отменённой попытки, выявляя оставшийся timer/callback.
+	bool deadlinePassed = false;
+	QTimer::singleShot(limits.sseHandshakeMs + 50, &client, [&] { deadlinePassed = true; });
+	QTRY_VERIFY_WITH_TIMEOUT(deadlinePassed, 1000);
+	QCOMPARE(callbacks, 0);
+	QCOMPARE(client.confirmedCursor(), QStringLiteral("cancel-anchor"));
+	QCOMPARE(server.requests.size(), 1);
+	client.shutdown();
 }
 
 QTEST_GUILESS_MAIN(ApiNetworkTest)

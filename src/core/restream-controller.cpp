@@ -1,6 +1,7 @@
 #include "restream-controller.hpp"
 
 #include "api/api-client.hpp"
+#include "api/profile-rules.hpp"
 #include "core/connection-controller.hpp"
 #include "core/output-operations.hpp"
 #include "core/state-store.hpp"
@@ -30,53 +31,6 @@ bool activeSession(const QString &state)
 {
 	return state == QStringLiteral("STARTING") || state == QStringLiteral("RUNNING") ||
 	       state == QStringLiteral("STOPPING");
-}
-
-// Сравнивает полный формат, включая байтовые ProfileText и точную рациональную частоту кадров.
-bool sameFormat(const api::Format &a, const api::Format &b)
-{
-	return std::tie(a.video.codec, a.video.width, a.video.height, a.video.frameRate.numerator,
-			a.video.frameRate.denominator, a.video.codecProfile, a.video.level, a.video.tier,
-			a.video.pixelFormat, a.video.bitDepth, a.video.color.range, a.video.color.primaries,
-			a.video.color.transfer, a.video.color.matrix, a.audio.codec, a.audio.codecProfile,
-			a.audio.sampleRateHz, a.audio.channels, a.audio.channelLayout) ==
-	       std::tie(b.video.codec, b.video.width, b.video.height, b.video.frameRate.numerator,
-			b.video.frameRate.denominator, b.video.codecProfile, b.video.level, b.video.tier,
-			b.video.pixelFormat, b.video.bitDepth, b.video.color.range, b.video.color.primaries,
-			b.video.color.transfer, b.video.color.matrix, b.audio.codec, b.audio.codecProfile,
-			b.audio.sampleRateHz, b.audio.channels, b.audio.channelLayout);
-}
-
-// Сравнивает рецепт encoding без подстановки значений для missing/null вложенных настроек.
-bool sameEncoding(const api::Encoding &a, const api::Encoding &b)
-{
-	if (std::tie(a.version, a.videoEncoder, a.audioEncoder, a.rateControl, a.rescaleOutput, a.videoCustom,
-		     a.audioCustom, a.nvenc.state, a.svtAv1.state) !=
-	    std::tie(b.version, b.videoEncoder, b.audioEncoder, b.rateControl, b.rescaleOutput, b.videoCustom,
-		     b.audioCustom, b.nvenc.state, b.svtAv1.state))
-		return false;
-	if (a.nvenc && std::tie(a.nvenc->preset, a.nvenc->tuning, a.nvenc->multipass, a.nvenc->lookaheadFrames,
-				a.nvenc->enableSpatialAq, a.nvenc->enableTemporalAq, a.nvenc->aqStrength) !=
-			       std::tie(b.nvenc->preset, b.nvenc->tuning, b.nvenc->multipass, b.nvenc->lookaheadFrames,
-					b.nvenc->enableSpatialAq, b.nvenc->enableTemporalAq, b.nvenc->aqStrength))
-		return false;
-	return !a.svtAv1 ||
-	       std::tie(a.svtAv1->preset, a.svtAv1->tuning, a.svtAv1->aqMode, a.svtAv1->lookaheadFrames) ==
-		       std::tie(b.svtAv1->preset, b.svtAv1->tuning, b.svtAv1->aqMode, b.svtAv1->lookaheadFrames);
-}
-
-// Полное структурное равенство профиля: liveAudioMode Missing не эквивалентен явному copy.
-bool sameProfile(const api::GroupProfile &a, const api::GroupProfile &b)
-{
-	return std::tie(a.mode, a.liveAudioMode.state, a.videoEncoding.targetBitrateBps, a.videoEncoding.maxBitrateBps,
-			a.videoEncoding.bufferBits, a.videoEncoding.gopFrames, a.videoEncoding.maxBFrames,
-			a.videoEncoding.closedGop, a.audioEncoding.bitrateBps, a.encoding.state) ==
-		       std::tie(b.mode, b.liveAudioMode.state, b.videoEncoding.targetBitrateBps,
-				b.videoEncoding.maxBitrateBps, b.videoEncoding.bufferBits, b.videoEncoding.gopFrames,
-				b.videoEncoding.maxBFrames, b.videoEncoding.closedGop, b.audioEncoding.bitrateBps,
-				b.encoding.state) &&
-	       (!a.liveAudioMode || *a.liveAudioMode == *b.liveAudioMode) && sameFormat(a.format, b.format) &&
-	       (!a.encoding || sameEncoding(*a.encoding, *b.encoding));
 }
 
 // Возвращает точное backend kind для разрешённой команды; None не может попасть в POST.
@@ -159,6 +113,8 @@ public:
 		// destinationId фиксирует назначение для add-output либо singleton-запуска новой Session.
 		// Оно связывает результат выбранного запуска с Destination; Output имеет отдельный ID.
 		QString destinationId;
+		// failureNotified запрещает повторный popup при повторном чтении той же терминальной квитанции.
+		bool failureNotified = false;
 	};
 
 	// Приватное доказательство пригодности ровно одного выбранного назначения; общий precheck не изменяется.
@@ -576,6 +532,42 @@ public:
 			       : receipt.targetId == live->outputId && receipt.outputId == live->outputId;
 	}
 
+	// Публикует отказ только живого шага. После сигнала повторно проверяет контекст и время жизни:
+	// обработчик может синхронно завершить плагин либо вытеснить workflow.
+	bool notifyFailure(OperationFailure failure)
+	{
+		if (!busy || !live || live->failureNotified || !current(stepToken))
+			return false;
+		live->failureNotified = true;
+		failure.source = OperationFailureSource::Runtime;
+		failure.context = context;
+		failure.generation = generation;
+		failure.stepIdentity = live->requestId + QLatin1Char('/') + QString::number(stepToken);
+		// guard обнаруживает уничтожение фасада, expected — замену шага из обработчика.
+		const QPointer<RestreamController> guard = &owner;
+		const auto expected = stepToken;
+		emit owner.operationFailed(failure);
+		return guard && current(expected) && busy;
+	}
+
+	// Передаёт доступную причину отказа session через уведомление живого шага.
+	// Вызывающий оракул уже проверил принадлежность Session; без failure обработчик
+	// уведомления выбирает общее пояснение. Возвращает разрешение продолжить работу после сигнала.
+	bool notifySessionFailure(const api::Session &session)
+	{
+		// failure копирует полученные поля, не создавая отсутствующую причину или диагностическое тело.
+		OperationFailure failure;
+		if (session.failure) {
+			failure.code = session.failure->code;
+			failure.reason = session.failure->message;
+			failure.action = session.failure->action;
+			failure.field = session.failure->field;
+			failure.ids = session.failure->context;
+			failure.diagnosticBody = session.failure->diagnosticBody;
+		}
+		return notifyFailure(std::move(failure));
+	}
+
 	// Принимает только согласованную квитанцию и разделяет её терминальный статус с оракулом состояния.
 	void acceptReceipt(api::Receipt receipt)
 	{
@@ -595,8 +587,21 @@ public:
 			model.current->sessionId = receipt.sessionId;
 		}
 		model.current->commandId = receipt.id;
+		// failure переносит диагностику в однократное событие до сохранения value-модели квитанции.
+		OperationFailure failure;
+		if (receipt.failure) {
+			failure.code = receipt.failure->code;
+			failure.reason = receipt.failure->message;
+			failure.action = receipt.failure->action;
+			failure.field = receipt.failure->field;
+			failure.ids = receipt.failure->context;
+			failure.diagnosticBody = std::move(receipt.failure->diagnosticBody);
+		}
+		receipt.failure.value.diagnosticBody.clear();
 		model.current->receipt = receipt;
 		if (receipt.status == QStringLiteral("FAILED") || receipt.status == QStringLiteral("INTERRUPTED")) {
+			if (!notifyFailure(std::move(failure)))
+				return;
 			finish(OperationOutcome::Failed, QStringLiteral("Operation.CommandFailed"));
 			return;
 		}
@@ -705,12 +710,16 @@ public:
 			if (!current(expected) || !busy)
 				return;
 			if (!result) {
-				// conflict означает определённый отказ; перечитывание не выдаёт чужой start за собственный.
+				// rejected устанавливается только по HTTP-отказу, а не потере ответа после отправки.
+				const bool rejected = result.error && mutationRejected(*result.error);
+				// conflict разрешает адресное обновление, сохраняя исходный предметный код отказа.
 				const bool conflict = result.error && result.error->httpStatus == 409;
+				if (rejected && !notifyFailure(operationFailure(*result.error)))
+					return;
 				// guard защищает продолжение после публикации результата и refreshState.
 				const QPointer<RestreamController> guard = &owner;
-				finish(conflict ? OperationOutcome::Failed : OperationOutcome::Unknown,
-				       conflict ? QStringLiteral("Operation.Conflict")
+				finish(rejected ? OperationOutcome::Failed : OperationOutcome::Unknown,
+				       rejected ? QStringLiteral("Operation.CommandFailed")
 						: QStringLiteral("Operation.Unknown"));
 				if (guard && conflict)
 					connection.refreshState();
@@ -785,7 +794,8 @@ public:
 	{
 		// expected связывает последовательные чтения только с собственной квитанцией запуска.
 		const auto expected = stepToken;
-		// Обработчик отвергает другую Session даже при совпадении текущего выбора Dock.
+		// Обработчик отвергает другую Session даже при совпадении выбора Dock; отказ своей Session
+		// передаёт общему уведомлению до завершения шага.
 		api.getSession(live->sessionId, &owner, [this, expected](auto, api::Result<api::Session> session) {
 			if (!current(expected) || !busy)
 				return;
@@ -801,6 +811,8 @@ public:
 			    session.value->state == QStringLiteral("INTERRUPTED")) {
 				if (batch)
 					stopNewSteps = true;
+				if (!notifySessionFailure(*session.value))
+					return;
 				finish(OperationOutcome::Failed, QStringLiteral("Operation.CommandFailed"));
 				return;
 			}
@@ -905,6 +917,7 @@ public:
 			return;
 		}
 		// callback проверяет RUNNING/desiredPaused либо STOPPED исходной Session, без проверки LIVE/FALLBACK группы.
+		// При её отказе передаёт доступную причину общему уведомлению до завершения шага.
 		api.getSession(live->sessionId, &owner, [this, expected](auto, api::Result<api::Session> result) {
 			if (!current(expected) || !busy)
 				return;
@@ -927,9 +940,11 @@ public:
 			if (confirmed)
 				stepCompleted();
 			else if (result.value->state == QStringLiteral("FAILED") ||
-				 result.value->state == QStringLiteral("INTERRUPTED"))
+				 result.value->state == QStringLiteral("INTERRUPTED")) {
+				if (!notifySessionFailure(*result.value))
+					return;
 				finish(OperationOutcome::Failed, QStringLiteral("Operation.CommandFailed"));
-			else
+			} else
 				schedulePoll();
 		});
 	}
@@ -1710,10 +1725,10 @@ public:
 							// variant сравнивается целиком по рецепту, без выдуманного generator_version.
 							[&profile](const api::Variant &variant) {
 								return variant.state == QStringLiteral("READY") &&
-								       sameProfile(variant.profile,
-										   profile.value->profile) &&
-								       sameFormat(variant.format,
-										  profile.value->profile.format);
+								       api::sameProfile(variant.profile,
+											profile.value->profile) &&
+								       api::compatibleMeasuredFormat(
+									       variant.format, profile.value->profile);
 							});
 						if (!compatible) {
 							finishPrecheck(FallbackReadiness::Unavailable,
@@ -1947,10 +1962,11 @@ public:
 						return;
 					}
 					ids.insert(variant.id);
-					compatible = compatible ||
-						     (variant.state == QStringLiteral("READY") &&
-						      sameProfile(variant.profile, selectedStart->profile) &&
-						      sameFormat(variant.format, selectedStart->profile.format));
+					compatible =
+						compatible ||
+						(variant.state == QStringLiteral("READY") &&
+						 api::sameProfile(variant.profile, selectedStart->profile) &&
+						 api::compatibleMeasuredFormat(variant.format, selectedStart->profile));
 				}
 				if (!compatible) {
 					finish(OperationOutcome::Failed,
@@ -2188,6 +2204,8 @@ public:
 				continue;
 			++stepToken;
 			live = batchUnknown[index]->step;
+			// Явная попытка сохраняет request_id, но имеет собственный результат доставки отказа.
+			live->failureNotified = false;
 			// receipt сохраняет прежнюю собственную квитанцию до сброса публичных полей шага.
 			const auto receipt = batchUnknown[index]->receipt;
 			batchUnknown[index].reset();
@@ -2226,6 +2244,7 @@ public:
 			return false;
 		++stepToken;
 		busy = true;
+		live->failureNotified = false;
 		stopNewSteps = true;
 		model.current->remainingStopped = true;
 		model.current->outcome = OperationOutcome::Pending;

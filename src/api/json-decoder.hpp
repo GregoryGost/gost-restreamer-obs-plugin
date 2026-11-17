@@ -1,9 +1,7 @@
 #pragma once
 #include "api/models.hpp"
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonValue>
+#include "api/json-value.hpp"
+
 #include <cmath>
 #include <limits>
 #include <type_traits>
@@ -20,82 +18,155 @@ bool validTimestamp(const QString &text);
 // Они могут оставить частично изменённое value: публиковать его после false нельзя. Для внешнего
 // документа предназначен decode<T>, который выдаёт только целиком успешно разобранный новый DTO.
 // Неизвестные ключи обычных DTO допускаются; специальные оболочки имеют собственные ограничения.
-bool fromJson(const QJsonValue &, QString &, Error &);
-bool fromJson(const QJsonValue &, bool &, Error &);
-bool fromJson(const QJsonValue &, quint64 &, Error &);
-bool fromJson(const QJsonValue &, double &, Error &);
-bool fromJson(const QJsonValue &, ProfileText &, Error &);
+// Читает QString с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, QString &, Error &);
+// Читает bool с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, bool &, Error &);
+// Читает quint64 с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, quint64 &, Error &);
+// Читает double с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, double &, Error &);
+// Читает ProfileText с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, ProfileText &, Error &);
+// Читает строковые идентификаторы только из опубликованного сервером списка контекстных полей.
+// Читает QMap<QString, QString> с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, QMap<QString, QString> &, Error &);
+// Читает точное целое в физическом диапазоне T без double; при отказе value сохраняется.
 template<class T>
 	requires(std::is_integral_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, quint64>)
-bool fromJson(const QJsonValue &json, T &value, Error &error)
+bool fromJson(const JsonValue &json, T &value, Error &error)
 {
-	// Малые целые контракт хранит JSON-числами; quint64 исключён из шаблона и читается только строкой.
-	if (!json.isDouble() || !std::isfinite(json.toDouble()) || std::trunc(json.toDouble()) != json.toDouble() ||
-	    json.toDouble() < double(std::numeric_limits<T>::lowest()) ||
-	    json.toDouble() > double(std::numeric_limits<T>::max())) {
-		error = makeError(ErrorKind::Decode);
-		return false;
+	// parsedSigned принимает знаковый результат, parsedUnsigned — беззнаковый, без округления границ.
+	qint64 parsedSigned = 0;
+	quint64 parsedUnsigned = 0;
+	if constexpr (std::is_signed_v<T>) {
+		if (json.toSigned(parsedSigned) && parsedSigned >= std::numeric_limits<T>::lowest() &&
+		    parsedSigned <= std::numeric_limits<T>::max()) {
+			value = T(parsedSigned);
+			return true;
+		}
+	} else {
+		if (json.toUnsigned(parsedUnsigned) && parsedUnsigned <= std::numeric_limits<T>::max()) {
+			value = T(parsedUnsigned);
+			return true;
+		}
 	}
-	value = T(json.toDouble());
-	return true;
+	error = makeError(ErrorKind::Decode);
+	return false;
 }
-bool fromJson(const QJsonValue &, Record &, Error &);
-bool fromJson(const QJsonValue &, Failure &, Error &);
-bool fromJson(const QJsonValue &, Watchdog &, Error &);
-bool fromJson(const QJsonValue &, Policy &, Error &);
-bool fromJson(const QJsonValue &, Stream &, Error &);
-bool fromJson(const QJsonValue &, Destination &, Error &);
-bool fromJson(const QJsonValue &, FrameRate &, Error &);
-bool fromJson(const QJsonValue &, Color &, Error &);
-bool fromJson(const QJsonValue &, VideoFormat &, Error &);
-bool fromJson(const QJsonValue &, AudioFormat &, Error &);
-bool fromJson(const QJsonValue &, Format &, Error &);
-bool fromJson(const QJsonValue &, VideoEncoding &, Error &);
-bool fromJson(const QJsonValue &, AudioEncoding &, Error &);
-bool fromJson(const QJsonValue &, Group &, Error &);
-bool fromJson(const QJsonValue &, Receipt &, Error &);
-bool fromJson(const QJsonValue &, Asset &, Error &);
-bool fromJson(const QJsonValue &, Generation &, Error &);
-bool fromJson(const QJsonValue &, Rate &, Error &);
-bool fromJson(const QJsonValue &, Rates &, Error &);
-bool fromJson(const QJsonValue &, ObservedFormat &, Error &);
-bool fromJson(const QJsonValue &, MediaMetrics &, Error &);
-bool fromJson(const QJsonValue &, InputMetrics &, Error &);
-bool fromJson(const QJsonValue &, Input &, Error &);
-bool fromJson(const QJsonValue &, GroupMetrics &, Error &);
-bool fromJson(const QJsonValue &, OutputMetrics &, Error &);
-bool fromJson(const QJsonValue &, FFmpegProgress &, Error &);
-bool fromJson(const QJsonValue &, FFmpegMetrics &, Error &);
-bool fromJson(const QJsonValue &, GPUMetric &, Error &);
-bool fromJson(const QJsonValue &, GPUDevice &, Error &);
-bool fromJson(const QJsonValue &, GPU &, Error &);
-bool fromJson(const QJsonValue &, Observation &, Error &);
-bool fromJson(const QJsonValue &, RuntimeGroup &, Error &);
-bool fromJson(const QJsonValue &, RuntimeOutput &, Error &);
-bool fromJson(const QJsonValue &, RuntimeFFmpeg &, Error &);
-bool fromJson(const QJsonValue &, RuntimeSession &, Error &);
-bool fromJson(const QJsonValue &, Anchor &, Error &);
-bool fromJson(const QJsonValue &, SessionMetrics &, Error &);
-bool fromJson(const QJsonValue &, RuntimeEvent &, Error &);
-bool fromJson(const QJsonValue &, NVENC &, Error &);
-bool fromJson(const QJsonValue &, SVTAV1 &, Error &);
-bool fromJson(const QJsonValue &, Encoding &, Error &);
-bool fromJson(const QJsonValue &, GroupProfile &, Error &);
-bool fromJson(const QJsonValue &, Profile &, Error &);
-bool fromJson(const QJsonValue &, GroupSnapshot &, Error &);
-bool fromJson(const QJsonValue &, Session &, Error &);
-bool fromJson(const QJsonValue &, Output &, Error &);
-bool fromJson(const QJsonValue &, Variant &, Error &);
-bool fromJson(const QJsonValue &, Health &, Error &);
-bool fromJson(const QJsonValue &, Capability &, Error &);
-bool fromJson(const QJsonValue &, Capabilities &, Error &);
-bool fromJson(const QJsonValue &, PolicyResult &, Error &);
-bool fromJson(const QJsonValue &, OutputDetail &, Error &);
-bool fromJson(const QJsonValue &, Problem &, Error &);
+// Читает Record с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Record &, Error &);
+// Читает Failure с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Failure &, Error &);
+// Читает Watchdog с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Watchdog &, Error &);
+// Читает Policy с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Policy &, Error &);
+// Читает Stream с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Stream &, Error &);
+// Читает Destination с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Destination &, Error &);
+// Читает FrameRate с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, FrameRate &, Error &);
+// Читает Color с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Color &, Error &);
+// Читает VideoFormat с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, VideoFormat &, Error &);
+// Читает AudioFormat с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, AudioFormat &, Error &);
+// Читает Format с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Format &, Error &);
+// Читает VideoEncoding с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, VideoEncoding &, Error &);
+// Читает AudioEncoding с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, AudioEncoding &, Error &);
+// Читает Group с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Group &, Error &);
+// Читает Receipt с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Receipt &, Error &);
+// Читает Asset с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Asset &, Error &);
+// Читает Generation с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Generation &, Error &);
+// Читает Rate с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Rate &, Error &);
+// Читает Rates с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Rates &, Error &);
+// Читает ObservedFormat с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, ObservedFormat &, Error &);
+// Читает MediaMetrics с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, MediaMetrics &, Error &);
+// Читает InputMetrics с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, InputMetrics &, Error &);
+// Читает Input с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Input &, Error &);
+// Читает GroupMetrics с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, GroupMetrics &, Error &);
+// Читает OutputMetrics с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, OutputMetrics &, Error &);
+// Читает FFmpegProgress с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, FFmpegProgress &, Error &);
+// Читает FFmpegMetrics с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, FFmpegMetrics &, Error &);
+// Читает GPUMetric с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, GPUMetric &, Error &);
+// Читает GPUDevice с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, GPUDevice &, Error &);
+// Читает GPU с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, GPU &, Error &);
+// Читает Observation с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Observation &, Error &);
+// Читает RuntimeGroup с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, RuntimeGroup &, Error &);
+// Читает RuntimeOutput с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, RuntimeOutput &, Error &);
+// Читает RuntimeFFmpeg с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, RuntimeFFmpeg &, Error &);
+// Читает RuntimeSession с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, RuntimeSession &, Error &);
+// Читает Anchor с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Anchor &, Error &);
+// Читает SessionMetrics с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, SessionMetrics &, Error &);
+// Читает RuntimeEvent с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, RuntimeEvent &, Error &);
+// Читает NVENC с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, NVENC &, Error &);
+// Читает SVTAV1 с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, SVTAV1 &, Error &);
+// Читает Encoding с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Encoding &, Error &);
+// Читает GroupProfile с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, GroupProfile &, Error &);
+// Читает Profile с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Profile &, Error &);
+// Читает GroupSnapshot с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, GroupSnapshot &, Error &);
+// Читает Session с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Session &, Error &);
+// Читает Output с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Output &, Error &);
+// Читает Variant с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Variant &, Error &);
+// Читает Health с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Health &, Error &);
+// Читает Capability с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Capability &, Error &);
+// Читает Capabilities с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Capabilities &, Error &);
+// Читает PolicyResult с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, PolicyResult &, Error &);
+// Читает OutputDetail с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, OutputDetail &, Error &);
+// Читает Problem с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Problem &, Error &);
 // Читает только location/message ошибки поля; серверное value намеренно игнорируется.
-bool fromJson(const QJsonValue &, FieldError &, Error &);
-bool fromJson(const QJsonValue &, Preparation &, Error &);
-template<class T> bool fromJson(const QJsonValue &json, JsonField<T> &value, Error &error)
+// Читает FieldError с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, FieldError &, Error &);
+// Читает Preparation с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, Preparation &, Error &);
+// Различает отсутствующее поле, null и значение, не материализуя значения по умолчанию.
+template<class T> bool fromJson(const JsonValue &json, JsonField<T> &value, Error &error)
 {
 	// Физическое содержимое value не заменяет признак состояния; читать его можно только при FieldState::Value.
 	if (json.isUndefined()) {
@@ -111,16 +182,18 @@ template<class T> bool fromJson(const QJsonValue &json, JsonField<T> &value, Err
 }
 // Контейнер очищается и наполняется заново. Ошибка элемента оставляет разобранный префикс,
 // поэтому прямой вызов не обладает гарантией «старое значение или полностью новое».
-template<class T> bool fromJson(const QJsonValue &json, QVector<T> &value, Error &error)
+template<class T> bool fromJson(const JsonValue &json, QVector<T> &value, Error &error)
 {
 	if (!json.isArray()) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
-	const auto array = json.toArray();
+	// array заимствует проверенный массив; entry задаёт очередной элемент.
+	const auto &array = json.toArray();
 	value.clear();
 	value.reserve(array.size());
 	for (const auto &entry : array) {
+		// item не выдаётся вызывающей стороне до полного чтения элемента.
 		T item{};
 		if (!fromJson(entry, item, error))
 			return false;
@@ -128,14 +201,17 @@ template<class T> bool fromJson(const QJsonValue &json, QVector<T> &value, Error
 	}
 	return true;
 }
-bool fromJson(const QJsonValue &, QMap<QString, quint64> &, Error &);
-template<class T> bool fromJson(const QJsonValue &json, Page<T> &value, Error &error)
+// Читает QMap<QString, quint64> с проверкой JSON-типа; при несовместимом поле возвращает false и Error.
+bool fromJson(const JsonValue &, QMap<QString, quint64> &, Error &);
+// Читает массив элементов и непрозрачный курсор страницы; ошибка элемента отвергает страницу.
+template<class T> bool fromJson(const JsonValue &json, Page<T> &value, Error &error)
 {
 	if (!json.isObject()) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
-	const auto object = json.toObject();
+	// object заимствует проверенную оболочку страницы.
+	const auto &object = json.toObject();
 	return fromJson(object.value(QStringLiteral("items")), value.items, error) &&
 	       fromJson(object.value(QStringLiteral("next_cursor")), value.nextCursor, error);
 }
@@ -143,16 +219,15 @@ template<class T> bool fromJson(const QJsonValue &json, Page<T> &value, Error &e
 // транспорт/вызывающая сторона обязаны применить свой бюджет до разбора.
 template<class T> Result<T> decode(const QByteArray &body)
 {
-	// Новый объект публикуется только после полного разбора; частично заполненные поля наружу не выдаются.
+	// error содержит исходную Decode-классификацию до уточнения конкретной ошибкой поля.
 	Error error = makeError(ErrorKind::Decode);
-	if (!body.isValidUtf8())
+	// document содержит типизированное дерево с исходными числовыми лексемами.
+	JsonValue document;
+	if (!parseJson(body, document) || !document.isObject())
 		return Result<T>::failure(error);
-	QJsonParseError parseError;
-	const auto document = QJsonDocument::fromJson(body, &parseError);
-	if (parseError.error != QJsonParseError::NoError || !document.isObject())
-		return Result<T>::failure(error);
+	// value заполняется локально, чтобы частичная ошибка не публиковала неполный DTO.
 	T value{};
-	if (!fromJson(document.object(), value, error))
+	if (!fromJson(document, value, error))
 		return Result<T>::failure(error);
 	return Result<T>::success(std::move(value));
 }

@@ -1,6 +1,6 @@
 #include "profile-editor.hpp"
+#include "api/profile-rules.hpp"
 
-#include <QCheckBox>
 #include <QComboBox>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -15,6 +15,7 @@
 #include <QToolButton>
 #include <QToolTip>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <limits>
 #include <type_traits>
 #include <variant>
@@ -52,31 +53,77 @@ QString bitrateText(quint64 bits)
 	return result;
 }
 
-// Разбирает кбит/с без double; допускает точку или запятую и до трёх знаков, проверяет uint64 до умножения.
+// Разбирает точные кбит/с с точкой либо запятой; лишние дробные нули допустимы, округления нет.
 bool parseBitrate(const QString &text, quint64 &bits)
 {
 	// match отделяет целую часть от тысячных кбит/с и отвергает знаки, экспоненты и округление.
-	const auto match = QRegularExpression(QStringLiteral("^(0|[1-9][0-9]*)(?:[.,]([0-9]{1,3}))?$")).match(text);
+	const auto match = QRegularExpression(QStringLiteral("^(0|[1-9][0-9]*)(?:[.,]([0-9]{1,3}0*))?$")).match(text);
 	if (!match.hasMatch())
 		return false;
 	// ok подтверждает представимость целой части; whole и fraction измеряются в кбит/с и бит/с соответственно.
 	bool ok = false;
 	const auto whole = match.captured(1).toULongLong(&ok);
-	const auto fraction = match.captured(2).leftJustified(3, QLatin1Char('0')).toUInt();
+	const auto fraction = match.captured(2).left(3).leftJustified(3, QLatin1Char('0')).toUInt();
 	if (!ok || whole > (std::numeric_limits<quint64>::max() - fraction) / 1000)
 		return false;
 	bits = whole * 1000 + fraction;
 	return true;
 }
 
-// Создаёт конечный целочисленный каталог first..last для документированных параметров кодировщика.
-QStringList integerOptions(int first, int last)
+// Сопоставляет внутренние имена виджетов публичным путям общего каталога профиля.
+QString wirePath(const QString &path)
 {
-	// result содержит точные строки API; value последовательно проходит разрешённые целые.
-	QStringList result;
-	for (int value = first; value <= last; ++value)
-		result.append(QString::number(value));
-	return result;
+	// aliases сохраняет привычные objectName, не вводя вторую таблицу допустимых значений.
+	static const QMap<QString, QString> aliases{
+		{QStringLiteral("audio.sample_rate"), QStringLiteral("format.audio.sample_rate_hz")},
+		{QStringLiteral("video.target"), QStringLiteral("video_encoding.target_bitrate_bps")},
+		{QStringLiteral("video.maximum"), QStringLiteral("video_encoding.max_bitrate_bps")},
+		{QStringLiteral("video.buffer"), QStringLiteral("video_encoding.buffer_bits")},
+		{QStringLiteral("video.gop"), QStringLiteral("video_encoding.gop_frames")},
+		{QStringLiteral("video.b_frames"), QStringLiteral("video_encoding.max_b_frames")},
+		{QStringLiteral("video.closed_gop"), QStringLiteral("video_encoding.closed_gop")},
+		{QStringLiteral("audio.bitrate"), QStringLiteral("audio_encoding.bitrate_bps")},
+		{QStringLiteral("encoding.rescale"), QStringLiteral("encoding.rescale_output")},
+		{QStringLiteral("nvenc.lookahead"), QStringLiteral("encoding.nvenc.lookahead_frames")},
+		{QStringLiteral("nvenc.spatial"), QStringLiteral("encoding.nvenc.enable_spatial_aq")},
+		{QStringLiteral("nvenc.temporal"), QStringLiteral("encoding.nvenc.enable_temporal_aq")},
+		{QStringLiteral("nvenc.strength"), QStringLiteral("encoding.nvenc.aq_strength")},
+		{QStringLiteral("svt.aq"), QStringLiteral("encoding.svt_av1.aq_mode")},
+		{QStringLiteral("svt.lookahead"), QStringLiteral("encoding.svt_av1.lookahead_frames")}};
+	if (aliases.contains(path))
+		return aliases.value(path);
+	if (path.startsWith(QStringLiteral("video.")) || path.startsWith(QStringLiteral("audio.")))
+		return QStringLiteral("format.") + path;
+	if (path.startsWith(QStringLiteral("nvenc.")))
+		return QStringLiteral("encoding.") + path;
+	if (path.startsWith(QStringLiteral("svt.")))
+		return QStringLiteral("encoding.svt_av1.") + path.mid(4);
+	if (path.startsWith(QStringLiteral("custom.")))
+		return (path == QStringLiteral("custom.aac_coder") ? QStringLiteral("encoding.audio_custom.")
+								   : QStringLiteral("encoding.video_custom.")) +
+		       path.mid(7);
+	return path;
+}
+
+// Возвращает точный CRF в сотых; дробная строка никогда не проходит через double.
+QString crfText(int hundredths)
+{
+	return QStringLiteral("%1.%2").arg(hundredths / 100).arg(hundredths % 100, 2, 10, QLatin1Char('0'));
+}
+
+// Проверяет десятичный CRF с точкой либо запятой; лишние дробные нули не меняют точные сотые.
+bool parseCrf(const QString &text, int &hundredths)
+{
+	// match разделяет целую и дробную части; ok подтверждает диапазон промежуточного целого.
+	const auto match = QRegularExpression(QStringLiteral("^(0|[1-9][0-9]*)(?:[.,]([0-9]{1,2}0*))?$")).match(text);
+	bool ok = false;
+	// whole и fraction измеряются соответственно в единицах CRF и сотых.
+	const auto whole = match.captured(1).toULongLong(&ok);
+	const auto fraction = match.captured(2).left(2).leftJustified(2, QLatin1Char('0')).toUInt();
+	if (!match.hasMatch() || !ok || whole > (quint64(std::numeric_limits<int>::max()) - fraction) / 100)
+		return false;
+	hundredths = int(whole * 100 + fraction);
+	return true;
 }
 
 // Возвращает полный проверенный профиль владельца; index выбирает H.264 1080p60, H.264 1440p60 либо AV1 1440p60.
@@ -110,15 +157,10 @@ api::GroupProfile basePreset(int index)
 	profile.videoEncoding = {target, target, target * 2, 120, 0, true};
 	profile.audioEncoding = {160000};
 	profile.encoding.state = api::FieldState::Value;
-	profile.encoding.value = {2,
-				  av1 ? QStringLiteral("libsvtav1") : QStringLiteral("h264_nvenc"),
-				  QStringLiteral("aac"),
-				  QStringLiteral("cbr"),
-				  !av1,
-				  {},
-				  {},
-				  {},
-				  {}};
+	profile.encoding.value.videoEncoder = av1 ? QStringLiteral("libsvtav1") : QStringLiteral("h264_nvenc");
+	profile.encoding.value.audioEncoder = QStringLiteral("aac");
+	profile.encoding.value.rateControl = QStringLiteral("cbr");
+	profile.encoding.value.rescaleOutput = !av1;
 	if (av1)
 		profile.encoding.value.svtAv1 = {api::FieldState::Value, {8, QStringLiteral("psnr"), 2, 0}};
 	else
@@ -128,8 +170,8 @@ api::GroupProfile basePreset(int index)
 	return profile;
 }
 
-// Выбирает data в закрытом списке; неизвестное значение остаётся отдельным пунктом с точными байтами/строкой.
-void selectValue(QComboBox *combo, const QVariant &data, const QString &unknownLabel)
+// Выбирает data; неизвестный пункт сохраняет исходное значение и по умолчанию недоступен для выбора.
+void selectValue(QComboBox *combo, const QVariant &data, const QString &unknownLabel, bool disabled = true)
 {
 	// index адресует точное itemData, а не локализованную подпись.
 	int index = combo->findData(data);
@@ -137,6 +179,10 @@ void selectValue(QComboBox *combo, const QVariant &data, const QString &unknownL
 		combo->addItem(unknownLabel, data);
 		index = combo->count() - 1;
 		combo->setItemData(index, true, Qt::UserRole + 1);
+		// model предоставляет флаги только добавленного исходного значения.
+		if (disabled)
+			if (auto *model = qobject_cast<QStandardItemModel *>(combo->model()))
+				model->item(index)->setEnabled(false);
 	}
 	combo->setCurrentIndex(index);
 }
@@ -150,7 +196,9 @@ void clearUnknownValues(QComboBox *combo)
 			combo->removeItem(index);
 }
 
-// Заменяет одну разрешённую пару key=value в source, сохраняя остальные серверные токены.
+// Возвращает строку с заменённой или удалённой парой key=value. Известные пары сортируются для валидатора,
+// а неизвестные либо повреждённые токены остаются в исходном порядке до явной очистки.
+// source — исходная строка, key — имя изменяемой опции, value — новое значение или пустота для удаления.
 QString replaceCustomOption(const QString &source, const QString &key, const QString &value)
 {
 	// pairs сохраняет все незатронутые опции; pair проходит токены серверного ASCII-space представления.
@@ -160,7 +208,43 @@ QString replaceCustomOption(const QString &source, const QString &key, const QSt
 			pairs.append(pair);
 	if (!value.isEmpty())
 		pairs.append(key + QLatin1Char('=') + value);
+	// audio выбирает допустимое имя для дорожки, а onlyKnown разрешает сортировку без изменения неизвестного ввода.
+	const bool audio = key == QStringLiteral("aac_coder");
+	bool onlyKnown = true;
+	// pair проверяет один оставленный токен, optionName — его имя до знака равенства.
+	for (const auto &pair : pairs) {
+		// separator указывает единственный знак равенства в проверяемой паре.
+		const auto separator = pair.indexOf(QLatin1Char('='));
+		const auto optionName = pair.section(QLatin1Char('='), 0, 0);
+		if (separator <= 0 || pair.indexOf(QLatin1Char('='), separator + 1) >= 0 ||
+		    (audio ? optionName != QStringLiteral("aac_coder")
+			   : (optionName != QStringLiteral("nonref_p") && optionName != QStringLiteral("strict_gop") &&
+			      optionName != QStringLiteral("lp")))) {
+			onlyKnown = false;
+			break;
+		}
+	}
+	if (onlyKnown)
+		std::sort(pairs.begin(), pairs.end());
 	return pairs.join(QLatin1Char(' '));
+}
+
+// Оставляет только именованные пары, для которых в форме есть отдельный контрол соответствующей дорожки.
+// Значения известных параметров не исправляет: их допустимость проверяет общий каталог.
+QString knownCustomOptions(const QString &source, bool audio)
+{
+	// result сохраняет известные пары в исходном порядке, pair обозначает один токен исходной строки.
+	QStringList result;
+	for (const auto &pair : source.split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
+		// key адресует уже существующий именованный контрол и не расширяет каталог значений.
+		const auto key = pair.section(QLatin1Char('='), 0, 0);
+		if (pair.indexOf(QLatin1Char('=')) > 0 &&
+		    ((audio && key == QStringLiteral("aac_coder")) ||
+		     (!audio && (key == QStringLiteral("nonref_p") || key == QStringLiteral("strict_gop") ||
+				 key == QStringLiteral("lp")))))
+			result.append(pair);
+	}
+	return result.join(QLatin1Char(' '));
 }
 
 // Возвращает адрес известного поля p по точному имени path; список соответствует полной форме профиля.
@@ -230,6 +314,10 @@ ProfileValue profileValue(api::GroupProfile &p, const QString &path)
 		return &p.encoding.value.rateControl;
 	if (path == QStringLiteral("encoding.rescale"))
 		return &p.encoding.value.rescaleOutput;
+	if (path == QStringLiteral("encoding.qp"))
+		return &p.encoding.value.qp.value;
+	if (path == QStringLiteral("encoding.crf"))
+		return &p.encoding.value.crfHundredths.value;
 	if (path == QStringLiteral("nvenc.preset"))
 		return &p.encoding.value.nvenc.value.preset;
 	if (path == QStringLiteral("nvenc.tuning"))
@@ -254,8 +342,8 @@ ProfileValue profileValue(api::GroupProfile &p, const QString &path)
 }
 } // namespace
 
-/** Привязывает элементы формы к известным полям DTO. Исходный профиль копируется,
- * поэтому неизменённый текст не восстанавливается из QString и не теряет байты. */
+/** Привязывает структурный ввод к полям полного профиля. Каталоги и применимость
+ * получает из profile-rules; исходный документ и неприменимый ввод остаются в RAM. */
 class ProfileEditor::Impl {
 public:
 	// Описание одного ввода; не владеет QObject-элементами, принадлежащими внешнему виджету.
@@ -266,21 +354,23 @@ public:
 		// input содержит строку, выбор либо флаг; bytes отличает точный QByteArray в itemData от строковых чисел.
 		QWidget *input = nullptr;
 		bool bytes = false;
+		// finite отличает закрытый каталог от ввода числового диапазона.
+		bool finite = false;
 		// caption показывает зависимую от copy/transcode подпись, не меняя самого значения.
 		QLabel *caption = nullptr;
 	};
 	// Создаёт разделы и привязки; owner и text задают QObject-контекст и перевод подписей.
 	// nameInput, если передан, размещается перед параметрами в общей колонке ввода.
 	Impl(ProfileEditor &owner, TextLookup text, QWidget *nameInput);
-	// Добавляет в form поле DTO path с переводом подписи label; options задаёт закрытый список.
-	// bytes хранит ProfileText как QByteArray, boolean выбирает флажок вместо строки или списка.
-	void add(QFormLayout *form, const char *path, const char *label, const QStringList &options = {},
-		 bool bytes = false, bool boolean = false);
+	// Добавляет поле path с подписью label; finite/boolean выбирают закрытый каталог общего модуля.
+	// bytes сохраняет ProfileText как QByteArray в itemData.
+	void add(QFormLayout *form, const char *path, const char *label, bool finite = false, bool bytes = false,
+		 bool boolean = false);
 	// Добавляет локализованную группу формы к общему layout.
 	QFormLayout *section(QVBoxLayout *layout, const char *title);
 	// Регистрирует явное изменение path и уведомляет внешний виджет, кроме периода отражения DTO.
 	void touch(const QString &path);
-	// Устанавливает доступность применимых блоков, не меняя скрытую обработку LIVE AAC.
+	// Пересчитывает конечные каталоги и применимость, сохраняя видимые несовместимые исходные значения.
 	void updateApplicability();
 	// Меняет разрешённые пункты path, сохраняя текущий выбор как отдельное исходное значение.
 	void choices(const QString &path, const QStringList &options);
@@ -311,14 +401,17 @@ public:
 	QWidget *advancedContent_ = nullptr;
 	// bitrateHelp_ показывает текущие основной и максимальный видеобитрейты без изменения черновика.
 	QToolButton *bitrateHelp_ = nullptr;
-	// recipe_ различает Missing/null/v2; nvenc_ и svt_ включают явные необязательные подблоки.
-	QComboBox *recipe_ = nullptr;
-	QCheckBox *nvenc_ = nullptr;
-	QCheckBox *svt_ = nullptr;
+	// Читает проекцию формы; strict требует корректного применимого ввода, мягкий режим нужен каталогам.
+	bool project(api::GroupProfile &profile, QString &error, bool strict) const;
 	// custom_ хранит только разрешённые отдельные параметры; исходные строки сохраняются до их изменения.
 	QMap<QString, QComboBox *> custom_;
+	// sourceCustom_ показывает неподдерживаемую исходную строку и требует явного удаления лишних пар.
+	QMap<QString, QComboBox *> sourceCustom_;
+	// sourceCaptions_ скрывает подписи вместе с отсутствующими неподдерживаемыми исходными параметрами.
+	QMap<QString, QLabel *> sourceCaptions_;
 };
 
+// Создаёт дочерний раздел и возвращает форму для его связанных параметров.
 QFormLayout *ProfileEditor::Impl::section(QVBoxLayout *layout, const char *title)
 {
 	// group объединяет связанные параметры; form передаётся помощнику создания отдельных полей.
@@ -330,36 +423,26 @@ QFormLayout *ProfileEditor::Impl::section(QVBoxLayout *layout, const char *title
 	return form;
 }
 
-void ProfileEditor::Impl::add(QFormLayout *form, const char *path, const char *label, const QStringList &options,
-			      bool bytes, bool boolean)
+// Создаёт ввод диапазона либо закрытый список, сохраняя техническое имя поля и пользовательское намерение.
+void ProfileEditor::Impl::add(QFormLayout *form, const char *path, const char *label, bool finite, bool bytes,
+			      bool boolean)
 {
 	// field содержит адрес DTO, подпись и созданный ввод этой строки.
-	Field field{QString::fromLatin1(path), text_(label), nullptr, bytes};
-	if (boolean) {
-		// check отражает булево значение; обработчик отмечает только явное переключение пользователя.
-		auto *check = new QCheckBox(&owner_);
-		field.input = check;
-		QObject::connect(check, &QCheckBox::toggled, &owner_,
-				 [this, path] { touch(QString::fromLatin1(path)); });
-	} else if (bytes || !options.isEmpty()) {
-		// combo хранит точное API-значение в itemData; неизвестное исходное значение добавляется при загрузке.
+	Field field{QString::fromLatin1(path), text_(label), nullptr, bytes, finite || boolean};
+	if (field.finite) {
+		// combo получает каталог только из profile-rules; исходный выбор устанавливается отдельно.
 		auto *combo = new QComboBox(&owner_);
-		combo->addItem(text_(bytes ? "Profile.Unspecified" : "Editor.Choose"),
-			       bytes ? QVariant(QByteArray{}) : QVariant(QString{}));
-		// option содержит один документированный вариант, используемый без нормализации.
-		for (const auto &option : options)
-			if (!option.isEmpty())
-				combo->addItem(optionLabel(field.path, option),
-					       bytes ? QVariant(option.toUtf8()) : QVariant(option));
+		combo->setEditable(false);
 		field.input = combo;
-		// activated возникает только после пользовательского выбора, а не setCurrentIndex.
+		// Обработчик activated отмечает явную замену, а отражение DTO не меняет черновик.
 		QObject::connect(combo, &QComboBox::activated, &owner_,
 				 [this, path] { touch(QString::fromLatin1(path)); });
 	} else {
-		// line сохраняет полный текст, в том числе точные десятичные uint64; обработчик не обрабатывает setText.
+		// line хранит точный ввод диапазона, в том числе незавершённую десятичную строку.
 		auto *line = new QLineEdit(&owner_);
 		line->setMaxLength(std::numeric_limits<int>::max());
 		field.input = line;
+		// Обработчик textEdited сохраняет пользовательское намерение без реакции на setText.
 		QObject::connect(line, &QLineEdit::textEdited, &owner_,
 				 [this, path] { touch(QString::fromLatin1(path)); });
 	}
@@ -397,6 +480,7 @@ void ProfileEditor::Impl::add(QFormLayout *form, const char *path, const char *l
 	fields_.push_back(std::move(field));
 }
 
+// Создаёт основную форму и свёрнутый расширенный раздел; обработчики не выполняют HTTP.
 ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text, QWidget *nameInput)
 	: owner_(owner),
 	  text_(std::move(text))
@@ -425,10 +509,8 @@ ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text, QWidget *nameIn
 		preset_->setCurrentIndex(index);
 		emit owner_.changed();
 	});
-	add(basics, "mode", "Profile.VideoMode", {QStringLiteral("copy"), QStringLiteral("transcode")});
-	add(basics, "video.codec", "Profile.Codec", {QStringLiteral("h264"), QStringLiteral("av1")});
-	qobject_cast<QComboBox *>(input(QStringLiteral("video.codec")))->setItemText(1, QStringLiteral("H.264"));
-	qobject_cast<QComboBox *>(input(QStringLiteral("video.codec")))->setItemText(2, QStringLiteral("AV1"));
+	add(basics, "mode", "Profile.VideoMode", true, false, false);
+	add(basics, "video.codec", "Profile.Codec", true, false, false);
 	resolution_ = new QComboBox(&owner_);
 	resolution_->setObjectName(QStringLiteral("video.resolution"));
 	resolution_->setEditable(true);
@@ -462,16 +544,9 @@ ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text, QWidget *nameIn
 	basics->addRow(text_("Profile.Fps"), fps_);
 	// Только activated отмечает намерение заменить частоту, сохраняя нестандартное исходное отношение до выбора.
 	QObject::connect(fps_, &QComboBox::activated, &owner_, [this] { touch(QStringLiteral("video.fps")); });
-	add(basics, "video.target", "Profile.TargetBitrate");
-	add(basics, "live_audio_mode", "Profile.LiveAudio", {QStringLiteral("copy"), QStringLiteral("transcode")});
-	add(basics, "audio.bitrate", "Profile.AudioBitrate");
-	qobject_cast<QComboBox *>(input(QStringLiteral("mode")))->setItemText(1, text_("Profile.CopyVideo"));
-	qobject_cast<QComboBox *>(input(QStringLiteral("mode")))->setItemText(2, text_("Profile.TranscodeVideo"));
-	qobject_cast<QComboBox *>(input(QStringLiteral("live_audio_mode")))->setItemText(1, text_("Profile.CopyAudio"));
-	qobject_cast<QComboBox *>(input(QStringLiteral("live_audio_mode")))
-		->setItemText(2, text_("Profile.TranscodeAudio"));
-	qobject_cast<QComboBox *>(input(QStringLiteral("live_audio_mode")))
-		->setItemText(0, text_("Profile.LegacyAudio"));
+	add(basics, "video.target", "Profile.TargetBitrate", false, false, false);
+	add(basics, "live_audio_mode", "Profile.LiveAudio", true, false, false);
+	add(basics, "audio.bitrate", "Profile.AudioBitrate", false, false, false);
 	// notice поясняет применимость битрейта аудио и независимость текущего Output от редактирования.
 	auto *notice = new QLabel(text_("Profile.AudioNotice"), &owner_);
 	notice->setTextFormat(Qt::PlainText);
@@ -498,113 +573,92 @@ ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text, QWidget *nameIn
 	});
 	// video содержит весь ожидаемый видеоформат, включая цвет и точные ProfileText.
 	auto *video = section(advancedLayout, "Profile.VideoFormat");
-	add(video, "video.codec_profile", "Profile.CodecProfile", {}, true);
-	add(video, "video.level", "Profile.Level", {}, true);
-	add(video, "video.tier", "Profile.Tier", {}, true);
-	add(video, "video.pixel_format", "Profile.PixelFormat", {QStringLiteral("yuv420p")}, true);
-	add(video, "video.bit_depth", "Profile.BitDepth", {QStringLiteral("8")});
-	add(video, "video.color.range", "Profile.ColorRange",
-	    {QStringLiteral("limited"), QStringLiteral("full"), QStringLiteral("tv"), QStringLiteral("pc")}, true);
-	add(video, "video.color.primaries", "Profile.ColorPrimaries", {QStringLiteral("bt709")}, true);
-	add(video, "video.color.transfer", "Profile.ColorTransfer", {QStringLiteral("bt709")}, true);
-	add(video, "video.color.matrix", "Profile.ColorMatrix", {QStringLiteral("bt709")}, true);
-	// audio содержит ожидаемые параметры AAC, а не измеренные характеристики текущего LIVE.
+	add(video, "video.codec_profile", "Profile.CodecProfile", true, true, false);
+	add(video, "video.level", "Profile.Level", true, true, false);
+	add(video, "video.tier", "Profile.Tier", true, true, false);
+	add(video, "video.pixel_format", "Profile.PixelFormat", true, true, false);
+	add(video, "video.bit_depth", "Profile.BitDepth", true, false, false);
+	add(video, "video.color.range", "Profile.ColorRange", true, true, false);
+	add(video, "video.color.primaries", "Profile.ColorPrimaries", true, true, false);
+	add(video, "video.color.transfer", "Profile.ColorTransfer", true, true, false);
+	add(video, "video.color.matrix", "Profile.ColorMatrix", true, true, false);
+	// audio содержит ожидаемый аудиоформат, а не измерения текущего LIVE.
 	auto *audio = section(advancedLayout, "Profile.AudioFormat");
-	add(audio, "audio.codec", "Profile.Codec", {QStringLiteral("aac")});
-	add(audio, "audio.codec_profile", "Profile.CodecProfile", {QStringLiteral("LC")}, true);
-	add(audio, "audio.sample_rate", "Profile.SampleRate",
-	    {QStringLiteral("7350"), QStringLiteral("8000"), QStringLiteral("11025"), QStringLiteral("12000"),
-	     QStringLiteral("16000"), QStringLiteral("22050"), QStringLiteral("24000"), QStringLiteral("32000"),
-	     QStringLiteral("44100"), QStringLiteral("48000"), QStringLiteral("64000")});
-	add(audio, "audio.channels", "Profile.Channels", {QStringLiteral("1"), QStringLiteral("2")});
-	add(audio, "audio.channel_layout", "Profile.ChannelLayout", {}, true);
+	add(audio, "audio.codec", "Profile.Codec", true, false, false);
+	add(audio, "audio.codec_profile", "Profile.CodecProfile", true, true, false);
+	add(audio, "audio.sample_rate", "Profile.SampleRate", true, false, false);
+	add(audio, "audio.channels", "Profile.Channels", true, false, false);
+	add(audio, "audio.channel_layout", "Profile.ChannelLayout", true, true, false);
 	// rates содержит точные числа рецепта: биты/с, биты и количество кадров.
 	auto *rates = section(advancedLayout, "Profile.Bitrates");
-	add(rates, "video.maximum", "Profile.MaxBitrate");
-	add(rates, "video.buffer", "Profile.Buffer");
-	add(rates, "video.gop", "Profile.Gop");
-	add(rates, "video.b_frames", "Profile.BFrames", integerOptions(0, 4));
-	add(rates, "video.closed_gop", "Profile.ClosedGop", {}, false, true);
-	// encoding содержит выбор прежнего рецепта или явного v2 и его общие поля.
+	add(rates, "video.maximum", "Profile.MaxBitrate", false, false, false);
+	add(rates, "video.buffer", "Profile.Buffer", false, false, false);
+	add(rates, "video.gop", "Profile.Gop", false, false, false);
+	add(rates, "video.b_frames", "Profile.BFrames", true, false, false);
+	add(rates, "video.closed_gop", "Profile.ClosedGop", true, false, true);
+	// encoding содержит полный явный рецепт без выбора версии или присутствия.
 	auto *encoding = section(advancedLayout, "Profile.Encoding");
-	recipe_ = new QComboBox(&owner_);
-	recipe_->setObjectName(QStringLiteral("encodingPresence"));
-	recipe_->addItem(text_("Profile.EncodingMissing"), 0);
-	recipe_->addItem(text_("Profile.EncodingNull"), 1);
-	recipe_->addItem(text_("Profile.EncodingV2"), 2);
-	encoding->addRow(text_("Profile.Recipe"), recipe_);
-	// Переключение рецепта отмечается отдельно от полей; удаление сохранённого v2 отвергается при чтении.
-	QObject::connect(recipe_, &QComboBox::activated, &owner_, [this] { touch(QStringLiteral("encoding")); });
-	add(encoding, "encoding.video_encoder", "Profile.VideoEncoder",
-	    {QStringLiteral("h264_nvenc"), QStringLiteral("libsvtav1")});
-	add(encoding, "encoding.audio_encoder", "Profile.AudioEncoder", {QStringLiteral("aac")});
-	add(encoding, "encoding.rate_control", "Profile.RateControl", {QStringLiteral("cbr"), QStringLiteral("vbr")});
-	add(encoding, "encoding.rescale", "Profile.Rescale", {}, false, true);
-	// nvenc содержит только документированные настройки h264_nvenc.
+	add(encoding, "encoding.video_encoder", "Profile.VideoEncoder", true, false, false);
+	add(encoding, "encoding.audio_encoder", "Profile.AudioEncoder", true, false, false);
+	add(encoding, "encoding.rate_control", "Profile.RateControl", true, false, false);
+	add(encoding, "encoding.qp", "Profile.Qp");
+	add(encoding, "encoding.crf", "Profile.Crf");
+	add(encoding, "encoding.rescale", "Profile.Rescale", true, false, true);
+	// nvenc содержит конечные параметры применимых кодировщиков NVENC.
 	auto *nvenc = section(advancedLayout, "Profile.Nvenc");
-	nvenc_ = new QCheckBox(text_("Profile.IncludeNvenc"), &owner_);
-	nvenc_->setObjectName(QStringLiteral("includeNvenc"));
-	nvenc->addRow(nvenc_);
-	// Пользователь явно включает/удаляет необязательный NVENC-блок.
-	QObject::connect(nvenc_, &QCheckBox::clicked, &owner_, [this] { touch(QStringLiteral("nvenc")); });
-	add(nvenc, "nvenc.preset", "Profile.Preset",
-	    {QStringLiteral("p1"), QStringLiteral("p2"), QStringLiteral("p3"), QStringLiteral("p4"),
-	     QStringLiteral("p5"), QStringLiteral("p6"), QStringLiteral("p7")});
-	add(nvenc, "nvenc.tuning", "Profile.Tuning",
-	    {QStringLiteral("hq"), QStringLiteral("ll"), QStringLiteral("ull")});
-	add(nvenc, "nvenc.multipass", "Profile.Multipass",
-	    {QStringLiteral("disabled"), QStringLiteral("qres"), QStringLiteral("fullres")});
-	add(nvenc, "nvenc.lookahead", "Profile.Lookahead", integerOptions(0, 31));
-	add(nvenc, "nvenc.spatial", "Profile.SpatialAq", {}, false, true);
-	add(nvenc, "nvenc.temporal", "Profile.TemporalAq", {}, false, true);
-	add(nvenc, "nvenc.strength", "Profile.AqStrength", integerOptions(1, 15));
+	add(nvenc, "nvenc.preset", "Profile.Preset", true, false, false);
+	add(nvenc, "nvenc.tuning", "Profile.Tuning", true, false, false);
+	add(nvenc, "nvenc.multipass", "Profile.Multipass", true, false, false);
+	add(nvenc, "nvenc.lookahead", "Profile.Lookahead", true, false, false);
+	add(nvenc, "nvenc.spatial", "Profile.SpatialAq", true, false, true);
+	add(nvenc, "nvenc.temporal", "Profile.TemporalAq", true, false, true);
+	add(nvenc, "nvenc.strength", "Profile.AqStrength", true, false, false);
 	// svt содержит настройки AV1-рецепта заглушки и не включает перекодирование основного copy-потока.
 	auto *svt = section(advancedLayout, "Profile.Svt");
-	svt_ = new QCheckBox(text_("Profile.IncludeSvt"), &owner_);
-	svt_->setObjectName(QStringLiteral("includeSvt"));
-	svt->addRow(svt_);
-	// Пользователь явно включает/удаляет необязательный блок SVT-AV1.
-	QObject::connect(svt_, &QCheckBox::clicked, &owner_, [this] { touch(QStringLiteral("svt")); });
-	add(svt, "svt.preset", "Profile.Preset", integerOptions(0, 13));
-	add(svt, "svt.tuning", "Profile.Tuning", {QStringLiteral("psnr"), QStringLiteral("vq")});
-	add(svt, "svt.aq", "Profile.AqMode", {QStringLiteral("2")});
-	add(svt, "svt.lookahead", "Profile.Lookahead", {QStringLiteral("0")});
+	add(svt, "svt.preset", "Profile.Preset", true, false, false);
+	add(svt, "svt.tuning", "Profile.Tuning", true, false, false);
+	add(svt, "svt.aq", "Profile.AqMode", true, false, false);
+	add(svt, "svt.lookahead", "Profile.Lookahead", true, false, false);
 	// custom содержит отдельные разрешённые API-пары вместо произвольной командной строки.
 	auto *custom = section(advancedLayout, "Profile.Custom");
-	// key проходит точные имена разрешённых параметров; options содержит допустимые значения текущей опции.
+	// key адресует разрешённую API-пару; её каталог и применимость определяет общий модуль.
 	for (const auto &key : {QStringLiteral("nonref_p"), QStringLiteral("strict_gop"), QStringLiteral("lp"),
 				QStringLiteral("aac_coder")}) {
-		QStringList options = key == QStringLiteral("aac_coder")
-					      ? QStringList{QStringLiteral("twoloop"), QStringLiteral("fast")}
-				      : key == QStringLiteral("lp")
-					      ? QStringList{QStringLiteral("0"), QStringLiteral("1"),
-							    QStringLiteral("2"), QStringLiteral("3"),
-							    QStringLiteral("4"), QStringLiteral("5"),
-							    QStringLiteral("6")}
-					      : QStringList{QStringLiteral("0"), QStringLiteral("1")};
-		// combo хранит точное значение пары, пустой пункт означает отсутствие дополнительной опции.
+		// combo хранит только технические строки, без свободного CLI-ввода.
 		auto *combo = new QComboBox(&owner_);
 		combo->setObjectName(QStringLiteral("custom.") + key);
-		combo->addItem(text_("Profile.OptionAbsent"), QString{});
-		// option задаёт одно разрешённое значение; для булевых опций подпись объясняет 0/1.
-		for (const auto &option : options)
-			combo->addItem((key == QStringLiteral("nonref_p") || key == QStringLiteral("strict_gop"))
-					       ? text_(option == QStringLiteral("1") ? "Dialog.Yes" : "Dialog.No")
-					       : option,
-				       option);
+		combo->setEditable(false);
 		custom_[key] = combo;
 		custom->addRow(text_(key == QStringLiteral("nonref_p")     ? "Profile.CustomNonref"
 				     : key == QStringLiteral("strict_gop") ? "Profile.CustomStrictGop"
 				     : key == QStringLiteral("lp")         ? "Profile.CustomLp"
 									   : "Profile.CustomAacCoder"),
 			       combo);
-		// Обработчик сохраняет конкретное изменённое имя, чтобы незатронутую строку дополнительных параметров оставить побайтно прежней.
+		// Обработчик запоминает изменение одной пары, сохраняя незатронутые исходные опции.
 		QObject::connect(combo, &QComboBox::activated, &owner_,
 				 [this, key] { touch(QStringLiteral("custom.") + key); });
+	}
+	// track разделяет исходные дополнительные параметры видео и звука; новые строки здесь не вводятся.
+	for (const auto &track : {QStringLiteral("video"), QStringLiteral("audio")}) {
+		// combo предлагает только явное удаление неподдерживаемой части; caption подписывает исходную строку.
+		auto *combo = new QComboBox(&owner_);
+		auto *caption = new QLabel(text_(track == QStringLiteral("audio") ? "Profile.UnsupportedAudioOptions"
+										  : "Profile.UnsupportedVideoOptions"),
+					   &owner_);
+		combo->setObjectName(QStringLiteral("unsupportedCustom.") + track);
+		combo->setEditable(false);
+		caption->setBuddy(combo);
+		custom->addRow(caption, combo);
+		sourceCustom_[track] = combo;
+		sourceCaptions_[track] = caption;
+		// Обработчик отмечает явное решение удалить неизвестные пары; простая смена encoder их не удаляет.
+		QObject::connect(combo, &QComboBox::activated, &owner_,
+				 [this, track] { touch(QStringLiteral("custom_source.") + track); });
 	}
 	updateBitrateHelp();
 }
 
+// Возвращает заимствованный ввод по стабильному внутреннему имени поля.
 QWidget *ProfileEditor::Impl::input(const QString &path) const
 {
 	// field — очередная привязка известного поля структуры.
@@ -639,6 +693,7 @@ void ProfileEditor::Impl::showBitrateHelp()
 	QToolTip::showText(point, bitrateHelp_->toolTip(), bitrateHelp_);
 }
 
+// Отмечает одно пользовательское изменение и обновляет зависимости без подстановки значений.
 void ProfileEditor::Impl::touch(const QString &path)
 {
 	if (loading_)
@@ -653,11 +708,22 @@ QString ProfileEditor::Impl::optionLabel(const QString &path, const QString &val
 {
 	if (path == QStringLiteral("nvenc.preset"))
 		return text_((QStringLiteral("Profile.Option.NvencP") + value.mid(1)).toUtf8().constData());
-	if (path == QStringLiteral("audio.channels"))
+	if (path == QStringLiteral("audio.channels") && (value == QStringLiteral("1") || value == QStringLiteral("2")))
 		return text_(value == QStringLiteral("1") ? "Profile.Option.Mono" : "Profile.Option.Stereo") +
 		       QStringLiteral(" (%1)").arg(value);
 	if (path == QStringLiteral("svt.lookahead") && value == QStringLiteral("-1"))
 		return text_("Profile.Option.Auto");
+	if (value == QStringLiteral("true") || value == QStringLiteral("false"))
+		return text_(value == QStringLiteral("true") ? "Dialog.Yes" : "Dialog.No");
+	if (path == QStringLiteral("mode"))
+		return text_(value == QStringLiteral("copy") ? "Profile.CopyVideo" : "Profile.TranscodeVideo");
+	if (path == QStringLiteral("live_audio_mode"))
+		return text_(value == QStringLiteral("copy") ? "Profile.CopyAudio" : "Profile.TranscodeAudio");
+	if (value == QStringLiteral("h264") || value == QStringLiteral("hevc") || value == QStringLiteral("vp9") ||
+	    value == QStringLiteral("av1"))
+		return value == QStringLiteral("h264") ? QStringLiteral("H.264") : value.toUpper();
+	if (value == QStringLiteral("cqp") || value == QStringLiteral("crf"))
+		return value.toUpper();
 	if (value == QStringLiteral("h264_nvenc"))
 		return QStringLiteral("NVIDIA NVENC H.264");
 	if (value == QStringLiteral("libsvtav1"))
@@ -696,154 +762,77 @@ QString ProfileEditor::Impl::optionLabel(const QString &path, const QString &val
 // Перестраивает только каталог поля path; текущее значение сохраняется, даже если стало неприменимым.
 void ProfileEditor::Impl::choices(const QString &path, const QStringList &options)
 {
-	// field определяет тип itemData и текущее значение единственного обновляемого списка.
+	// field задаёт конечный список и тип его технических данных.
 	for (const auto &field : fields_) {
-		if (field.path != path)
+		if (field.path != path || !field.finite)
 			continue;
-		// combo содержит исходный выбор, selected сохраняет его на время перестройки.
+		// combo и selected сохраняют текущий выбор во время обновления каталога.
 		auto *combo = qobject_cast<QComboBox *>(field.input);
 		const auto selected = combo->currentData();
 		combo->clear();
-		combo->addItem(text_(field.bytes ? "Profile.Unspecified" : "Editor.Choose"),
-			       field.bytes ? QVariant(QByteArray{}) : QVariant(QString{}));
-		// option обозначает один подтверждённый сервером пункт текущего каталога.
+		// option — одно разрешённое API-значение; пустота добавляется только самим каталогом.
 		for (const auto &option : options)
-			if (!option.isEmpty())
-				combo->addItem(optionLabel(path, option),
-					       field.bytes ? QVariant(option.toUtf8()) : QVariant(option));
-		// display содержит исходное значение для подписи; двоичные байты обозначаются без потерь в itemData.
-		const auto display = field.bytes ? QString::fromUtf8(selected.toByteArray()) : selected.toString();
-		selectValue(combo, selected,
-			    field.bytes && display.toUtf8() != selected.toByteArray()
-				    ? text_("Profile.OpaqueValue")
-				    : text_("Profile.UnknownValue").arg(display));
+			combo->addItem(option.isEmpty() ? text_("Profile.Unspecified") : optionLabel(path, option),
+				       field.bytes ? QVariant(option.toUtf8()) : QVariant(option));
+		// data сохраняет незаполненный выбор; display содержит исходную строку для недоступного пункта.
+		const auto data = selected.isValid() ? selected
+				  : field.bytes      ? QVariant(QByteArray{})
+						     : QVariant(QString{});
+		const auto display = field.bytes ? QString::fromUtf8(data.toByteArray()) : data.toString();
+		selectValue(combo, data,
+			    display.isEmpty() ? text_("Editor.Choose") : text_("Profile.UnknownValue").arg(display));
 		return;
 	}
 }
 
-// Ограничивает доступные каталоги выбранными параметрами без подстановки новых значений в форму.
+// Получает актуальные каталоги из общей проекции, не исправляя пользовательский ввод.
 void ProfileEditor::Impl::updateApplicability()
 {
-	// v2 и encoder определяют применимость подблоков; явное audio не переключается вслед за видео.
-	const bool v2 = recipe_->currentData().toInt() == 2;
-	const auto encoder =
-		qobject_cast<QComboBox *>(input(QStringLiteral("encoding.video_encoder")))->currentData().toString();
-	// codec выбирает профиль/уровни/число B-кадров, rateControl — допустимый анализ SVT-AV1.
-	const auto codec = qobject_cast<QComboBox *>(input(QStringLiteral("video.codec")))->currentData().toString();
-	const auto rateControl =
-		qobject_cast<QComboBox *>(input(QStringLiteral("encoding.rate_control")))->currentData().toString();
-	choices(QStringLiteral("video.codec_profile"),
-		codec == QStringLiteral("h264")
-			? QStringList{QStringLiteral("baseline"), QStringLiteral("main"), QStringLiteral("high")}
-		: codec == QStringLiteral("av1") ? QStringList{QStringLiteral("main")}
-						 : QStringList{});
-	// levels перечисляет только уровни выбранного кодека; major/minor образуют допустимые AV1 2.0..7.3.
-	QStringList levels;
-	if (codec == QStringLiteral("h264"))
-		levels = {QStringLiteral("auto"), QStringLiteral("1"),   QStringLiteral("1.0"), QStringLiteral("1b"),
-			  QStringLiteral("1.0b"), QStringLiteral("1.1"), QStringLiteral("1.2"), QStringLiteral("1.3"),
-			  QStringLiteral("2"),    QStringLiteral("2.0"), QStringLiteral("2.1"), QStringLiteral("2.2"),
-			  QStringLiteral("3"),    QStringLiteral("3.0"), QStringLiteral("3.1"), QStringLiteral("3.2"),
-			  QStringLiteral("4"),    QStringLiteral("4.0"), QStringLiteral("4.1"), QStringLiteral("4.2"),
-			  QStringLiteral("5"),    QStringLiteral("5.0"), QStringLiteral("5.1"), QStringLiteral("5.2")};
-	else if (codec == QStringLiteral("av1")) {
-		levels.append(QStringLiteral("auto"));
-		for (int major = 2; major <= 7; ++major)
-			for (int minor = 0; minor <= 3; ++minor)
-				levels.append(QString::number(major) + QLatin1Char('.') + QString::number(minor));
-	}
-	choices(QStringLiteral("video.level"), levels);
-	choices(QStringLiteral("video.tier"),
-		codec == QStringLiteral("av1") ? QStringList{QStringLiteral("main")} : QStringList{});
-	choices(QStringLiteral("encoding.video_encoder"),
-		codec == QStringLiteral("h264")  ? QStringList{QStringLiteral("h264_nvenc")}
-		: codec == QStringLiteral("av1") ? QStringList{QStringLiteral("libsvtav1")}
-						 : QStringList{});
-	choices(QStringLiteral("video.b_frames"),
-		codec == QStringLiteral("av1") ||
-				qobject_cast<QComboBox *>(input(QStringLiteral("video.codec_profile")))
-						->currentData()
-						.toByteArray() == QByteArrayLiteral("baseline")
-			? QStringList{QStringLiteral("0")}
-			: integerOptions(0, 4));
-	// bFrames и bFramesOk задают верхнюю границу NVENC lookahead без изменения выбранного значения.
-	bool bFramesOk = false;
-	const auto bFrames = qobject_cast<QComboBox *>(input(QStringLiteral("video.b_frames")))
-				     ->currentData()
-				     .toString()
-				     .toUInt(&bFramesOk);
-	choices(QStringLiteral("nvenc.lookahead"),
-		integerOptions(0, bFramesOk && bFrames <= 31 ? 31 - int(bFrames) : 31));
-	choices(QStringLiteral("audio.channel_layout"),
-		qobject_cast<QComboBox *>(input(QStringLiteral("audio.channels")))->currentData().toString() ==
-				QStringLiteral("1")
-			? QStringList{QStringLiteral("mono")}
-		: qobject_cast<QComboBox *>(input(QStringLiteral("audio.channels")))->currentData().toString() ==
-				QStringLiteral("2")
-			? QStringList{QStringLiteral("stereo")}
-			: QStringList{});
-	choices(QStringLiteral("svt.tuning"), rateControl == QStringLiteral("cbr")
-						      ? QStringList{QStringLiteral("psnr")}
-						      : QStringList{QStringLiteral("psnr"), QStringLiteral("vq")});
-	choices(QStringLiteral("svt.lookahead"), rateControl == QStringLiteral("cbr")
-							 ? QStringList{QStringLiteral("0")}
-							 : QStringList{QStringLiteral("-1")} + integerOptions(6, 120));
-	choices(QStringLiteral("nvenc.strength"),
-		qobject_cast<QCheckBox *>(input(QStringLiteral("nvenc.spatial")))->isChecked()
-			? integerOptions(1, 15)
-			: QStringList{QStringLiteral("8")});
-	// audio и audioModel ограничивают явный выбор без скрытой смены наследуемой семантики.
-	auto *audio = qobject_cast<QComboBox *>(input(QStringLiteral("live_audio_mode")));
-	auto *audioModel = qobject_cast<QStandardItemModel *>(audio->model());
-	if (audioModel) {
-		audioModel->item(0)->setEnabled(!creating_ && !original_.liveAudioMode.hasValue());
-		audioModel->item(2)->setEnabled(
-			qobject_cast<QComboBox *>(input(QStringLiteral("mode")))->currentData().toString() ==
-			QStringLiteral("transcode"));
-	}
-	// copyVideo/effectiveAudioTranscode описывают действие параметров, включая наследуемый режим старого профиля.
-	const bool copyVideo = qobject_cast<QComboBox *>(input(QStringLiteral("mode")))->currentData().toString() ==
-			       QStringLiteral("copy");
-	const bool effectiveAudioTranscode = audio->currentData().toString() == QStringLiteral("transcode") ||
-					     (audio->currentData().toString().isEmpty() && !copyVideo);
-	// field обновляет видимые единицы и область действия битрейта; эти подписи не ограничивают LIVE copy.
+	// profile нужен только для зависимостей; ignored не превращает частичный черновик в допустимый профиль.
+	api::GroupProfile profile;
+	QString ignored;
+	project(profile, ignored, false);
+	// field получает каталог и применимость независимо от валидности остальных полей.
 	for (const auto &field : fields_) {
+		if (field.finite)
+			choices(field.path, api::profileOptions(profile, wirePath(field.path)));
+		field.input->setEnabled(api::profileFieldApplicable(profile, wirePath(field.path)));
 		if (field.path == QStringLiteral("video.target"))
-			field.caption->setText(text_(copyVideo ? "Profile.VideoStubBitrate" : "Profile.TargetBitrate"));
+			field.caption->setText(text_(profile.mode == QStringLiteral("copy") ? "Profile.VideoStubBitrate"
+											    : "Profile.TargetBitrate"));
 		if (field.path == QStringLiteral("video.maximum"))
-			field.caption->setText(text_(copyVideo ? "Profile.VideoStubMaxBitrate" : "Profile.MaxBitrate"));
+			field.caption->setText(text_(profile.mode == QStringLiteral("copy")
+							     ? "Profile.VideoStubMaxBitrate"
+							     : "Profile.MaxBitrate"));
 		if (field.path == QStringLiteral("audio.bitrate"))
-			field.caption->setText(
-				text_(effectiveAudioTranscode ? "Profile.AudioBitrate" : "Profile.AudioStubBitrate"));
+			field.caption->setText(text_(profile.liveAudioMode.value == QStringLiteral("transcode")
+							     ? "Profile.AudioBitrate"
+							     : "Profile.AudioStubBitrate"));
 		field.input->setAccessibleName(field.caption->text());
 	}
-	// recipeModel блокирует возврат сохранённого современного профиля к прежним настройкам.
-	if (auto *recipeModel = qobject_cast<QStandardItemModel *>(recipe_->model())) {
-		recipeModel->item(0)->setEnabled(!original_.encoding.hasValue());
-		recipeModel->item(1)->setEnabled(!original_.encoding.hasValue());
+	// item адресует только именованные custom-пары, не свободную командную строку.
+	for (auto item = custom_.cbegin(); item != custom_.cend(); ++item) {
+		// path является публичным путём пары, selected сохраняет точный прежний выбор.
+		const auto path = wirePath(QStringLiteral("custom.") + item.key());
+		const auto selected = item.value()->currentData().toString();
+		item.value()->clear();
+		// option получен из того же каталога, что используется сериализатором.
+		for (const auto &option : api::profileOptions(profile, path))
+			item.value()->addItem(option.isEmpty() ? text_("Profile.OptionAbsent") : option, option);
+		selectValue(item.value(), selected,
+			    selected.isEmpty() ? text_("Profile.OptionAbsent")
+					       : text_("Profile.UnknownValue").arg(selected));
+		item.value()->setEnabled(api::profileFieldApplicable(profile, path));
 	}
-	nvenc_->setEnabled(v2 && encoder == QStringLiteral("h264_nvenc"));
-	svt_->setEnabled(v2 && encoder == QStringLiteral("libsvtav1"));
-	// field получает доступность по реальному encoder и явному флагу необязательного подблока.
-	for (const auto &field : fields_) {
-		if (field.path.startsWith(QStringLiteral("encoding.")))
-			field.input->setEnabled(v2);
-		if (field.path.startsWith(QStringLiteral("nvenc.")))
-			field.input->setEnabled(nvenc_->isEnabled() && nvenc_->isChecked());
-		if (field.path.startsWith(QStringLiteral("svt.")))
-			field.input->setEnabled(svt_->isEnabled() && svt_->isChecked());
-	}
-	custom_[QStringLiteral("nonref_p")]->setEnabled(v2 && encoder == QStringLiteral("h264_nvenc"));
-	custom_[QStringLiteral("strict_gop")]->setEnabled(v2 && encoder == QStringLiteral("h264_nvenc"));
-	custom_[QStringLiteral("lp")]->setEnabled(v2 && encoder == QStringLiteral("libsvtav1"));
-	custom_[QStringLiteral("aac_coder")]->setEnabled(v2);
 }
 
+// Создаёт редактор внутри родительской страницы и передаёт имя в общую колонку формы.
 ProfileEditor::ProfileEditor(TextLookup text, QWidget *parent, QWidget *nameInput)
 	: QWidget(parent),
 	  impl_(std::make_unique<Impl>(*this, std::move(text), nameInput))
 {
 }
+// Освобождает описания привязок; Qt удаляет дочерние элементы формы.
 ProfileEditor::~ProfileEditor() = default;
 
 // Отражает profile без пользовательских изменений; creating оставляет обязательный новый формат незаполненным.
@@ -867,8 +856,9 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 	selectValue(impl_->fps_, creating && !profile.format.video.frameRate.numerator ? QString{} : rate,
 		    impl_->text_("Profile.ExistingFps")
 			    .arg(profile.format.video.frameRate.numerator)
-			    .arg(profile.format.video.frameRate.denominator));
-	// display сохраняет исходные поля; значения необязательных блоков используются лишь после явного включения.
+			    .arg(profile.format.video.frameRate.denominator),
+		    false);
+	// display сохраняет исходные значения; неполный новый рецепт не наследует значения другой карточки.
 	auto display = profile;
 	if (!display.liveAudioMode.hasValue())
 		display.liveAudioMode.value.clear();
@@ -877,31 +867,18 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 		display.encoding.value.audioEncoder = QStringLiteral("aac");
 		display.encoding.value.rescaleOutput = profile.mode == QStringLiteral("transcode");
 	}
-	if (!display.encoding.value.nvenc.hasValue()) {
-		display.encoding.value.nvenc.value = {
-			QStringLiteral("p4"), QStringLiteral("hq"), QStringLiteral("disabled"), 0, false, false, 8};
-	}
-	if (!display.encoding.value.svtAv1.hasValue()) {
-		display.encoding.value.svtAv1.value = {
-			8, QStringLiteral("psnr"), 2,
-			display.encoding.value.rateControl == QStringLiteral("cbr") ? 0 : -1};
-	}
-	impl_->recipe_->setCurrentIndex(profile.encoding.hasValue() ? 2 : profile.encoding.isNull() ? 1 : 0);
-	impl_->nvenc_->setChecked(profile.encoding.hasValue() && profile.encoding->nvenc.hasValue());
-	impl_->svt_->setChecked(profile.encoding.hasValue() && profile.encoding->svtAv1.hasValue());
 	// field получает точное представление своего типа; обработчик visit не изменяет исходный DTO.
 	for (const auto &field : impl_->fields_) {
 		// combo удаляет только временный пункт другой карточки перед установкой нового исходного значения.
 		if (auto *combo = qobject_cast<QComboBox *>(field.input))
 			clearUnknownValues(combo);
 		std::visit(
-			[this, &field, creating](auto *value) {
+			[this, &field](auto *value) {
 				// Value обозначает фактический тип поля; text содержит только его отображение.
 				using Value = std::remove_pointer_t<decltype(value)>;
 				QString text;
 				if constexpr (std::is_same_v<Value, bool>) {
-					qobject_cast<QCheckBox *>(field.input)->setChecked(*value);
-					return;
+					text = *value ? QStringLiteral("true") : QStringLiteral("false");
 				} else if constexpr (std::is_same_v<Value, api::ProfileText>) {
 					text = QString::fromUtf8(value->bytes);
 					selectValue(qobject_cast<QComboBox *>(field.input), value->bytes,
@@ -912,18 +889,18 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 				} else if constexpr (std::is_same_v<Value, QString>)
 					text = *value;
 				else {
-					text = creating && *value == 0 &&
-							       (field.path == QStringLiteral("video.target") ||
-								field.path == QStringLiteral("audio.bitrate") ||
-								field.path == QStringLiteral("audio.sample_rate") ||
-								field.path == QStringLiteral("audio.channels") ||
-								field.path == QStringLiteral("video.gop"))
-						       ? QString{}
-						       : QString::number(*value);
+					text = QString::number(*value);
 					if constexpr (std::is_same_v<Value, quint64>)
 						if (!text.isEmpty() && isBitrate(field.path))
 							text = bitrateText(*value);
 				}
+				if (field.path == QStringLiteral("encoding.qp") &&
+				    !impl_->original_.encoding.value.qp.hasValue())
+					text.clear();
+				if (field.path == QStringLiteral("encoding.crf"))
+					text = impl_->original_.encoding.value.crfHundredths.hasValue()
+						       ? crfText(impl_->original_.encoding.value.crfHundredths.value)
+						       : QString{};
 				// line и combo выбирают фактическое представление текущего типизированного поля.
 				if (auto *line = qobject_cast<QLineEdit *>(field.input))
 					line->setText(text);
@@ -940,11 +917,27 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 		auto *combo = item.value();
 		const auto source = key == QStringLiteral("aac_coder") ? display.encoding.value.audioCustom
 								       : display.encoding.value.videoCustom;
-		combo->setCurrentIndex(0);
+		clearUnknownValues(combo);
+		selectValue(combo, QString{}, impl_->text_("Profile.OptionAbsent"));
 		// pair сохраняет отдельный токен API; пользователь не редактирует произвольный CLI.
 		for (const auto &pair : source.split(QLatin1Char(' '), Qt::SkipEmptyParts))
 			if (pair.startsWith(key + QLatin1Char('=')))
-				combo->setCurrentIndex(qMax(0, combo->findData(pair.mid(key.size() + 1))));
+				selectValue(combo, pair.mid(key.size() + 1),
+					    impl_->text_("Profile.UnknownValue").arg(pair.mid(key.size() + 1)));
+	}
+	// item показывает исходные неизвестные пары отдельно; известные значения остаются в собственных контролах.
+	for (auto item = impl_->sourceCustom_.cbegin(); item != impl_->sourceCustom_.cend(); ++item) {
+		// source содержит одну исходную строку, unsupported отмечает отличающуюся неподдерживаемую часть.
+		const auto source = item.key() == QStringLiteral("audio") ? display.encoding.value.audioCustom
+									  : display.encoding.value.videoCustom;
+		const bool unsupported = source.split(QLatin1Char(' '), Qt::SkipEmptyParts).join(QLatin1Char(' ')) !=
+					 knownCustomOptions(source, item.key() == QStringLiteral("audio"));
+		item.value()->clear();
+		item.value()->addItem(impl_->text_("Profile.RemoveUnsupportedOptions"), QString{});
+		if (unsupported)
+			selectValue(item.value(), source, impl_->text_("Profile.UnknownValue").arg(source));
+		item.value()->setVisible(unsupported);
+		impl_->sourceCaptions_[item.key()]->setVisible(unsupported);
 	}
 	impl_->updateApplicability();
 	impl_->updateBitrateHelp();
@@ -966,26 +959,27 @@ QVariantMap ProfileEditor::captureDraft() const
 		else if (auto *combo = qobject_cast<QComboBox *>(field.input))
 			value = QVariantMap{{QStringLiteral("data"), combo->currentData()},
 					    {QStringLiteral("text"), combo->currentText()}};
-		else
-			value = qobject_cast<QCheckBox *>(field.input)->isChecked();
 		values.insert(field.path, value);
 	}
 	// custom содержит отдельные разрешённые опции; item проходит их точные привязки.
 	QVariantMap custom;
 	for (auto item = impl_->custom_.cbegin(); item != impl_->custom_.cend(); ++item)
 		custom.insert(item.key(), item.value()->currentData());
+	// sourceCustom сохраняет отдельное явное решение о неизвестных исходных парах.
+	QVariantMap sourceCustom;
+	// item адресует одну дорожку и выбранное исходное значение либо его явное удаление.
+	for (auto item = impl_->sourceCustom_.cbegin(); item != impl_->sourceCustom_.cend(); ++item)
+		sourceCustom.insert(item.key(), item.value()->currentData());
 	return {{QStringLiteral("original"), QVariant::fromValue(impl_->original_)},
 		{QStringLiteral("creating"), impl_->creating_},
 		{QStringLiteral("dirty"), QStringList(impl_->dirty_.values())},
 		{QStringLiteral("fields"), values},
 		{QStringLiteral("custom"), custom},
+		{QStringLiteral("sourceCustom"), sourceCustom},
 		{QStringLiteral("resolution"), impl_->resolution_->currentText()},
 		{QStringLiteral("fps"), impl_->fps_->currentData()},
 		{QStringLiteral("fpsText"), impl_->fps_->currentText()},
 		{QStringLiteral("preset"), impl_->preset_->currentIndex()},
-		{QStringLiteral("encoding"), impl_->recipe_->currentData()},
-		{QStringLiteral("nvenc"), impl_->nvenc_->isChecked()},
-		{QStringLiteral("svt"), impl_->svt_->isChecked()},
 		{QStringLiteral("advanced"), impl_->advanced_->isChecked()}};
 }
 
@@ -1012,20 +1006,25 @@ void ProfileEditor::restoreDraft(const QVariantMap &draft)
 			const auto selection = value.toMap();
 			selectValue(combo, selection.value(QStringLiteral("data")),
 				    selection.value(QStringLiteral("text")).toString());
-		} else
-			qobject_cast<QCheckBox *>(field.input)->setChecked(value.toBool());
+		}
 	}
 	impl_->resolution_->setEditText(draft.value(QStringLiteral("resolution")).toString());
-	selectValue(impl_->fps_, draft.value(QStringLiteral("fps")), draft.value(QStringLiteral("fpsText")).toString());
+	selectValue(impl_->fps_, draft.value(QStringLiteral("fps")), draft.value(QStringLiteral("fpsText")).toString(),
+		    false);
 	impl_->preset_->setCurrentIndex(draft.value(QStringLiteral("preset")).toInt());
-	impl_->recipe_->setCurrentIndex(impl_->recipe_->findData(draft.value(QStringLiteral("encoding"))));
-	impl_->nvenc_->setChecked(draft.value(QStringLiteral("nvenc")).toBool());
-	impl_->svt_->setChecked(draft.value(QStringLiteral("svt")).toBool());
 	// custom возвращает только разрешённые именованные опции; item указывает на существующий ввод.
 	const auto custom = draft.value(QStringLiteral("custom")).toMap();
 	for (auto item = impl_->custom_.cbegin(); item != impl_->custom_.cend(); ++item)
 		selectValue(item.value(), custom.value(item.key()),
 			    impl_->text_("Profile.UnknownValue").arg(custom.value(item.key()).toString()));
+	// sourceCustom возвращает выбор удаления, не меняя сохранённый исходный документ.
+	const auto sourceCustom = draft.value(QStringLiteral("sourceCustom")).toMap();
+	// item восстанавливает только существующие закрытые контролы дорожек.
+	for (auto item = impl_->sourceCustom_.cbegin(); item != impl_->sourceCustom_.cend(); ++item)
+		if (sourceCustom.contains(item.key()))
+			selectValue(
+				item.value(), sourceCustom.value(item.key()),
+				impl_->text_("Profile.UnknownValue").arg(sourceCustom.value(item.key()).toString()));
 	impl_->dirty_.clear();
 	// path восстанавливает намерение редактировать конкретное поле, включая ещё невалидную строку.
 	for (const auto &path : draft.value(QStringLiteral("dirty")).toStringList())
@@ -1039,101 +1038,71 @@ void ProfileEditor::restoreDraft(const QVariantMap &draft)
 // Собирает profile из исходного DTO и изменённых полей; error объясняет отказ без потери исходных байтов.
 bool ProfileEditor::readProfile(api::GroupProfile &profile, QString &error) const
 {
-	profile = impl_->original_;
-	error.clear();
-	// recipe различает Missing/null/v2; newRecipe требует собрать обязательные поля нового блока.
-	const int recipe = impl_->recipe_->currentData().toInt();
-	const bool newRecipe = recipe == 2 && !profile.encoding.hasValue();
-	if (profile.encoding.hasValue() && recipe != 2) {
-		error = impl_->text_("Profile.CannotRemoveV2");
+	if (!impl_->project(profile, error, true))
 		return false;
-	}
-	if (impl_->dirty_.contains(QStringLiteral("encoding")))
-		profile.encoding.state = recipe == 2   ? api::FieldState::Value
-					 : recipe == 1 ? api::FieldState::Null
-						       : api::FieldState::Missing;
-	if (recipe == 2) {
-		profile.encoding.state = api::FieldState::Value;
-		profile.encoding.value.version = 2;
-		if (newRecipe || impl_->dirty_.contains(QStringLiteral("encoding.video_encoder")) ||
-		    impl_->dirty_.contains(QStringLiteral("nvenc")))
-			profile.encoding.value.nvenc.state = impl_->nvenc_->isEnabled() && impl_->nvenc_->isChecked()
-								     ? api::FieldState::Value
-								     : api::FieldState::Missing;
-		if (newRecipe || impl_->dirty_.contains(QStringLiteral("encoding.video_encoder")) ||
-		    impl_->dirty_.contains(QStringLiteral("svt")))
-			profile.encoding.value.svtAv1.state = impl_->svt_->isEnabled() && impl_->svt_->isChecked()
-								      ? api::FieldState::Value
-								      : api::FieldState::Missing;
-	}
-	if (impl_->creating_ || impl_->dirty_.contains(QStringLiteral("video.resolution"))) {
-		// dimensions отделяет две целые стороны; widthOk/heightOk подтверждают представимость без округления.
-		const auto dimensions = QRegularExpression(QStringLiteral("^([0-9]+)\\s*[x×]\\s*([0-9]+)$"))
-						.match(impl_->resolution_->currentText());
-		bool widthOk = false;
-		bool heightOk = false;
-		// width/height остаются uint64 до проверки границы полей uint32.
-		const auto width = dimensions.captured(1).toULongLong(&widthOk);
-		const auto height = dimensions.captured(2).toULongLong(&heightOk);
-		if (!dimensions.hasMatch() || !widthOk || !heightOk || !width || !height ||
-		    width > std::numeric_limits<quint32>::max() || height > std::numeric_limits<quint32>::max()) {
-			error = impl_->text_("Profile.InvalidField").arg(impl_->text_("Profile.Resolution"));
-			return false;
-		}
-		profile.format.video.width = quint32(width);
-		profile.format.video.height = quint32(height);
-	}
-	if (impl_->creating_ || impl_->dirty_.contains(QStringLiteral("video.fps"))) {
-		// rate содержит выбранную точную пару; numeratorOk/denominatorOk проверяют uint32 без double.
-		const auto rate = impl_->fps_->currentData().toString().split(QLatin1Char('/'));
-		bool numeratorOk = false;
-		bool denominatorOk = false;
-		// numerator и denominator сохраняют исходное отношение, включая несокращённый нестандартный FPS.
-		const auto numerator = rate.value(0).toUInt(&numeratorOk);
-		const auto denominator = rate.value(1).toUInt(&denominatorOk);
-		if (rate.size() != 2 || !numeratorOk || !denominatorOk || !numerator || !denominator) {
-			error = impl_->text_("Profile.InvalidField").arg(impl_->text_("Profile.Fps"));
-			return false;
-		}
-		profile.format.video.frameRate = {numerator, denominator};
-	}
-	// field применяется только после пользовательского изменения либо для нового обязательного блока.
-	for (const auto &field : impl_->fields_) {
-		if (!field.input->isEnabled())
-			continue;
-		// freshBlock требует заполнить поля только что включённого необязательного рецепта.
-		const bool freshBlock = (field.path.startsWith(QStringLiteral("encoding.")) && newRecipe) ||
-					(field.path.startsWith(QStringLiteral("nvenc.")) &&
-					 !impl_->original_.encoding.value.nvenc.hasValue()) ||
-					(field.path.startsWith(QStringLiteral("svt.")) &&
-					 !impl_->original_.encoding.value.svtAv1.hasValue());
-		if (!impl_->creating_ && !freshBlock && !impl_->dirty_.contains(field.path))
-			continue;
-		// valid отражает проверку фактического типа поля; обработчик visit сохраняет точность целого ввода.
+	// validation содержит только локальные доверенные ключи общего валидатора.
+	api::Error validation;
+	if (api::validateProfile(profile, validation))
+		return true;
+	if (validation.problem && !validation.problem->errors.isEmpty()) {
+		// issue — первая ошибка полного рецепта; подпись поля находится по wire-пути.
+		const auto &issue = validation.problem->errors.front();
+		// caption остаётся безопасным названием профиля при неизвестном локальном пути.
+		QString caption = impl_->text_("Editor.Profile");
+		// field связывает локальный wire-путь с уже переведённой подписью формы.
+		for (const auto &field : impl_->fields_)
+			if (issue.location == wirePath(field.path) ||
+			    issue.location == QStringLiteral("profile.") + wirePath(field.path))
+				caption = field.label;
+		error = issue.messageKey.isEmpty()
+				? impl_->text_("Profile.InvalidField").arg(caption)
+				: caption + QStringLiteral(": ") + impl_->text_(issue.messageKey.toUtf8().constData());
+	} else
+		error = impl_->text_("Profile.RequiredFormat");
+	return false;
+}
+
+// Собирает проекцию текущего ввода для каталогов либо полной проверки без изменения самих виджетов.
+bool ProfileEditor::Impl::project(api::GroupProfile &profile, QString &error, bool strict) const
+{
+	profile = original_;
+	error.clear();
+	profile.encoding.state = api::FieldState::Value;
+	profile.liveAudioMode.state = api::FieldState::Value;
+	// invalid перечисляет строки, которые пока нельзя представить в точном типе DTO.
+	QSet<QString> invalid;
+	// field читается независимо от текущей доступности: скрытый ввод нужен для возврата к прежнему режиму.
+	for (const auto &field : fields_) {
+		// valid отражает точность преобразования; посетитель меняет только одно типизированное поле.
 		const bool valid = std::visit(
 			[&field](auto *value) {
-				// Value — тип конечного DTO-поля, line и combo предоставляют один из вариантов ввода.
+				// Value задаёт физический диапазон; line и combo указывают на существующее представление поля.
 				using Value = std::remove_pointer_t<decltype(value)>;
 				auto *line = qobject_cast<QLineEdit *>(field.input);
 				auto *combo = qobject_cast<QComboBox *>(field.input);
-				// text содержит пользовательскую строку без trim или другой нормализации ProfileText.
-				const auto text = line    ? line->text()
-						  : combo ? combo->currentData().toString()
-							  : QString{};
-				if constexpr (std::is_same_v<Value, bool>) {
-					*value = qobject_cast<QCheckBox *>(field.input)->isChecked();
-					return true;
-				} else if constexpr (std::is_same_v<Value, QString>) {
+				// text сохраняет ввод без trim, включая незавершённые десятичные значения.
+				const auto text = line ? line->text() : combo->currentData().toString();
+				if constexpr (std::is_same_v<Value, QString>) {
 					*value = text;
-					return !text.isEmpty() || field.path == QStringLiteral("live_audio_mode");
+					return true;
 				} else if constexpr (std::is_same_v<Value, api::ProfileText>) {
 					value->bytes = combo->currentData().toByteArray();
 					return true;
+				} else if constexpr (std::is_same_v<Value, bool>) {
+					if (text != QStringLiteral("false") && text != QStringLiteral("true"))
+						return false;
+					*value = text == QStringLiteral("true");
+					return true;
 				} else {
+					if constexpr (std::is_same_v<Value, int>)
+						if (field.path == QStringLiteral("encoding.crf"))
+							return text.isEmpty() || parseCrf(text, *value);
+					if (field.path == QStringLiteral("encoding.qp") && text.isEmpty())
+						return true;
 					if constexpr (std::is_same_v<Value, quint64>)
 						if (isBitrate(field.path))
 							return parseBitrate(text, *value);
-					// ok и parsed подтверждают точное целое, не проходя через числа с плавающей точкой.
+					// ok подтверждает диапазон; parsed не проходит через плавающую точку.
 					bool ok = false;
 					if constexpr (std::is_signed_v<Value>) {
 						const auto parsed = text.toLongLong(&ok);
@@ -1159,87 +1128,115 @@ bool ProfileEditor::readProfile(api::GroupProfile &profile, QString &error) cons
 				}
 			},
 			profileValue(profile, field.path));
-		if (!valid) {
-			error = impl_->text_("Profile.InvalidField").arg(field.label);
+		if (!valid)
+			invalid.insert(field.path);
+	}
+	// dimensions проверяет целые стороны без округления; widthOk/heightOk подтверждают физический диапазон.
+	const auto dimensions =
+		QRegularExpression(QStringLiteral("^([0-9]+)\\s*[x×]\\s*([0-9]+)$")).match(resolution_->currentText());
+	bool widthOk = false;
+	bool heightOk = false;
+	// width и height остаются широкими целыми до проверки границы uint32.
+	const auto width = dimensions.captured(1).toULongLong(&widthOk);
+	const auto height = dimensions.captured(2).toULongLong(&heightOk);
+	if (dimensions.hasMatch() && widthOk && heightOk && width <= std::numeric_limits<quint32>::max() &&
+	    height <= std::numeric_limits<quint32>::max()) {
+		profile.format.video.width = quint32(width);
+		profile.format.video.height = quint32(height);
+	} else if (strict) {
+		error = text_("Profile.InvalidField").arg(text_("Profile.Resolution"));
+		return false;
+	}
+	// rate сохраняет выбранную дробь; numeratorOk/denominatorOk проверяют точные uint32.
+	const auto rate = fps_->currentData().toString().split(QLatin1Char('/'));
+	bool numeratorOk = false;
+	bool denominatorOk = false;
+	// numerator/denominator не сокращаются: исходная форма дроби остаётся в рецепте.
+	const auto numerator = rate.value(0).toUInt(&numeratorOk);
+	const auto denominator = rate.value(1).toUInt(&denominatorOk);
+	if (rate.size() == 2 && numeratorOk && denominatorOk)
+		profile.format.video.frameRate = {numerator, denominator};
+	else if (strict) {
+		error = text_("Profile.InvalidField").arg(text_("Profile.Fps"));
+		return false;
+	}
+	profile.encoding.value.qp.state =
+		qobject_cast<QLineEdit *>(input(QStringLiteral("encoding.qp")))->text().isEmpty()
+			? api::FieldState::Missing
+			: api::FieldState::Value;
+	profile.encoding.value.crfHundredths.state =
+		qobject_cast<QLineEdit *>(input(QStringLiteral("encoding.crf")))->text().isEmpty()
+			? api::FieldState::Missing
+			: api::FieldState::Value;
+	profile.encoding.value.nvenc.state =
+		api::profileFieldApplicable(profile, QStringLiteral("encoding.nvenc.preset"))
+			? api::FieldState::Value
+			: api::FieldState::Missing;
+	profile.encoding.value.svtAv1.state =
+		api::profileFieldApplicable(profile, QStringLiteral("encoding.svt_av1.preset"))
+			? api::FieldState::Value
+			: api::FieldState::Missing;
+	// item применяет только явное решение удалить неизвестные пары; известный ввод сохраняется.
+	for (auto item = sourceCustom_.cbegin(); item != sourceCustom_.cend(); ++item) {
+		if (!dirty_.contains(QStringLiteral("custom_source.") + item.key()) ||
+		    !item.value()->currentData().toString().isEmpty())
+			continue;
+		// source относится к одной дорожке полного рецепта.
+		auto &source = item.key() == QStringLiteral("audio") ? profile.encoding.value.audioCustom
+								     : profile.encoding.value.videoCustom;
+		source = knownCustomOptions(source, item.key() == QStringLiteral("audio"));
+	}
+	// item проецирует только известные отдельные пары; неизвестные исходные токены сохраняются для проверки.
+	for (auto item = custom_.cbegin(); item != custom_.cend(); ++item) {
+		// source указывает на исходную строку нужного кодировщика.
+		auto &source = item.key() == QStringLiteral("aac_coder") ? profile.encoding.value.audioCustom
+									 : profile.encoding.value.videoCustom;
+		if (dirty_.contains(QStringLiteral("custom.") + item.key()))
+			source = replaceCustomOption(source, item.key(), item.value()->currentData().toString());
+	}
+	if (!strict)
+		return true;
+	// field проверяет конечные каталоги и точный ввод только применимых параметров.
+	for (const auto &field : fields_) {
+		if (!api::profileFieldApplicable(profile, wirePath(field.path)))
+			continue;
+		if (invalid.contains(field.path) ||
+		    (field.finite &&
+		     !api::profileOptions(profile, wirePath(field.path))
+			      .contains(qobject_cast<QComboBox *>(field.input)->currentData().toString()))) {
+			error = text_("Profile.InvalidField").arg(field.label);
 			return false;
 		}
 	}
-	if (impl_->creating_ || impl_->dirty_.contains(QStringLiteral("live_audio_mode"))) {
-		profile.liveAudioMode.state = profile.liveAudioMode.value.isEmpty() ? api::FieldState::Missing
-										    : api::FieldState::Value;
-	}
-	if (impl_->original_.liveAudioMode.hasValue() && !profile.liveAudioMode.hasValue()) {
-		error = impl_->text_("Profile.CannotRemoveAudio");
-		return false;
-	}
-	if ((profile.mode != QStringLiteral("copy") && profile.mode != QStringLiteral("transcode")) ||
-	    (impl_->original_.liveAudioMode.isMissing() && profile.liveAudioMode.isMissing() &&
-	     impl_->original_.mode != profile.mode) ||
-	    (profile.mode == QStringLiteral("copy") && profile.liveAudioMode.hasValue() &&
-	     *profile.liveAudioMode != QStringLiteral("copy"))) {
-		error = impl_->text_("Profile.InvalidAudioMode");
-		return false;
-	}
-	if (impl_->creating_ &&
-	    (!profile.liveAudioMode.hasValue() || profile.format.video.width == 0 || profile.format.video.height == 0 ||
-	     profile.format.video.frameRate.numerator == 0 || profile.format.video.frameRate.denominator == 0 ||
-	     profile.format.audio.sampleRateHz == 0 || profile.format.audio.channels == 0 ||
-	     profile.videoEncoding.targetBitrateBps == 0 || profile.audioEncoding.bitrateBps == 0)) {
-		error = impl_->text_("Profile.RequiredFormat");
-		return false;
-	}
-	if (recipe == 2) {
-		// encoding является полным явным рецептом, videoChanged/audioChanged определяют необходимость пересборки custom.
-		auto &encoding = profile.encoding.value;
-		const bool videoChanged = newRecipe ||
-					  impl_->dirty_.contains(QStringLiteral("encoding.video_encoder")) ||
-					  impl_->dirty_.contains(QStringLiteral("custom.nonref_p")) ||
-					  impl_->dirty_.contains(QStringLiteral("custom.strict_gop")) ||
-					  impl_->dirty_.contains(QStringLiteral("custom.lp"));
-		const bool audioChanged = newRecipe || impl_->dirty_.contains(QStringLiteral("custom.aac_coder"));
-		if (videoChanged) {
-			// encoderChanged отзывает custom старого кодировщика только после его явной смены.
-			const bool encoderChanged = newRecipe ||
-						    impl_->dirty_.contains(QStringLiteral("encoding.video_encoder"));
-			if (encoderChanged)
-				encoding.videoCustom.clear();
-			// key проходит применимые разрешённые параметры выбранного видеокодировщика.
-			for (const auto &key :
-			     encoding.videoEncoder == QStringLiteral("h264_nvenc")
-				     ? QStringList{QStringLiteral("nonref_p"), QStringLiteral("strict_gop")}
-				     : QStringList{QStringLiteral("lp")}) {
-				if (!encoderChanged && !impl_->dirty_.contains(QStringLiteral("custom.") + key))
-					continue;
-				// value — точное значение отдельной API-пары либо отсутствие опции.
-				const auto value = impl_->custom_[key]->currentData().toString();
-				encoding.videoCustom = replaceCustomOption(encoding.videoCustom, key, value);
+	// item проверяет выбранные значения разрешённых дополнительных опций до их отправки.
+	for (auto item = custom_.cbegin(); item != custom_.cend(); ++item) {
+		// path относится к одной известной API-паре, value хранит её точное значение.
+		const auto path = wirePath(QStringLiteral("custom.") + item.key());
+		const auto value = item.value()->currentData().toString();
+		if (api::profileFieldApplicable(profile, path)) {
+			if (!api::profileOptions(profile, path).contains(value)) {
+				error = text_("Profile.InvalidField").arg(text_("Profile.Custom"));
+				return false;
 			}
-		}
-		if (audioChanged) {
-			// value содержит только разрешённый aac_coder, пустота удаляет эту дополнительную пару.
-			const auto value = impl_->custom_[QStringLiteral("aac_coder")]->currentData().toString();
-			encoding.audioCustom = replaceCustomOption(newRecipe ? QString{} : encoding.audioCustom,
-								   QStringLiteral("aac_coder"), value);
-		}
-		if (encoding.nvenc.hasValue() &&
-		    (encoding.nvenc->lookaheadFrames < 0 || encoding.nvenc->lookaheadFrames > 31 ||
-		     encoding.nvenc->aqStrength < 1 || encoding.nvenc->aqStrength > 15 ||
-		     (!encoding.nvenc->enableSpatialAq && encoding.nvenc->aqStrength != 8) ||
-		     (encoding.nvenc->lookaheadFrames > 0 &&
-		      quint64(encoding.nvenc->lookaheadFrames) + profile.videoEncoding.maxBFrames > 31))) {
-			error = impl_->text_("Profile.InvalidNvenc");
-			return false;
-		}
-		if (encoding.svtAv1.hasValue() &&
-		    (encoding.svtAv1->preset < 0 || encoding.svtAv1->preset > 13 || encoding.svtAv1->aqMode != 2 ||
-		     (encoding.rateControl == QStringLiteral("cbr") &&
-		      (encoding.svtAv1->tuning != QStringLiteral("psnr") || encoding.svtAv1->lookaheadFrames != 0)) ||
-		     (encoding.rateControl == QStringLiteral("vbr") && encoding.svtAv1->lookaheadFrames != -1 &&
-		      (encoding.svtAv1->lookaheadFrames < 6 || encoding.svtAv1->lookaheadFrames > 120)))) {
-			error = impl_->text_("Profile.InvalidSvt");
-			return false;
+		} else {
+			// source содержит одну строку custom; удаление пары не меняет её RAM-ввод в виджете.
+			auto &source = item.key() == QStringLiteral("aac_coder") ? profile.encoding.value.audioCustom
+										 : profile.encoding.value.videoCustom;
+			source = replaceCustomOption(source, item.key(), {});
 		}
 	}
+	if (!api::profileFieldApplicable(profile, QStringLiteral("encoding.qp")))
+		profile.encoding.value.qp.state = api::FieldState::Missing;
+	if (!api::profileFieldApplicable(profile, QStringLiteral("encoding.crf")))
+		profile.encoding.value.crfHundredths.state = api::FieldState::Missing;
+	profile.encoding.value.nvenc.state =
+		api::profileFieldApplicable(profile, QStringLiteral("encoding.nvenc.preset"))
+			? api::FieldState::Value
+			: api::FieldState::Missing;
+	profile.encoding.value.svtAv1.state =
+		api::profileFieldApplicable(profile, QStringLiteral("encoding.svt_av1.preset"))
+			? api::FieldState::Value
+			: api::FieldState::Missing;
 	return true;
 }
 } // namespace gost

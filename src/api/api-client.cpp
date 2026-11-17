@@ -12,9 +12,8 @@
 #include <QSet>
 #include <QTimer>
 #include <QUrlQuery>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
+#include "api/json-value.hpp"
+
 #include <QElapsedTimer>
 #include <algorithm>
 #include <type_traits>
@@ -240,8 +239,13 @@ public:
 			return;
 		active.remove(reply);
 		job->status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-		if (result.error)
+		if (result.error) {
 			result.error->requestSent = true;
+			// При досрочном отказе сохраняется только ограниченная диагностика полученного HTTP-отклонения.
+			// Успешные HTTP-тела и исходящие payload в этот канал не копируются.
+			if (job->status >= 400 && result.error->diagnosticBody.isEmpty())
+				result.error->diagnosticBody = job->body.first(std::min(job->cap, job->body.size()));
+		}
 		job->reply = nullptr;
 		QObject::disconnect(reply, nullptr, owner, nullptr);
 		if (abort)
@@ -451,10 +455,11 @@ public:
 					   .toLower();
 		if (status >= 400) {
 			// HTTP-ошибка обрабатывается до общей ошибки транспорта, которую Qt также выставляет для таких ответов.
-			complete(job, Result<QByteArray>::failure(
-					      decodeProblem(status, media == QStringLiteral("application/problem+json")
-									    ? job->body
-									    : QByteArray{})));
+			// error хранит ограниченное исходное тело даже при неверном MIME или повреждённом Problem.
+			auto error = decodeProblem(status, job->body);
+			if (media != QStringLiteral("application/problem+json"))
+				error.problem.reset();
+			complete(job, Result<QByteArray>::failure(std::move(error)));
 			return;
 		}
 		if (reply->error() != QNetworkReply::NoError) {
@@ -512,8 +517,10 @@ public:
 	 * Сериализует payload одной команды path; valid отражает проверенные вызывающим wrapper ID.
 	 * receiver ограничивает callback квитанции; valid не допускает локально неверные параметры в сеть.
 	 */
-	void post(QString path, QJsonObject payload, bool valid, QObject *receiver, Callback<Receipt> callback)
+	void post(QString path, JsonValue::Object payload, bool valid, QObject *receiver, Callback<Receipt> callback)
 	{
+		// bytes содержит полный типизированный JSON; пустой результат означает неверную строку или предел writer.
+		const auto bytes = serializeJson(JsonValue(std::move(payload)));
 		raw(
 			std::move(path), {}, receiver,
 			// context и result — исходный контекст и полное тело; ошибки передаются без журналирования payload.
@@ -521,8 +528,8 @@ public:
 							       HttpDiagnostic diagnostic) {
 				decoded<Receipt>(context, std::move(result), diagnostic, callback);
 			},
-			limits.restBodyBytes, QNetworkAccessManager::PostOperation,
-			QJsonDocument(payload).toJson(QJsonDocument::Compact), 202, valid);
+			limits.restBodyBytes, QNetworkAccessManager::PostOperation, bytes, 202,
+			valid && !bytes.isEmpty());
 	}
 	// Преобразование DTO выполняется только для полного успешного тела. decode создаёт новый объект,
 	// поэтому ошибка в середине документа не публикует частично заполненную сущность.
@@ -548,6 +555,8 @@ public:
 	{
 		// encoded содержит весь исходящий JSON либо безопасную ошибку известного поля.
 		auto encoded = encodeRequest(request);
+		// bytes не позволяет отправить пустое тело, если writer отверг Unicode или структурный предел.
+		const auto bytes = encoded ? serializeJson(*encoded.value) : QByteArray{};
 		raw(
 			std::move(path), {}, receiver,
 			// Обработчик проверяет непустой ID создания либо expectedId изменения до выдачи DTO callback.
@@ -555,9 +564,8 @@ public:
 				RequestContext context, Result<QByteArray> result, HttpDiagnostic diagnostic) {
 				decoded<T>(context, std::move(result), diagnostic, callback, expectedId, true);
 			},
-			limits.restBodyBytes, method,
-			encoded ? QJsonDocument(*encoded.value).toJson(QJsonDocument::Compact) : QByteArray{}, status,
-			valid && bool(encoded), encoded.error);
+			limits.restBodyBytes, method, bytes, status, valid && bool(encoded) && !bytes.isEmpty(),
+			encoded.error);
 	}
 	// Передаёт expectedRevision только в DELETE query и принимает 204 без JSON/MIME.
 	void remove(QString path, quint64 expectedRevision, bool valid, QObject *receiver, Callback<Empty> callback)
@@ -576,7 +584,8 @@ public:
 				report(diagnostic, result.error);
 				callback(context, std::move(result));
 			},
-			limits.restBodyBytes, QNetworkAccessManager::DeleteOperation, {}, 204, valid);
+			limits.restBodyBytes, QNetworkAccessManager::DeleteOperation, {}, 204,
+			valid && expectedRevision > 0);
 	}
 	// Читает одну страницу path с фильтрами query; результат callback ограничен жизнью receiver.
 	template<class T> void page(QString path, QObject *receiver, Callback<Page<T>> callback, ListQuery query)
@@ -897,7 +906,7 @@ void APIClient::startSession(QString streamId, QString requestId, QStringList de
 			     Callback<Receipt> callback)
 {
 	// destinations сохраняет порядок и значения исходного списка без динамического выбора Enabled на сервере.
-	QJsonArray destinations;
+	JsonValue::Array destinations;
 	// valid не позволяет серверу трактовать пустой список как выбор всех текущих Enabled.
 	bool valid = !streamId.isEmpty() && !requestId.isEmpty() && !destinationIds.isEmpty();
 	// id — одно явно выбранное назначение; пустое значение делает весь запрос недопустимым.

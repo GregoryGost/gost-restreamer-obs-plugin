@@ -7,6 +7,7 @@
 #include "ui/management-window.hpp"
 #include "ui/profile-editor.hpp"
 #include "ui/secret-field.hpp"
+#include "ui/operation-error-dialog.hpp"
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
@@ -43,12 +44,48 @@ bool choose(QComboBox *field, const QString &value)
 {
 	if (!field)
 		return false;
-	// index адресует точное контрактное значение, а не локализованный отображаемый текст.
-	const int index = field->findData(value);
-	if (index < 0)
+	// data сохраняет тип технического значения: ProfileText использует точные UTF-8 байты,
+	// остальные конечные поля — QString. Подпись пункта в сравнении не участвует.
+	const QVariant data = field->currentData().metaType() == QMetaType::fromType<QByteArray>()
+				      ? QVariant(value.toUtf8())
+				      : QVariant(value);
+	// index адресует точное типизированное значение и не допускает выбора отключённого исходного пункта.
+	const int index = field->findData(data);
+	if (index < 0 || !(field->model()->flags(field->model()->index(index, 0)) & Qt::ItemIsEnabled))
 		return false;
 	field->setCurrentIndex(index);
 	return QMetaObject::invokeMethod(field, "activated", Q_ARG(int, index));
+}
+// Накладывает patch на независимый документ base; вложенные объекты дополняются без изменения остальных полей.
+QJsonObject mergeProfileFields(QJsonObject base, const QJsonObject &patch)
+{
+	// field указывает на одно явно заданное поле сценария и его ожидаемое значение.
+	for (auto field = patch.begin(); field != patch.end(); ++field) {
+		if (field.value().isObject())
+			base.insert(field.key(),
+				    mergeProfileFields(base.value(field.key()).toObject(), field.value().toObject()));
+		else
+			base.insert(field.key(), field.value());
+	}
+	return base;
+}
+
+// Возвращает полный независимый HEVC/AAC-рецепт с явными изменениями patch в JSON.
+// Значения сценариев следуют закреплённым таблицам API для кодеков, качества, HDR и аудиопривязок.
+QJsonObject expandedProfile(const QByteArray &patch)
+{
+	// base содержит все обязательные поля; новые кодировщики не наследуют блоки NVENC/SVT или custom.
+	const auto base = fixture::object(R"({"mode":"transcode","live_audio_mode":"copy",
+"format":{"video":{"codec":"hevc","width":1920,"height":1080,
+"frame_rate":{"numerator":60,"denominator":1},"codec_profile":"main","level":"auto","tier":"",
+"pixel_format":"yuv420p","bit_depth":8,
+"color":{"range":"limited","primaries":"bt709","transfer":"bt709","matrix":"bt709"}},
+"audio":{"codec":"aac","codec_profile":"LC","sample_rate_hz":48000,"channels":2,"channel_layout":"stereo"}},
+"video_encoding":{"target_bitrate_bps":6000000,"max_bitrate_bps":6000000,"buffer_bits":12000000,
+"gop_frames":120,"max_b_frames":0,"closed_gop":true},"audio_encoding":{"bitrate_bps":128000},
+"encoding":{"video_encoder":"libx265","audio_encoder":"aac","rate_control":"cbr",
+"rescale_output":false,"video_custom":"","audio_custom":""}})");
+	return mergeProfileFields(base, fixture::object(patch));
 }
 } // namespace
 
@@ -56,6 +93,22 @@ bool choose(QComboBox *field, const QString &value)
 class ConfigurationUiTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Задаёт полные допустимые профили новых кодеков, HDR, качества и аудиопривязок.
+	void expandedProfilesKeepFiniteIdentityAndCompleteRecipe_data();
+	// Загрузка и явный выбор тех же пунктов сохраняют технические значения и весь исходящий профиль.
+	void expandedProfilesKeepFiniteIdentityAndCompleteRecipe();
+	// Смена аудиокодека и HDR-формата сохраняет несовместимый ввод до явного исправления.
+	void expandedDependenciesRequireExplicitRepair();
+	// Нулевой QP и дробный CRF имеют раздельное присутствие, а отключённый ввод остаётся в RAM.
+	void qualityModeChangesKeepOnlyApplicableValue();
+	// Конечные флаги остаются ComboBox, а отключённый точный CRF сохраняет промежуточную RAM строку.
+	void finiteSelectorsAndQualityDraftStayExact();
+	// Правка одной custom пары сохраняет канонический порядок всех незатронутых опций.
+	void editingCustomPairKeepsCanonicalOrder();
+	// Неизвестные custom пары требуют явного удаления, а исходный документ остаётся в RAM.
+	void unsupportedCustomCanBeExplicitlyRepaired();
+	// Один popup/log соответствует одной операции; поздний контекст и повтор не порождают уведомления.
+	void operationFailurePopupIsSinglePlainTextAndContextBound();
 	// Открывает ещё не исполнявшееся назначение в прежнем окне с парковкой черновиков и маскированием.
 	void destinationDetailsWithoutSessionPreserveDraftAndMasks();
 	// Маска не меняет точную строку Copy, включая userinfo/path/query, и не отмечает draft изменённым.
@@ -70,16 +123,16 @@ private slots:
 	void existingRecordCanBeSelectedAfterCreate_data();
 	// После «Создать» повторный щелчок по прежней записи снова показывает её параметры без записи на сервер.
 	void existingRecordCanBeSelectedAfterCreate();
-	// Задаёт legacy/null/missing и полный v2 с двоичным ProfileText.
+	// Задаёт полные versionless профили с явными audio mode.
 	void structuredProfilePreservesUntouchedFields_data();
 	// Отражение и чтение формы не теряют FPS, байты, LIVE AAC и присутствие encoding.
 	void structuredProfilePreservesUntouchedFields();
-	// Изменение одного поля не пересобирает незатронутый двоичный текст или весь рецепт.
-	void changingOneProfileFieldPreservesBytesAndLegacyAudio();
-	// Пользователь не может удалить сохранённый encoding v2 или выбрать transcode AAC для video copy.
-	void incompatibleAudioAndRemovingV2AreRejected();
-	// Смена video mode старого профиля требует явного решения об обработке LIVE AAC.
-	void changingLegacyVideoModeRequiresExplicitAudioDecision();
+	// Правка одного поля сохраняет остальные точные настройки полного рецепта.
+	void changingOneProfileFieldPreservesExplicitRecipe();
+	// Полный encoding обязателен, несовместимые video/audio сочетания не отправляются.
+	void fullEncodingAndAudioDependenciesAreEnforced();
+	// Неизвестный codec_profile требует явного исправления, исходный документ сохраняется.
+	void unknownProfileValueRequiresExplicitRepair();
 	// Пустой новый профиль не сохраняется с вымышленными форматами или площадочными presets.
 	void newProfileRequiresExplicitMediaFormat();
 	// Дробный размер и переполнение битрейта вызывают ошибку вместо округления.
@@ -94,10 +147,10 @@ private slots:
 	void profileValidationShowsReasonOnceAndTurnsGreenAfterCorrection_data();
 	// Отказ формы и сериализатора красный, причина понятна, явное исправление позволяет подтверждённое сохранение.
 	void profileValidationShowsReasonOnceAndTurnsGreenAfterCorrection();
-	// Серверный вложенный путь и HTML-причина сохраняются обычным текстом без value и доверия к messageKey.
+	// Серверный путь и HTML-причина передаются уведомлению, без повторения в форме и доверия к messageKey.
 	void nestedServerValidationIsPlainTextAndKeepsReasonOnce();
-	// Причина сервера сохраняется, но точные секреты текущей карточки скрываются и вне отдельного value.
-	void serverValidationRedactsSecretsEmbeddedInMessage();
+	// Серверная причина не дублируется в форме карточки, включая полученные в ней секретные значения.
+	void serverValidationReasonIsAbsentFromEditor();
 	// Задаёт подтверждённый отказ, конфликт и неопределённый исход отправленного изменения.
 	void mutationFailuresStayRedWithoutClaimingUnknownWasRejected_data();
 	// Красный цвет не превращает потерянный ответ в подтверждённый отказ и не повторяет изменение.
@@ -139,9 +192,9 @@ private slots:
 	// Отказ подтверждения dirty-навигации сохраняет ввод; скрытие страницы маскирует секреты.
 	void dirtyNavigationRequiresDecisionAndPageRemasksSecrets();
 	// Задаёт оба пользовательских режима штатного журнала.
-	void clientLogsExcludeServerSecretsInBothModes_data();
-	// Успехи и отказы CRUD проходят через sink Runtime без payload, ключей, endpoint и сырых серверных текстов.
-	void clientLogsExcludeServerSecretsInBothModes();
+	void clientLogsIncludeOnlyReceivedFailureDiagnostics_data();
+	// Журнал содержит полученную диагностику отказа, но не запросы и успешную конфигурацию.
+	void clientLogsIncludeOnlyReceivedFailureDiagnostics();
 	// Задаёт открытие существующей карточки и создание новой после явного отказа от stale draft.
 	void explicitDiscardAfterProfileChangeAllowsCurrentContext_data();
 	// Подтверждённый отказ от старого ввода не отправляет его и не блокирует текущий UUID.
@@ -338,25 +391,17 @@ void ConfigurationUiTest::receivedEntityChangeAndPageRemaskHideBothRepresentatio
 	field.setReceived({FieldState::Value, QStringLiteral("second")});
 	QCOMPARE(view->echoMode(), QLineEdit::Password);
 }
+// Полные ответы содержат явный audio mode; каждый вариант сохраняется без скрытой подстановки.
 void ConfigurationUiTest::structuredProfilePreservesUntouchedFields_data()
 {
 	QTest::addColumn<QJsonObject>("document");
-	// document последовательно задаёт независимые формы присутствия encoding и LIVE AAC.
+	// document задаёт полный рецепт; audio mode изменяется независимо от прочих параметров.
 	auto document = fixture::groupProfile();
-	QTest::newRow("legacy-null") << document;
-	document.remove(QStringLiteral("encoding"));
-	QTest::newRow("legacy-missing") << document;
-	document.insert(QStringLiteral("encoding"), fixture::encoding());
-	document.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
-	QTest::newRow("explicit-v2") << document;
-	// format/video добавляют непредставимый текст, который нельзя восстанавливать из QString.
-	auto format = document.value(QStringLiteral("format")).toObject();
-	auto video = format.value(QStringLiteral("video")).toObject();
-	video.insert(QStringLiteral("level"), fixture::object(R"({"encoding":"base64","value":"/wBh"})"));
-	format.insert(QStringLiteral("video"), video);
-	document.insert(QStringLiteral("format"), format);
-	QTest::newRow("binary-text") << document;
+	QTest::newRow("explicit-copy") << document;
+	document.insert(QStringLiteral("live_audio_mode"), QStringLiteral("transcode"));
+	QTest::newRow("explicit-transcode") << document;
 }
+
 void ConfigurationUiTest::structuredProfilePreservesUntouchedFields()
 {
 	// document содержит полное независимое представление профиля выбранной строки сценария.
@@ -367,83 +412,85 @@ void ConfigurationUiTest::structuredProfilePreservesUntouchedFields()
 	ProfileEditor editor(translatedKey);
 	editor.setProfile(*decoded.value);
 	GroupProfile restored;
+	// error принимает объяснение отказа чтения, spy выявляет непрошенные изменения при заполнении формы.
 	QString error;
 	QSignalSpy spy(&editor, &ProfileEditor::changed);
 	QVERIFY(spy.isValid());
 	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
 	// encoded сравнивается с независимым исходным JSON целиком, а не с результатом самого редактора.
-	const auto encoded = encodeProfile(restored);
+	const auto encoded = fixture::qtResult(encodeProfile(restored));
 	QVERIFY(encoded);
 	QCOMPARE(*encoded.value, document);
 	QCOMPARE(spy.size(), 0);
 }
-void ConfigurationUiTest::changingOneProfileFieldPreservesBytesAndLegacyAudio()
+// Правка битрейта звука сохраняет прочие поля полного явного рецепта.
+void ConfigurationUiTest::changingOneProfileFieldPreservesExplicitRecipe()
 {
-	// decoded/profile/editor задают старый профиль с двоичным уровнем и отсутствующим LIVE AAC.
-	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
-	QVERIFY(decoded);
-	auto profile = *decoded.value;
-	profile.format.video.level.bytes = QByteArray::fromHex("ff0061");
-	ProfileEditor editor(translatedKey);
-	editor.setProfile(profile);
-	// bitrate — единственный пользовательски изменённый ввод, остальные поля должны остаться точными.
-	auto *bitrate = editor.findChild<QLineEdit *>(QStringLiteral("audio.bitrate"));
-	QVERIFY(bitrate);
-	bitrate->selectAll();
-	QTest::keyClicks(bitrate, "128");
-	// restored/error принимают полный результат и возможную ошибку структурного ввода.
-	GroupProfile restored;
-	QString error;
-	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
-	QCOMPARE(restored.audioEncoding.bitrateBps, quint64(128000));
-	QCOMPARE(restored.format.video.level.bytes, QByteArray::fromHex("ff0061"));
-	QVERIFY(restored.liveAudioMode.isMissing());
-	QVERIFY(restored.encoding.isNull());
-	QCOMPARE(restored.format.video.frameRate.numerator, quint32(60000));
-	QCOMPARE(restored.format.video.frameRate.denominator, quint32(1001));
-}
-void ConfigurationUiTest::incompatibleAudioAndRemovingV2AreRejected()
-{
-	// decoded/profile/editor задают допустимый явный рецепт v2 и LIVE transcode при video transcode.
-	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
-	QVERIFY(decoded);
-	auto profile = *decoded.value;
-	profile.encoding = {FieldState::Value, *decode<Encoding>(fixture::bytes(fixture::encoding())).value};
-	profile.liveAudioMode = {FieldState::Value, QStringLiteral("transcode")};
-	ProfileEditor editor(translatedKey);
-	editor.setProfile(profile);
-	// recipe позволяет пользователю запросить legacy, но уже сохранённый v2 нельзя молча удалить.
-	auto *recipe = editor.findChild<QComboBox *>(QStringLiteral("encodingPresence"));
-	QVERIFY(recipe);
-	recipe->setCurrentIndex(1);
-	QVERIFY(QMetaObject::invokeMethod(recipe, "activated", Q_ARG(int, 1)));
-	// restored/error фиксируют отказ удаления и затем независимый отказ несовместимого режима AAC.
-	GroupProfile restored;
-	QString error;
-	QVERIFY(!editor.readProfile(restored, error));
-	QVERIFY(!error.isEmpty());
-	editor.setProfile(profile);
-	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("mode")), QStringLiteral("copy")));
-	QVERIFY(!editor.readProfile(restored, error));
-	QVERIFY(!error.isEmpty());
-}
-void ConfigurationUiTest::changingLegacyVideoModeRequiresExplicitAudioDecision()
-{
-	// decoded/editor задают старый transcode с наследуемой обработкой AAC.
+	// decoded задаёт независимый исходный рецепт; editor показывает его пользователю.
 	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
 	QVERIFY(decoded);
 	ProfileEditor editor(translatedKey);
 	editor.setProfile(*decoded.value);
+	// bitrate адресует единственный изменяемый ввод; restored/error принимают итог формы.
+	auto *bitrate = editor.findChild<QLineEdit *>(QStringLiteral("audio.bitrate"));
+	GroupProfile restored;
+	QString error;
+	QVERIFY(bitrate);
+	bitrate->selectAll();
+	QTest::keyClicks(bitrate, "128");
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QCOMPARE(restored.audioEncoding.bitrateBps, quint64(128000));
+	QCOMPARE(restored.format.video.level.bytes, QByteArray("5.1"));
+	QCOMPARE(restored.liveAudioMode.value, QStringLiteral("copy"));
+	QCOMPARE(restored.encoding->videoEncoder, QStringLiteral("h264_nvenc"));
+	QCOMPARE(restored.format.video.frameRate.numerator, quint32(60000));
+	QCOMPARE(restored.format.video.frameRate.denominator, quint32(1001));
+}
+
+// Полный редактор не предлагает удаление encoding, а несовместимая смена режима не становится допустимым запросом.
+void ConfigurationUiTest::fullEncodingAndAudioDependenciesAreEnforced()
+{
+	// decoded/profile задают явный LIVE transcode; editor содержит только конечные элементы выбора.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
+	QVERIFY(decoded);
+	auto profile = *decoded.value;
+	profile.liveAudioMode = {FieldState::Value, QStringLiteral("transcode")};
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(profile);
+	QVERIFY(!editor.findChild<QComboBox *>(QStringLiteral("encodingPresence")));
+	// restored/error фиксируют недопустимый промежуточный рецепт после смены video mode.
+	GroupProfile restored;
+	QString error;
 	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("mode")), QStringLiteral("copy")));
-	// restored/error не должны получить молчаливое переключение наследуемого transcode AAC в copy.
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(!error.isEmpty());
+}
+
+// Неизвестное исходное значение остаётся видимым, недоступным для выбора и не проходит полную замену.
+void ConfigurationUiTest::unknownProfileValueRequiresExplicitRepair()
+{
+	// decoded/profile содержат неизвестный codec_profile; originalDocument не должен теряться в RAM.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
+	QVERIFY(decoded);
+	auto profile = *decoded.value;
+	profile.format.video.codecProfile.bytes = "unknown-profile";
+	// editor/selector представляют неизвестное значение отдельным отключённым пунктом.
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(profile);
+	auto *selector = editor.findChild<QComboBox *>(QStringLiteral("video.codec_profile"));
+	QVERIFY(selector);
+	QVERIFY(!selector->isEditable());
+	QCOMPARE(selector->currentData().toByteArray(), QByteArray("unknown-profile"));
+	QVERIFY(!(selector->model()->flags(selector->model()->index(selector->currentIndex(), 0)) & Qt::ItemIsEnabled));
+	// restored/error требуют явного исправления на разрешённое high.
 	GroupProfile restored;
 	QString error;
 	QVERIFY(!editor.readProfile(restored, error));
-	QVERIFY(!error.isEmpty());
-	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("live_audio_mode")), QStringLiteral("copy")));
+	QVERIFY(choose(selector, QStringLiteral("high")));
 	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
-	QCOMPARE(*restored.liveAudioMode, QStringLiteral("copy"));
+	QCOMPARE(restored.originalDocument, profile.originalDocument);
 }
+
 void ConfigurationUiTest::newProfileRequiresExplicitMediaFormat()
 {
 	// profile содержит только разрешённый default LIVE AAC copy, без вымышленных размеров/частот/битрейтов.
@@ -500,10 +547,7 @@ void ConfigurationUiTest::bitrateUnitsPreservePrecisionAndConvertExplicitInput()
 	editor.setProfile(profile);
 	GroupProfile restored;
 	QString error;
-	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
-	QCOMPARE(restored.videoEncoding.targetBitrateBps, quint64(6000123));
-	QCOMPARE(restored.videoEncoding.maxBitrateBps, std::numeric_limits<quint64>::max());
-	QCOMPARE(restored.audioEncoding.bitrateBps, quint64(160001));
+	QVERIFY(!editor.readProfile(restored, error));
 	// target/maximum/audio показывают точные десятичные кбит/с и принимают обычный ввод OBS.
 	auto *target = editor.findChild<QLineEdit *>(QStringLiteral("video.target"));
 	auto *maximum = editor.findChild<QLineEdit *>(QStringLiteral("video.maximum"));
@@ -514,7 +558,7 @@ void ConfigurationUiTest::bitrateUnitsPreservePrecisionAndConvertExplicitInput()
 		 QStringLiteral("18446744073709551.615"));
 	QCOMPARE(QString(audio->text()).replace(QLatin1Char(','), QLatin1Char('.')), QStringLiteral("160.001"));
 	maximum->selectAll();
-	QTest::keyClicks(maximum, "18446744073709551.615");
+	QTest::keyClicks(maximum, "8000.001");
 	target->selectAll();
 	QTest::keyClicks(target, "6000");
 	audio->selectAll();
@@ -522,7 +566,7 @@ void ConfigurationUiTest::bitrateUnitsPreservePrecisionAndConvertExplicitInput()
 	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
 	QCOMPARE(restored.videoEncoding.targetBitrateBps, quint64(6000000));
 	QCOMPARE(restored.audioEncoding.bitrateBps, quint64(160000));
-	QCOMPARE(restored.videoEncoding.maxBitrateBps, std::numeric_limits<quint64>::max());
+	QCOMPARE(restored.videoEncoding.maxBitrateBps, quint64(8000001));
 }
 
 // Проверяет две поставляемые локализации без фиксации их конкретной пунктуации.
@@ -647,8 +691,8 @@ void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorr
 	model.insert(QStringLiteral("encoding"), encoding);
 	model.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
 	auto video = model.value(QStringLiteral("video_encoding")).toObject();
-	video.insert(QStringLiteral("target_bitrate_bps"), QStringLiteral("12000000"));
-	video.insert(QStringLiteral("max_bitrate_bps"), QStringLiteral("12000000"));
+	video.insert(QStringLiteral("target_bitrate_bps"), QJsonValue(qint64(12000000)));
+	video.insert(QStringLiteral("max_bitrate_bps"), QJsonValue(qint64(12000000)));
 	model.insert(QStringLiteral("video_encoding"), video);
 	rig.profile.insert(QStringLiteral("profile"), model);
 	// page использует реальный редактор; key адресует локализованную подпись или причину.
@@ -668,8 +712,11 @@ void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorr
 	auto *message = page.findChild<QLabel *>(QStringLiteral("configurationMessage"));
 	QVERIFY(target && maximum && save && message);
 	QVERIFY(!maximum->isVisible());
+	// initialOutcome остаётся прежним: отключённая кнопка не передаёт локальную ошибку контроллеру записи.
+	const auto initialOutcome = rig.state.configurationEditor().outcome;
 	target->selectAll();
 	QTest::keyClicks(target, "12x");
+	QVERIFY(!save->isEnabled());
 	save->click();
 	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
 	QCOMPARE(message->textFormat(), Qt::PlainText);
@@ -677,8 +724,9 @@ void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorr
 	QVERIFY(rig.mutations().isEmpty());
 	target->selectAll();
 	QTest::keyClicks(target, "10000");
+	QVERIFY(!save->isEnabled());
 	save->click();
-	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected);
+	QCOMPARE(rig.state.configurationEditor().outcome, initialOutcome);
 	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
 	// reason/notSaved/label — независимые публичные ресурсы точной причины, общего отказа и понятного поля.
 	const auto reason = translations.value(QStringLiteral("Validation.CbrBitrateMismatch")).toString();
@@ -698,6 +746,7 @@ void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorr
 	QVERIFY(rig.mutations().isEmpty());
 	target->selectAll();
 	QTest::keyClicks(target, "12000");
+	QVERIFY(save->isEnabled());
 	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
 	QVERIFY(!message->text().contains(reason));
 	save->click();
@@ -709,15 +758,18 @@ void ConfigurationUiTest::profileValidationShowsReasonOnceAndTurnsGreenAfterCorr
 	QCOMPARE(rig.mutations().size(), 1);
 }
 
-// Серверная причина сохраняет буквальные теги и один вложенный путь, а отдельное value не попадает в сообщение.
+// Серверный отказ передаётся уведомлению операции, а форма не повторяет его причину и вложенный путь.
 void ConfigurationUiTest::nestedServerValidationIsPlainTextAndKeepsReasonOnce()
 {
-	// translations предоставляет настоящую строку формата для подписи поля и серверной причины.
+	// translations предоставляет настоящие подписи формы, чтобы отсутствие причины не зависело от заглушки.
 	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QStringLiteral("/en-US.ini"),
 			       QSettings::IniFormat);
 	// rig/page открывают обычный серверный профиль; key адресует поставляемую английскую подпись.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
+	// failures получает отдельный серверный отказ; repaint формы его не заменяет.
+	QSignalSpy failures(&rig.configuration, &ConfigurationController::operationFailed);
+	QVERIFY(failures.isValid());
 	ConfigurationEditor page(
 		rig.state, rig.configuration,
 		[&translations](const char *key) {
@@ -746,13 +798,16 @@ void ConfigurationUiTest::nestedServerValidationIsPlainTextAndKeepsReasonOnce()
 	save->click();
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected, 1000);
 	QCOMPARE(rig.mutations().size(), 1);
-	QCOMPARE(rig.state.configurationEditor().fieldIssues.size(), 1);
-	QVERIFY(rig.state.configurationEditor().fieldIssues.contains(
-		QStringLiteral("profile.video_encoding.max_bitrate_bps")));
+	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
+	QCOMPARE(failures.size(), 1);
+	// notification сохраняет PlainText причину и точный серверный путь для общего popup.
+	const auto notification = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	QVERIFY(notification.reason.contains(QStringLiteral("<b>Maximum rejected</b>")));
+	QVERIFY(notification.reason.contains(QStringLiteral("body.profile.video_encoding.max_bitrate_bps")));
 	QCOMPARE(message->textFormat(), Qt::PlainText);
 	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("error"));
-	QCOMPARE(message->text().count(QStringLiteral("<b>Maximum rejected</b>")), 1);
-	QVERIFY(message->text().contains(translations.value(QStringLiteral("Profile.MaxBitrate")).toString()));
+	QVERIFY(!message->text().contains(QStringLiteral("Maximum rejected")));
+	QVERIFY(!message->text().contains(QStringLiteral("<b>Maximum rejected</b>")));
 	QVERIFY(!message->text().contains(QStringLiteral("profile.video_encoding")));
 	QVERIFY(!message->text().contains(QStringLiteral("private-field-value")));
 	QVERIFY(!message->text().contains(QStringLiteral("Configuration.Saved")));
@@ -763,13 +818,13 @@ void ConfigurationUiTest::nestedServerValidationIsPlainTextAndKeepsReasonOnce()
 	QVERIFY(!message->text().contains(QStringLiteral("Maximum rejected")));
 }
 
-// Не даёт серверному message раскрыть точные секреты, уже полученные для открытой карточки назначения.
-void ConfigurationUiTest::serverValidationRedactsSecretsEmbeddedInMessage()
+// Не повторяет серверную причину отказа в открытой карточке назначения; она принадлежит общему уведомлению.
+void ConfigurationUiTest::serverValidationReasonIsAbsentFromEditor()
 {
-	// translations предоставляет реальный формат сообщения с причиной, исключая фиктивный перевод без %1/%2.
+	// translations предоставляет настоящие подписи формы с неизменными форматами подстановки.
 	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QStringLiteral("/en-US.ini"),
 			       QSettings::IniFormat);
-	// rig/page содержат синтетические endpoint и stream_key, доступные редактору, но исключённые из диагностики.
+	// rig/page содержат синтетические endpoint и stream_key, которые сервер включает в причину отказа.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
 	// Переводчик key возвращает поставляемую подпись, сохраняя подстановки редактора.
@@ -805,7 +860,7 @@ void ConfigurationUiTest::serverValidationRedactsSecretsEmbeddedInMessage()
 	QTest::keyClicks(name, "Rejected destination name");
 	save->click();
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected, 1000);
-	QCOMPARE(message->text().count(QStringLiteral("Name rejected for")), 1);
+	QVERIFY(!message->text().contains(QStringLiteral("Name rejected for")));
 	QVERIFY(!message->text().contains(fixture::endpoint()));
 	QVERIFY(!message->text().contains(rig.destination.value(QStringLiteral("stream_key")).toString()));
 	QVERIFY(!message->text().contains(QStringLiteral("private-field-value")));
@@ -844,8 +899,10 @@ void ConfigurationUiTest::mutationFailuresStayRedWithoutClaimingUnknownWasReject
 				request.socket->abort();
 		} else {
 			if (status == 409)
-				rig.group.insert(QStringLiteral("revision"), QStringLiteral("2"));
-			HttpServer::reply(request, "{}", status, "application/problem+json");
+				rig.group.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
+			HttpServer::reply(request,
+					  status == 409 ? R"({"status":409,"code":"revision_conflict"})" : "{}", status,
+					  "application/problem+json");
 		}
 		return true;
 	};
@@ -963,7 +1020,7 @@ void ConfigurationUiTest::partialDestinationSaveKeepsErrorTone()
 		}
 		if (request.method == "PATCH") {
 			documents[id].insert(QStringLiteral("enabled"), false);
-			documents[id].insert(QStringLiteral("revision"), QStringLiteral("2"));
+			documents[id].insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 		}
 		HttpServer::reply(request, fixture::bytes(documents.value(id)));
 		return true;
@@ -1019,7 +1076,7 @@ void ConfigurationUiTest::frameRateChoicesKeepExactRatios()
 	QCOMPARE(restored.format.video.frameRate.denominator, quint32(1));
 }
 
-// Скрытие расширенного раздела и смена кодека сохраняют неизвестные байты и недопустимый сырой ввод.
+// Скрытие расширенного раздела и смена кодека сохраняют неизвестное значение и незавершённый ввод.
 void ConfigurationUiTest::advancedChoicesAndVisibilityKeepUnsavedValues()
 {
 	// decoded/profile моделируют старый профиль с неизвестным именем кодек-профиля и пустым tier.
@@ -1052,7 +1109,7 @@ void ConfigurationUiTest::advancedChoicesAndVisibilityKeepUnsavedValues()
 	advanced->click();
 	advanced->click();
 	QCOMPARE(gop->text(), QStringLiteral("12x"));
-	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.codec")), QStringLiteral("av1")));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.codec")), QStringLiteral("hevc")));
 	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.codec")), QStringLiteral("h264")));
 	QCOMPARE(gop->text(), QStringLiteral("12x"));
 	QCOMPARE(codecProfile->currentData().toByteArray(), QByteArray("unlisted-profile"));
@@ -1085,7 +1142,7 @@ void ConfigurationUiTest::presetsMatchVerifiedCompleteProfiles()
 		QVERIFY(choose(preset, presetId));
 		QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
 		// encoded сравнивается целиком, поэтому неверный скрытый параметр также провалит проверку.
-		const auto encoded = encodeProfile(restored);
+		const auto encoded = fixture::qtResult(encodeProfile(restored));
 		QVERIFY(encoded);
 		QCOMPARE(*encoded.value, expected.value(QStringLiteral("profile")).toObject());
 	}
@@ -1222,7 +1279,7 @@ void ConfigurationUiTest::destinationSecretsEditAndClearThroughSingleFields()
 	QCOMPARE(rig.mutations().size(), 1);
 	QCOMPARE(QJsonDocument::fromJson(rig.mutations().first().body).object(),
 		 (QJsonObject{{QStringLiteral("stream_key"), QStringLiteral("  exact/+%2F  ")},
-			      {QStringLiteral("expected_revision"), QStringLiteral("1")}}));
+			      {QStringLiteral("expected_revision"), QJsonValue(qint64(1))}}));
 	input->selectAll();
 	QTest::keyClick(input, Qt::Key_Backspace);
 	save->click();
@@ -1230,7 +1287,7 @@ void ConfigurationUiTest::destinationSecretsEditAndClearThroughSingleFields()
 	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 1000);
 	QCOMPARE(QJsonDocument::fromJson(rig.mutations().last().body).object(),
 		 (QJsonObject{{QStringLiteral("stream_key"), QString{}},
-			      {QStringLiteral("expected_revision"), QStringLiteral("2")}}));
+			      {QStringLiteral("expected_revision"), QJsonValue(qint64(2))}}));
 	QCOMPARE(rig.destination.value(QStringLiteral("endpoint")).toString(), fixture::endpoint());
 }
 
@@ -1505,7 +1562,7 @@ void ConfigurationUiTest::destinationCardSavesNameWithoutReplacingSecrets()
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Saved, 1000);
 	QCOMPARE(rig.mutations().size(), 1);
 	QCOMPARE(QJsonDocument::fromJson(rig.mutations().first().body).object(),
-		 QJsonObject({{QStringLiteral("expected_revision"), QStringLiteral("1")},
+		 QJsonObject({{QStringLiteral("expected_revision"), QJsonValue(qint64(1))},
 			      {QStringLiteral("name"), QStringLiteral("Renamed destination")}}));
 	QCOMPARE(rig.state.selectedStreamId(), QStringLiteral("stream"));
 	QCOMPARE(page.selectedDestinationId(), QStringLiteral("destination"));
@@ -1570,15 +1627,15 @@ void ConfigurationUiTest::dirtyNavigationRequiresDecisionAndPageRemasksSecrets()
 	QVERIFY(rig.mutations().isEmpty());
 }
 
-void ConfigurationUiTest::clientLogsExcludeServerSecretsInBothModes_data()
+void ConfigurationUiTest::clientLogsIncludeOnlyReceivedFailureDiagnostics_data()
 {
 	QTest::addColumn<bool>("detailed");
 	QTest::newRow("normal") << false;
 	QTest::newRow("detailed") << true;
 }
-void ConfigurationUiTest::clientLogsExcludeServerSecretsInBothModes()
+void ConfigurationUiTest::clientLogsIncludeOnlyReceivedFailureDiagnostics()
 {
-	// detailed выбирает normal или detailed без изменения требований к исключению секретов.
+	// detailed выбирает обычный либо подробный режим: оба сохраняют полученную диагностику отказа.
 	QFETCH(bool, detailed);
 	// temp/file изолируют preferences настоящего Runtime, logs принимает только его итоговые записи.
 	WorkspaceTemp temp(QStringLiteral("safe-client-log"));
@@ -1586,7 +1643,8 @@ void ConfigurationUiTest::clientLogsExcludeServerSecretsInBothModes()
 	const auto file = temp.filePath(QStringLiteral("settings.json"));
 	QStringList logs;
 	{
-		// preferences отключает автоматическую сеть и задаёт проверяемый режим до загрузки Runtime.
+		// preferences задаёт режим журнала; совместимый auto_connect не управляет текущим runtime.
+		// Сеть не запускается до отсутствующего в этом сценарии события FinishedLoading.
 		SettingsStore preferences(file);
 		preferences.setAutoConnect(false);
 		preferences.setDetailedLogging(detailed);
@@ -1636,11 +1694,13 @@ void ConfigurationUiTest::clientLogsExcludeServerSecretsInBothModes()
 	const auto combined = logs.join(QLatin1Char('\n'));
 	QVERIFY(!combined.isEmpty());
 	QVERIFY(combined.contains(QStringLiteral("422")));
-	// secret перечисляет независимые запрещённые источники: ввод, DTO и полученные ошибки.
-	for (const auto &secret : {QStringLiteral("private-user-payload"), fixture::endpoint(),
-				   QStringLiteral("key/%2F+="), QStringLiteral("server-raw-secret"),
-				   QStringLiteral("synthetic-private-payload"), QStringLiteral("clipboard-secret")})
-		QVERIFY2(!combined.contains(secret), "Секретное значение попало в штатный журнал клиента.");
+	// secret перечисляет значения запроса и успешного DTO: они не входят в полученную диагностику ошибки.
+	for (const auto &secret :
+	     {QStringLiteral("private-user-payload"), fixture::endpoint(), QStringLiteral("key/%2F+=")})
+		QVERIFY2(!combined.contains(secret), "Журнал не должен выгружать запрос или успешную конфигурацию.");
+	QVERIFY(combined.contains(QStringLiteral("server-raw-secret")));
+	QVERIFY(combined.contains(QStringLiteral("synthetic-private-payload")));
+	QVERIFY(combined.contains(QStringLiteral("clipboard-secret")));
 }
 
 void ConfigurationUiTest::explicitDiscardAfterProfileChangeAllowsCurrentContext_data()
@@ -1859,7 +1919,9 @@ void ConfigurationUiTest::failedFirstDetailReadKeepsVisibleErrorAndReload()
 		if (detailReads != 1)
 			return false;
 		if (status)
-			HttpServer::reply(request, "{}", status, "application/problem+json");
+			HttpServer::reply(request,
+					  status == 409 ? R"({"status":409,"code":"revision_conflict"})" : "{}", status,
+					  "application/problem+json");
 		return true;
 	};
 	QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
@@ -2055,6 +2117,486 @@ void ConfigurationUiTest::deletingRecordReplacesStaleValidationWhilePending()
 	QCOMPARE(message->property("statusTone").toString(), QStringLiteral("active"));
 	QVERIFY(!message->text().contains(QStringLiteral("Configuration.NotSaved")));
 	QCOMPARE(rig.mutations().size(), 1);
+}
+
+// Нормализованный custom проверяется полным валидатором после правки первой из двух пар.
+void ConfigurationUiTest::editingCustomPairKeepsCanonicalOrder()
+{
+	// decoded/profile задают независимо допустимые параметры NVENC с двумя упорядоченными опциями.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
+	QVERIFY(decoded);
+	auto profile = *decoded.value;
+	profile.encoding->videoCustom = QStringLiteral("nonref_p=0 strict_gop=1");
+	// editor отображает полный рецепт до единственной пользовательской правки custom.
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(profile);
+	// nonref адресует единственную пользовательскую правку; restored/error принимают полный результат.
+	auto *nonref = editor.findChild<QComboBox *>(QStringLiteral("custom.nonref_p"));
+	GroupProfile restored;
+	QString error;
+	QVERIFY(choose(nonref, QStringLiteral("1")));
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QCOMPARE(restored.encoding->videoCustom, QStringLiteral("nonref_p=1 strict_gop=1"));
+	QVERIFY(encodeProfile(restored));
+}
+
+// Просмотр неизвестного source не позволяет отправить его как допустимую полную замену.
+void ConfigurationUiTest::unsupportedCustomCanBeExplicitlyRepaired()
+{
+	// document содержит новую неизвестную пару, original сохраняет её исходный lossless документ.
+	auto document = fixture::groupProfile();
+	// encoding получает неизвестную пару без изменения остальных исходных параметров.
+	auto encoding = document.value(QStringLiteral("encoding")).toObject();
+	encoding.insert(QStringLiteral("video_custom"), QStringLiteral("nonref_p=1 unsupported=1"));
+	document.insert(QStringLiteral("encoding"), encoding);
+	const auto original = decode<GroupProfile>(fixture::bytes(document));
+	QVERIFY(original);
+	// editor/source показывают неизвестную строку отключённым пунктом без свободного CLI.
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(*original.value);
+	auto *source = editor.findChild<QComboBox *>(QStringLiteral("unsupportedCustom.video"));
+	QVERIFY(source && !source->isEditable());
+	QCOMPARE(source->currentData().toString(), QStringLiteral("nonref_p=1 unsupported=1"));
+	QVERIFY(!(source->model()->flags(source->model()->index(source->currentIndex(), 0)) & Qt::ItemIsEnabled));
+	// restored/error требуют решения пользователя; удаление лишнего сохраняет известную пару.
+	GroupProfile restored;
+	QString error;
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(source, QString{}));
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QCOMPARE(restored.encoding->videoCustom, QStringLiteral("nonref_p=1"));
+	QCOMPARE(restored.originalDocument, original.value->originalDocument);
+	QVERIFY(original.value->originalDocument.toObject()
+			.value(QStringLiteral("encoding"))
+			.toObject()
+			.value(QStringLiteral("video_custom"))
+			.toString()
+			.contains(QStringLiteral("unsupported=1")));
+}
+
+// Настоящая CRUD ошибка проходит через Runtime в один временный диалог и одну запись штатного журнала.
+void ConfigurationUiTest::operationFailurePopupIsSinglePlainTextAndContextBound()
+{
+	// temp/file изолируют настройки; logs хранит только сообщения переданного Runtime sink.
+	WorkspaceTemp temp(QStringLiteral("operation-notification"));
+	QVERIFY(temp.isValid());
+	const auto file = temp.filePath(QStringLiteral("settings.json"));
+	QStringList logs;
+	{
+		// preferences сохраняет совместимый флаг; сеть здесь не запускается без FinishedLoading.
+		SettingsStore preferences(file);
+		preferences.setAutoConnect(false);
+		QVERIFY(preferences.save());
+	}
+	// server возвращает настоящий Problem с буквальными HTML тегами и синтетическим маркером диагностики.
+	HttpServer server;
+	QVERIFY(server.listen());
+	server.handler = [](const HttpServer::Request &request) {
+		if (request.method == "PATCH")
+			HttpServer::reply(
+				request,
+				R"({"status":422,"code":"invalid_profile","detail":"<b>rejected</b>","action":"<i>repair</i>","diagnostic":"synthetic-secret-marker"})",
+				422, "application/problem+json");
+		else
+			HttpServer::reply(request, fixture::bytes(fixture::destination()));
+	};
+	// frontend/lifecycle создают настоящий presenter с родителем главного OBS окна фикстуры.
+	// Переданный обработчик журнала добавляет подготовленное message в logs без обращения к OBS.
+	FakeFrontend frontend;
+	PluginLifecycle lifecycle(frontend, translatedKey,
+				  {QStringLiteral("test"), file, [&](LogSeverity, const QString &message) {
+					   logs.append(message);
+				   }});
+	QVERIFY(lifecycle.load());
+	// state/controller дают публичную точку явной операции; failures независимо наблюдает событие владельца.
+	auto *state = lifecycle.stateStore();
+	auto *controller = lifecycle.configurationController();
+	QVERIFY(state && controller);
+	state->setConnection(server.origin().toString(), ConnectionStatus::Connected);
+	state->setSelection({}, true, {}, {}, QStringLiteral("profile-uuid"));
+	QSignalSpy failures(controller, &ConfigurationController::operationFailed);
+	QVERIFY(failures.isValid());
+	QVERIFY(controller->open(ConfigurationKind::Destination, QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(state->configurationEditor().base.has_value(), 1000);
+	QVERIFY(frontend.host->findChildren<OperationErrorDialog *>().isEmpty());
+	// draft задаёт первое явное изменение; подтверждённый отказ не сохраняет diagnosticBody в StateStore.
+	auto draft = std::get<Destination>(*state->configurationEditor().draft);
+	draft.name = QStringLiteral("first mutation");
+	QVERIFY(controller->setDraft(draft, {QStringLiteral("name")}));
+	QVERIFY(controller->save());
+	QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, 1000);
+	// dialog/reason/action адресуют единственное окно и два обычных текстовых блока.
+	QPointer<OperationErrorDialog> dialog = frontend.host->findChild<OperationErrorDialog *>();
+	QVERIFY(dialog);
+	auto *reason = dialog->findChild<QLabel *>(QStringLiteral("operationErrorReason"));
+	auto *action = dialog->findChild<QLabel *>(QStringLiteral("operationErrorAction"));
+	QVERIFY(reason && action);
+	QCOMPARE(reason->textFormat(), Qt::PlainText);
+	QCOMPARE(action->textFormat(), Qt::PlainText);
+	QCOMPARE(reason->text(), QStringLiteral("<b>rejected</b>"));
+	QCOMPARE(action->text(), QStringLiteral("<i>repair</i>"));
+	QCOMPARE(frontend.host->findChildren<OperationErrorDialog *>().size(), 1);
+	// notification содержит уже проверенный event; countLogs различает отдельные записи, не число вхождений в body.
+	auto notification = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	const auto countLogs = [&logs] {
+		return logs.filter(QStringLiteral("Отказ операции:")).size();
+	};
+	QCOMPARE(countLogs(), 1);
+	QVERIFY(logs.join(QLatin1Char('\n')).contains(QStringLiteral("synthetic-secret-marker")));
+	QVERIFY(notification.diagnosticBody.contains("synthetic-secret-marker"));
+	QVERIFY(state->configurationEditor().messageKey != QStringLiteral("synthetic-secret-marker"));
+	controller->operationFailed(notification);
+	QCOMPARE(countLogs(), 1);
+	QCOMPARE(frontend.host->findChildren<OperationErrorDialog *>().size(), 1);
+	// late моделирует чужой context на границе presenter: даже новый ID не разрешает старому профилю окно/log.
+	auto late = notification;
+	late.generation += 1;
+	late.context.profileUuid = QStringLiteral("foreign-profile");
+	controller->operationFailed(late);
+	QCOMPARE(countLogs(), 1);
+	// Второе реальное намерение обновляет прежний popup, а не создаёт второе окно или историю.
+	draft.name = QStringLiteral("second mutation");
+	QVERIFY(controller->setDraft(draft, {QStringLiteral("name")}));
+	QVERIFY(controller->save());
+	QTRY_COMPARE_WITH_TIMEOUT(countLogs(), 2, 1000);
+	QCOMPARE(frontend.host->findChild<OperationErrorDialog *>(), dialog.data());
+	QCOMPARE(frontend.host->findChildren<OperationErrorDialog *>().size(), 1);
+	lifecycle.shutdown();
+	QVERIFY(dialog.isNull());
+	QCOMPARE(frontend.callsAfterExit, 0);
+}
+
+// UI использует конечные технические значения, а quality диапазон остаётся точным текстовым вводом.
+void ConfigurationUiTest::finiteSelectorsAndQualityDraftStayExact()
+{
+	// decoded/profile задают полный HEVC CRF рецепт с точными сотыми.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(fixture::groupProfile()));
+	QVERIFY(decoded);
+	auto profile = *decoded.value;
+	profile.format.video.codec = QStringLiteral("hevc");
+	profile.format.video.codecProfile.bytes = "main";
+	profile.format.video.level.bytes = "auto";
+	profile.videoEncoding = {0, 0, 0, 120, 0, true};
+	profile.encoding->videoEncoder = QStringLiteral("libx265");
+	profile.encoding->videoCustom.clear();
+	profile.encoding->rateControl = QStringLiteral("crf");
+	profile.encoding->nvenc.state = FieldState::Missing;
+	profile.encoding->crfHundredths = {FieldState::Value, 2225};
+	// editor/crf/control адресуют настоящий ввод и динамическую применимость качества.
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(profile);
+	auto *crf = editor.findChild<QLineEdit *>(QStringLiteral("encoding.crf"));
+	auto *control = editor.findChild<QComboBox *>(QStringLiteral("encoding.rate_control"));
+	QVERIFY(crf && control && !control->isEditable());
+	QCOMPARE(QString(crf->text()).replace(QLatin1Char(','), QLatin1Char('.')), QStringLiteral("22.25"));
+	// name перечисляет конечные boolean поля; selector не допускает произвольную строку вместо bool.
+	for (const auto &name : {QStringLiteral("video.closed_gop"), QStringLiteral("encoding.rescale"),
+				 QStringLiteral("nvenc.spatial"), QStringLiteral("nvenc.temporal")}) {
+		// selector адресует текущий конечный флаг, не допускающий произвольного строкового ввода.
+		auto *selector = editor.findChild<QComboBox *>(name);
+		QVERIFY(selector && !selector->isEditable());
+	}
+	crf->selectAll();
+	QTest::keyClicks(crf, "22.");
+	QVERIFY(choose(control, QStringLiteral("vbr")));
+	QVERIFY(!crf->isEnabled());
+	QCOMPARE(crf->text(), QStringLiteral("22."));
+	// draft сохраняет выключенную незавершённую строку при скрытии и восстановлении формы.
+	const auto draft = editor.captureDraft();
+	editor.hide();
+	editor.setProfile(profile);
+	editor.restoreDraft(draft);
+	QCOMPARE(crf->text(), QStringLiteral("22."));
+	QVERIFY(choose(control, QStringLiteral("crf")));
+	QVERIFY(crf->isEnabled());
+	crf->selectAll();
+	QTest::keyClicks(crf, "22.25");
+	// restored/error проверяют точное число после явного завершения ввода.
+	GroupProfile restored;
+	QString error;
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QCOMPARE(restored.encoding->crfHundredths.value, 2225);
+}
+
+// Проверяет по одному полному рецепту на существенную GUI-границу, не дублируя чистую матрицу валидатора.
+void ConfigurationUiTest::expandedProfilesKeepFiniteIdentityAndCompleteRecipe_data()
+{
+	QTest::addColumn<QJsonObject>("document");
+	// add создаёт отдельную строку name из независимого JSON patch; значения не вычисляются редактором.
+	const auto add = [](const char *name, const QByteArray &patch) {
+		QTest::newRow(name) << expandedProfile(patch);
+	};
+	add("hevc-cbr-aac-5.1", R"({"format":{"audio":{"channels":6,"channel_layout":"5.1"}},
+"audio_encoding":{"bitrate_bps":384000}})");
+	add("hevc-cqp-zero-opus", R"({"format":{"audio":{"codec":"opus","codec_profile":"celt"}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"audio_encoder":"libopus","rate_control":"cqp","qp":0}})");
+	add("hevc-pq-crf-flac", R"({"live_audio_mode":"transcode",
+"format":{"video":{"codec_profile":"main10","pixel_format":"yuv420p10le","bit_depth":10,
+"color":{"primaries":"bt2020","transfer":"smpte2084","matrix":"bt2020nc"}},
+"audio":{"codec":"flac","codec_profile":"s16"}},"audio_encoding":{"bitrate_bps":0},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"audio_encoder":"flac","rate_control":"crf","crf":23.51}})");
+	add("vp9-hlg-crf-zero-mp3", R"({"mode":"copy",
+"format":{"video":{"codec":"vp9","codec_profile":"profile2","pixel_format":"yuv420p10le","bit_depth":10,
+"color":{"primaries":"bt2020","transfer":"arib-std-b67","matrix":"bt2020nc"}},
+"audio":{"codec":"mp3","codec_profile":"mpeg1-layer3"}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libvpx-vp9","audio_encoder":"libmp3lame","rate_control":"crf","crf":0}})");
+	add("vp9-vbr-ac3", R"({"format":{"video":{"codec":"vp9","codec_profile":"profile0"},
+"audio":{"codec":"ac3","codec_profile":"ac3"}},"audio_encoding":{"bitrate_bps":192000},
+"video_encoding":{"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libvpx-vp9","audio_encoder":"ac3","rate_control":"vbr"}})");
+	add("hevc-nvenc-vbr", R"({"video_encoding":{"max_bitrate_bps":8000000},
+"encoding":{"video_encoder":"hevc_nvenc","rate_control":"vbr"}})");
+	add("x264-cqp-zero", R"({"format":{"video":{"codec":"h264","codec_profile":"high444","pixel_format":"yuv444p"}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libx264","rate_control":"cqp","qp":0}})");
+	add("x264-crf-zero", R"({"format":{"video":{"codec":"h264","codec_profile":"high444","pixel_format":"yuv444p"}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libx264","rate_control":"crf","crf":0}})");
+	add("aom-crf-professional", R"({"mode":"copy",
+"format":{"video":{"codec":"av1","codec_profile":"professional","pixel_format":"yuv422p10le","bit_depth":10}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libaom-av1","rate_control":"crf","crf":35}})");
+	add("svt-cqp", R"({"mode":"copy","format":{"video":{"codec":"av1"}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libsvtav1","rate_control":"cqp","qp":35,
+"svt_av1":{"preset":8,"tuning":"psnr","aq_mode":0,"lookahead_frames":-1}}})");
+	add("aac-2.1", R"({"format":{"audio":{"channels":3,"channel_layout":"2.1"}}})");
+	add("aac-3.0", R"({"format":{"audio":{"channels":3,"channel_layout":"3.0"}}})");
+}
+
+// Каждый выбранный пункт доступен как точное itemData; повторный явный выбор также проходит проекцию формы.
+void ConfigurationUiTest::expandedProfilesKeepFiniteIdentityAndCompleteRecipe()
+{
+	// document задаёт независимый полный ожидаемый результат текущего сценария.
+	QFETCH(QJsonObject, document);
+	// decoded проверяет обычную границу чтения DTO, editor содержит реальные Widgets и их привязки.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(document));
+	QVERIFY(decoded);
+	ProfileEditor editor(translatedKey);
+	// changes отличает отражение загруженного рецепта от явного пользовательского выбора.
+	QSignalSpy changes(&editor, &ProfileEditor::changed);
+	QVERIFY(changes.isValid());
+	editor.setProfile(*decoded.value);
+	QCOMPARE(changes.size(), 0);
+	// restored/error проверяют чтение сразу после загрузки; loaded сравнивает весь рецепт до activated.
+	GroupProfile restored;
+	QString error;
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	const auto loaded = fixture::qtResult(encodeProfile(restored));
+	QVERIFY(loaded);
+	QCOMPARE(*loaded.value, document);
+	// video, audio, color и encoding берут ожидаемые технические значения из независимого документа.
+	const auto video =
+		document.value(QStringLiteral("format")).toObject().value(QStringLiteral("video")).toObject();
+	const auto audio =
+		document.value(QStringLiteral("format")).toObject().value(QStringLiteral("audio")).toObject();
+	const auto color = video.value(QStringLiteral("color")).toObject();
+	const auto encoding = document.value(QStringLiteral("encoding")).toObject();
+	// expected связывает публичный формат с конкретными конечными контролами, включая тип QByteArray для ProfileText.
+	const QVariantMap expected{
+		{QStringLiteral("mode"), document.value(QStringLiteral("mode")).toString()},
+		{QStringLiteral("live_audio_mode"), document.value(QStringLiteral("live_audio_mode")).toString()},
+		{QStringLiteral("video.codec"), video.value(QStringLiteral("codec")).toString()},
+		{QStringLiteral("video.codec_profile"),
+		 video.value(QStringLiteral("codec_profile")).toString().toUtf8()},
+		{QStringLiteral("video.level"), video.value(QStringLiteral("level")).toString().toUtf8()},
+		{QStringLiteral("video.tier"), video.value(QStringLiteral("tier")).toString().toUtf8()},
+		{QStringLiteral("video.pixel_format"), video.value(QStringLiteral("pixel_format")).toString().toUtf8()},
+		{QStringLiteral("video.bit_depth"), QString::number(video.value(QStringLiteral("bit_depth")).toInt())},
+		{QStringLiteral("video.color.range"), color.value(QStringLiteral("range")).toString().toUtf8()},
+		{QStringLiteral("video.color.primaries"), color.value(QStringLiteral("primaries")).toString().toUtf8()},
+		{QStringLiteral("video.color.transfer"), color.value(QStringLiteral("transfer")).toString().toUtf8()},
+		{QStringLiteral("video.color.matrix"), color.value(QStringLiteral("matrix")).toString().toUtf8()},
+		{QStringLiteral("audio.codec"), audio.value(QStringLiteral("codec")).toString()},
+		{QStringLiteral("audio.codec_profile"),
+		 audio.value(QStringLiteral("codec_profile")).toString().toUtf8()},
+		{QStringLiteral("audio.sample_rate"),
+		 QString::number(audio.value(QStringLiteral("sample_rate_hz")).toInt())},
+		{QStringLiteral("audio.channels"), QString::number(audio.value(QStringLiteral("channels")).toInt())},
+		{QStringLiteral("audio.channel_layout"),
+		 audio.value(QStringLiteral("channel_layout")).toString().toUtf8()},
+		{QStringLiteral("encoding.video_encoder"), encoding.value(QStringLiteral("video_encoder")).toString()},
+		{QStringLiteral("encoding.audio_encoder"), encoding.value(QStringLiteral("audio_encoder")).toString()},
+		{QStringLiteral("encoding.rate_control"), encoding.value(QStringLiteral("rate_control")).toString()}};
+	// field указывает на ожидаемый технический выбор; selector принадлежит только текущему редактору.
+	for (auto field = expected.begin(); field != expected.end(); ++field) {
+		auto *selector = editor.findChild<QComboBox *>(field.key());
+		QVERIFY2(selector, qPrintable(field.key()));
+		QVERIFY(!selector->isEditable());
+		QVERIFY(selector->isEnabled());
+		QCOMPARE(selector->currentData().metaType(), field.value().metaType());
+		QCOMPARE(selector->currentData(), field.value());
+		QVERIFY(selector->model()->flags(selector->model()->index(selector->currentIndex(), 0)) &
+			Qt::ItemIsEnabled);
+		QVERIFY(choose(selector, field.value().toString()));
+	}
+	// qp/crf проверяют применимость диапазонов независимо от общего каталога реализации.
+	auto *qp = editor.findChild<QLineEdit *>(QStringLiteral("encoding.qp"));
+	auto *crf = editor.findChild<QLineEdit *>(QStringLiteral("encoding.crf"));
+	QVERIFY(qp && crf);
+	QCOMPARE(qp->isEnabled(), encoding.contains(QStringLiteral("qp")));
+	QCOMPARE(crf->isEnabled(), encoding.contains(QStringLiteral("crf")));
+	// encoded выявляет потерю любого поля или утечку неприменимого блока после явного выбора.
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	const auto encoded = fixture::qtResult(encodeProfile(restored));
+	QVERIFY(encoded);
+	QCOMPARE(*encoded.value, document);
+}
+
+// Зависимые каталоги запрещают прежние значения после смены формата и не заменяют их автоматически.
+void ConfigurationUiTest::expandedDependenciesRequireExplicitRepair()
+{
+	// source задаёт AAC 5.1 с допустимым для Opus битрейтом, чтобы отказ зависел только от аудиопривязки.
+	const auto source = expandedProfile(R"({"format":{"audio":{"channels":6,"channel_layout":"5.1"}}})");
+	// decoded/editor проходят обычную загрузку полного профиля, restored/error принимают результат каждой правки.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(source));
+	QVERIFY(decoded);
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(*decoded.value);
+	GroupProfile restored;
+	QString error;
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("audio.codec")), QStringLiteral("opus")));
+	// unsupported содержит прежние значения AAC, каждое из которых должно остаться видимым, но недоступным.
+	const QMap<QString, QString> unsupported{{QStringLiteral("audio.codec_profile"), QStringLiteral("LC")},
+						 {QStringLiteral("audio.channels"), QStringLiteral("6")},
+						 {QStringLiteral("audio.channel_layout"), QStringLiteral("5.1")},
+						 {QStringLiteral("encoding.audio_encoder"), QStringLiteral("aac")}};
+	// field проходит прежние значения; selector адресует соответствующий зависимый список.
+	for (auto field = unsupported.begin(); field != unsupported.end(); ++field) {
+		auto *selector = editor.findChild<QComboBox *>(field.key());
+		QVERIFY(selector && !selector->isEditable());
+		QCOMPARE(selector->currentData().toString(), field.value());
+		QVERIFY(!(selector->model()->flags(selector->model()->index(selector->currentIndex(), 0)) &
+			  Qt::ItemIsEnabled));
+		QVERIFY(!choose(selector, field.value()));
+	}
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(!error.isEmpty());
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("audio.codec_profile")), QStringLiteral("celt")));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("encoding.audio_encoder")),
+		       QStringLiteral("libopus")));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("audio.channels")), QStringLiteral("2")));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("audio.channel_layout")),
+		       QStringLiteral("stereo")));
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	// opus ожидает только явно исправленную аудиопривязку; прочие поля полного рецепта остаются прежними.
+	const auto opus = fixture::qtResult(encodeProfile(restored));
+	QVERIFY(opus);
+	QCOMPARE(*opus.value, mergeProfileFields(source, fixture::object(R"({"format":{"audio":{"codec":"opus",
+"codec_profile":"celt","channels":2,"channel_layout":"stereo"}},"encoding":{"audio_encoder":"libopus"}})")));
+
+	// hdr задаёт допустимый PQ-рецепт, transfer проверяет запрет сохранения PQ после явного перехода к 8 битам.
+	const auto hdr = decode<GroupProfile>(fixture::bytes(expandedProfile(R"({"format":{"video":{
+"codec_profile":"main10","pixel_format":"yuv420p10le","bit_depth":10,
+"color":{"primaries":"bt2020","transfer":"smpte2084","matrix":"bt2020nc"}}}})")));
+	QVERIFY(hdr);
+	editor.setProfile(*hdr.value);
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	auto *transfer = editor.findChild<QComboBox *>(QStringLiteral("video.color.transfer"));
+	QVERIFY(transfer);
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.codec_profile")), QStringLiteral("main")));
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.pixel_format")), QStringLiteral("yuv420p")));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.bit_depth")), QStringLiteral("8")));
+	QCOMPARE(transfer->currentData().toByteArray(), QByteArray("smpte2084"));
+	QVERIFY(!choose(transfer, QStringLiteral("smpte2084")));
+	QVERIFY(!choose(transfer, QStringLiteral("arib-std-b67")));
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(transfer, QStringLiteral("bt709")));
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.color.primaries")),
+		       QStringLiteral("bt709")));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("video.color.matrix")), QStringLiteral("bt709")));
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	// sdr подтверждает весь исправленный рецепт, включая сохранённые размеры, FPS, GOP и аудио.
+	const auto sdr = fixture::qtResult(encodeProfile(restored));
+	QVERIFY(sdr);
+	QCOMPARE(*sdr.value, expandedProfile("{}"));
+
+	// flac содержит два явных transcode-режима; live проверяет их зависимость при смене видео на copy.
+	const auto flac = decode<GroupProfile>(fixture::bytes(expandedProfile(R"({"live_audio_mode":"transcode",
+"format":{"audio":{"codec":"flac","codec_profile":"s16"}},"audio_encoding":{"bitrate_bps":0},
+"encoding":{"audio_encoder":"flac"}})")));
+	QVERIFY(flac);
+	editor.setProfile(*flac.value);
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	auto *live = editor.findChild<QComboBox *>(QStringLiteral("live_audio_mode"));
+	QVERIFY(live);
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("mode")), QStringLiteral("copy")));
+	QCOMPARE(live->currentData().toString(), QStringLiteral("transcode"));
+	QVERIFY(!choose(live, QStringLiteral("transcode")));
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(live, QStringLiteral("copy")));
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(editor.findChild<QComboBox *>(QStringLiteral("mode")), QStringLiteral("transcode")));
+	QVERIFY(choose(live, QStringLiteral("transcode")));
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QCOMPARE(restored.audioEncoding.bitrateBps, quint64(0));
+}
+
+// Смена CQP/CRF не превращает отсутствующее качество в ноль и не отправляет отключённую незавершённую строку.
+void ConfigurationUiTest::qualityModeChangesKeepOnlyApplicableValue()
+{
+	// decoded содержит x264 High444 с явным QP0, для которого контракт допускает также CRF0.
+	const auto decoded = decode<GroupProfile>(fixture::bytes(expandedProfile(R"({"format":{"video":{
+"codec":"h264","codec_profile":"high444","pixel_format":"yuv444p"}},
+"video_encoding":{"target_bitrate_bps":0,"max_bitrate_bps":0,"buffer_bits":0},
+"encoding":{"video_encoder":"libx264","rate_control":"cqp","qp":0}})")));
+	QVERIFY(decoded);
+	// editor/control/qp/crf адресуют реальную форму и три поля, участвующие в смене режима качества.
+	ProfileEditor editor(translatedKey);
+	editor.setProfile(*decoded.value);
+	auto *control = editor.findChild<QComboBox *>(QStringLiteral("encoding.rate_control"));
+	auto *qp = editor.findChild<QLineEdit *>(QStringLiteral("encoding.qp"));
+	auto *crf = editor.findChild<QLineEdit *>(QStringLiteral("encoding.crf"));
+	QVERIFY(control && qp && crf);
+	QCOMPARE(qp->text(), QStringLiteral("0"));
+	QVERIFY(crf->text().isEmpty());
+	// restored/error проверяют отдельное присутствие качества после пользовательского выбора и ввода.
+	GroupProfile restored;
+	QString error;
+	QVERIFY(choose(control, QStringLiteral("crf")));
+	QVERIFY(!qp->isEnabled() && crf->isEnabled());
+	QVERIFY(!editor.readProfile(restored, error));
+	QTest::keyClicks(crf, "23.50");
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QVERIFY(restored.encoding->qp.isMissing());
+	QVERIFY(restored.encoding->crfHundredths.hasValue());
+	QCOMPARE(restored.encoding->crfHundredths.value, 2350);
+	crf->selectAll();
+	QTest::keyClicks(crf, "23.501");
+	QVERIFY(!editor.readProfile(restored, error));
+	QVERIFY(choose(control, QStringLiteral("cqp")));
+	QVERIFY(qp->isEnabled() && !crf->isEnabled());
+	QCOMPARE(qp->text(), QStringLiteral("0"));
+	QCOMPARE(crf->text(), QStringLiteral("23.501"));
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QVERIFY(restored.encoding->qp.hasValue());
+	QCOMPARE(restored.encoding->qp.value, 0);
+	QVERIFY(restored.encoding->crfHundredths.isMissing());
+	// draft удерживает невалидный отключённый CRF; восстановление не должно превращать его в прежнее допустимое число.
+	const auto draft = editor.captureDraft();
+	editor.setProfile(*decoded.value);
+	editor.restoreDraft(draft);
+	QCOMPARE(crf->text(), QStringLiteral("23.501"));
+	QVERIFY(choose(control, QStringLiteral("crf")));
+	QVERIFY(!editor.readProfile(restored, error));
+	crf->selectAll();
+	QTest::keyClicks(crf, "0");
+	QVERIFY2(editor.readProfile(restored, error), qPrintable(error));
+	QVERIFY(restored.encoding->qp.isMissing());
+	QVERIFY(restored.encoding->crfHundredths.hasValue());
+	QCOMPARE(restored.encoding->crfHundredths.value, 0);
+	// encoded проверяет присутствие явного нуля в JSON и отсутствие прежнего QP.
+	const auto encoded = fixture::qtResult(encodeProfile(restored));
+	QVERIFY(encoded);
+	QVERIFY(!encoded.value->value(QStringLiteral("encoding")).toObject().contains(QStringLiteral("qp")));
+	QCOMPARE(encoded.value->value(QStringLiteral("encoding")).toObject().value(QStringLiteral("crf")),
+		 QJsonValue(0));
 }
 
 QTEST_MAIN(ConfigurationUiTest)

@@ -3,8 +3,10 @@
 #include <QRegularExpression>
 #include <QTime>
 namespace gost::api {
+/** Создаёт классифицированную ошибку без необработанных серверных строк. */
 Error makeError(ErrorKind kind, int status)
 {
+	// message содержит локальное общее пояснение без содержимого ответа.
 	QString message;
 	switch (kind) {
 	case ErrorKind::Transport:
@@ -32,11 +34,13 @@ Error makeError(ErrorKind kind, int status)
 	}
 	return {kind, status, message, std::nullopt};
 }
+/** Разбирает локальный канонический десятичный ввод с полной проверкой U64. */
 bool parseDecimal(const QString &text, quint64 &value)
 {
-	// uint64 приходит десятичной строкой: преобразование через число типа double потеряло бы старшие разряды.
+	// Локальный десятичный ввод разбирается без double, чтобы сохранить старшие разряды.
 	if (text.isEmpty() || (text.size() > 1 && text.front() == QLatin1Char('0')))
 		return false;
+	// result накапливает точное целое до публикации; c и digit обозначают текущую цифру.
 	quint64 result = 0;
 	for (const auto c : text) {
 		if (c < QLatin1Char('0') || c > QLatin1Char('9'))
@@ -49,9 +53,11 @@ bool parseDecimal(const QString &text, quint64 &value)
 	value = result;
 	return true;
 }
+/** Проверяет календарное UTC-время с сохранением исходной точности строки. */
 bool validTimestamp(const QString &text)
 {
 	// Проверяем UTC-формат со знаком Z, сохраняя исходную строку и до девяти знаков долей секунды без округления.
+	// pattern задаёт UTC с наносекундной дробью; match хранит календарные компоненты строки.
 	static const QRegularExpression pattern(
 		QStringLiteral("^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d{1,9})?Z$"));
 	const auto match = pattern.match(text);
@@ -59,7 +65,8 @@ bool validTimestamp(const QString &text)
 	       QDate(match.captured(1).toInt(), match.captured(2).toInt(), match.captured(3).toInt()).isValid() &&
 	       QTime(match.captured(4).toInt(), match.captured(5).toInt(), match.captured(6).toInt()).isValid();
 }
-bool fromJson(const QJsonValue &json, QString &value, Error &error)
+/** Принимает строку Unicode без изолированных суррогатов; другой тип отвергается. */
+bool fromJson(const JsonValue &json, QString &value, Error &error)
 {
 	// Проверка UTF-8 тела не исключает изолированных суррогатов внутри экранированных последовательностей JSON.
 	// QString должен содержать целые пары UTF-16, иначе последующее toUtf8 потеряло бы исходные данные.
@@ -68,6 +75,7 @@ bool fromJson(const QJsonValue &json, QString &value, Error &error)
 		return false;
 	}
 	value = json.toString();
+	// i проходит кодовые единицы UTF-16, проверяя каждую пару суррогатов.
 	for (qsizetype i = 0; i < value.size(); ++i) {
 		if (value[i].isHighSurrogate()) {
 			if (++i >= value.size() || !value[i].isLowSurrogate()) {
@@ -81,7 +89,8 @@ bool fromJson(const QJsonValue &json, QString &value, Error &error)
 	}
 	return true;
 }
-bool fromJson(const QJsonValue &json, bool &value, Error &error)
+/** Принимает только логическое JSON-значение без числовых или строковых подстановок. */
+bool fromJson(const JsonValue &json, bool &value, Error &error)
 {
 	if (!json.isBool()) {
 		error = makeError(ErrorKind::Decode);
@@ -90,61 +99,74 @@ bool fromJson(const QJsonValue &json, bool &value, Error &error)
 	value = json.toBool();
 	return true;
 }
-bool fromJson(const QJsonValue &json, quint64 &value, Error &error)
+/** Читает точное U64 из JSON-числа, отвергая дробь, переполнение и любой знак минус. */
+bool fromJson(const JsonValue &json, quint64 &value, Error &error)
 {
-	if (!json.isString() || !parseDecimal(json.toString(), value)) {
+	if (!json.toUnsigned(value)) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
 	return true;
 }
-bool fromJson(const QJsonValue &json, double &value, Error &error)
+/** Читает конечное неотрицательное измерение float64; целые DTO используют отдельный точный разбор. */
+bool fromJson(const JsonValue &json, double &value, Error &error)
 {
-	if (!json.isDouble() || !std::isfinite(json.toDouble())) {
+	// ok отличает корректный конечный float64 от переполнения или неверного JSON-типа.
+	bool ok = false;
+	// parsed применяется только для настоящих дробных измерений, не для целых или CRF.
+	const double parsed = json.isNumber() ? json.numberLexeme().toDouble(&ok) : 0;
+	if (!ok || !std::isfinite(parsed) || parsed < 0) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
-	value = json.toDouble();
+	value = parsed;
 	return true;
 }
-bool fromJson(const QJsonValue &json, ProfileText &value, Error &error)
+/** Читает строковый параметр профиля и сохраняет его корректные UTF-8 байты. */
+bool fromJson(const JsonValue &json, ProfileText &value, Error &error)
 {
-	if (json.isString()) {
-		QString text;
-		if (!fromJson(json, text, error))
-			return false;
-		value.bytes = text.toUtf8();
+	// text содержит проверенную строку Unicode; объект Base64 не относится к этому контракту.
+	QString text;
+	if (!fromJson(json, text, error))
+		return false;
+	value.bytes = text.toUtf8();
+	return true;
+}
+// Оставляет только опубликованные виды ID; неизвестные ключи не становятся доверенным контекстом.
+/** Читает поля QMap<QString, QString> из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, QMap<QString, QString> &value, Error &error)
+{
+	value.clear();
+	if (json.isUndefined())
 		return true;
-	}
 	if (!json.isObject()) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
-	const auto object = json.toObject();
-	QString encoded;
-	if (object.size() != 2 || object.value(QStringLiteral("encoding")) != QStringLiteral("base64") ||
-	    !fromJson(object.value(QStringLiteral("value")), encoded, error)) {
-		error = makeError(ErrorKind::Decode);
-		return false;
+	// key перечисляет фиксированные имена, text принимает только строковое значение известного ID.
+	for (const auto *key : {"stream_id", "session_id", "output_id", "group_id", "profile_id", "asset_id",
+				"generation_id", "variant_id", "destination_id", "command_id"}) {
+		if (!json.toObject().contains(QLatin1String(key)))
+			continue;
+		// text получает строковое значение одного разрешённого контекстного ID.
+		QString text;
+		if (!fromJson(json.toObject().value(QLatin1String(key)), text, error))
+			return false;
+		if (!text.isEmpty())
+			value.insert(QLatin1String(key), std::move(text));
 	}
-	const auto ascii = encoded.toLatin1();
-	const auto decoded = QByteArray::fromBase64Encoding(ascii, QByteArray::AbortOnBase64DecodingErrors);
-	// Обратное кодирование отклоняет неканоническую оболочку и сохраняет точные байты профиля.
-	if (!decoded || decoded.decoded.toBase64() != ascii) {
-		error = makeError(ErrorKind::Decode);
-		return false;
-	}
-	value.bytes = decoded.decoded;
 	return true;
 }
-bool fromJson(const QJsonValue &json, QMap<QString, quint64> &value, Error &error)
+/** Читает поля QMap<QString, quint64> из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, QMap<QString, quint64> &value, Error &error)
 {
 	if (!json.isObject()) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
 	value.clear();
-	const auto object = json.toObject();
+	// object содержит словарь счётчиков; it указывает текущую пару, entry получает точное U64.
+	const auto &object = json.toObject();
 	for (auto it = object.begin(); it != object.end(); ++it) {
 		quint64 entry;
 		if (!fromJson(it.value(), entry, error))
@@ -154,14 +176,17 @@ bool fromJson(const QJsonValue &json, QMap<QString, quint64> &value, Error &erro
 	return true;
 }
 namespace {
+/** Пропускает дополнительную проверку времени для значения иного типа. */
 template<class T> bool timestampField(const T &)
 {
 	return true;
 }
+/** Проверяет календарное UTC-время обязательной строки. */
 bool timestampField(const QString &v)
 {
 	return validTimestamp(v);
 }
+/** Проверяет время только при наличии значения; Missing/null не становятся датой. */
 bool timestampField(const JsonField<QString> &v)
 {
 	return !v.hasValue() || validTimestamp(v.value);
@@ -172,7 +197,8 @@ bool timestampField(const JsonField<QString> &v)
 // Неизвестные ключи не перечисляются и допускают добавление сервером совместимых полей.
 class Reader {
 public:
-	Reader(const QJsonValue &json, Error &error) : error_(error)
+	/** Начинает чтение объекта и фиксирует ошибку, если передан другой JSON-тип. */
+	Reader(const JsonValue &json, Error &error) : error_(error)
 	{
 		valid_ = json.isObject();
 		if (valid_)
@@ -180,6 +206,7 @@ public:
 		else
 			error_ = makeError(ErrorKind::Decode);
 	}
+	/** Читает обязательное поле выбранной перегрузкой; после первого отказа больше не изменяет DTO. */
 	template<class T> bool field(const char *key, T &value)
 	{
 		if (!valid_ || !fromJson(object_.value(QLatin1String(key)), value, error_)) {
@@ -188,6 +215,24 @@ public:
 		}
 		return true;
 	}
+	/** Читает необязательное строковое поле без подстановки отсутствующих данных. */
+	bool optional(const char *key, QString &value)
+	{
+		value.clear();
+		return !object_.contains(QLatin1String(key)) || field(key, value);
+	}
+	/** Читает time.Duration с физической границей знакового I64 и предметной нижней границей. */
+	bool duration(const char *key, quint64 &value, bool positive = false)
+	{
+		if (!field(key, value))
+			return false;
+		if (value > quint64(std::numeric_limits<qint64>::max()) || (positive && !value)) {
+			valid_ = false;
+			error_ = makeError(ErrorKind::Decode);
+		}
+		return valid_;
+	}
+	/** Читает поле и проверяет календарную форму UTC без преобразования его строки. */
 	template<class T> bool time(const char *key, T &value)
 	{
 		if (!field(key, value))
@@ -198,52 +243,74 @@ public:
 		}
 		return valid_;
 	}
+	/** Возвращает итог всех уже выполненных проверок полей. */
 	bool good() const { return valid_; }
 
 private:
-	QJsonObject object_;
+	// object_ содержит именованные значения читаемого объекта.
+	JsonValue::Object object_;
+	// error_ заимствует место первой ошибки вызывающей стороны.
 	Error &error_;
+	// valid_ запрещает дальнейшую запись после первого несовместимого поля.
 	bool valid_ = false;
 };
 } // namespace
-bool fromJson(const QJsonValue &json, Record &value, Error &error)
+/** Читает идентичность, положительную ревизию и исходные временные метки записи. */
+bool fromJson(const JsonValue &json, Record &value, Error &error)
 {
 	// Последующие перегрузки читают поля DTO в порядке объявления. Record/Observation разбираются
 	// первыми для производных типов; их отказ прекращает чтение оставшейся части объекта.
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("id", value.id);
 	r.field("revision", value.revision);
 	r.time("created_at", value.createdAt);
 	r.time("updated_at", value.updatedAt);
+	if (r.good() && value.revision == 0) {
+		error = makeError(ErrorKind::Decode);
+		return false;
+	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Failure &value, Error &error)
+/** Читает структурированную причину и известные ID; диагностическое тело сюда не копируется. */
+bool fromJson(const JsonValue &json, Failure &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("code", value.code);
 	r.field("message", value.message);
+	r.optional("action", value.action);
+	r.optional("field", value.field);
+	r.field("context", value.context);
+	value.diagnosticBody.clear();
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Watchdog &value, Error &error)
+/** Читает положительные интервалы watchdog в пределах time.Duration. */
+bool fromJson(const JsonValue &json, Watchdog &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
-	r.field("video_timeout_ns", value.videoTimeoutNs);
-	r.field("audio_timeout_ns", value.audioTimeoutNs);
-	r.field("recovery_window_ns", value.recoveryWindowNs);
-	r.field("keyframe_timeout_ns", value.keyframeTimeoutNs);
+	r.duration("video_timeout_ns", value.videoTimeoutNs, true);
+	r.duration("audio_timeout_ns", value.audioTimeoutNs, true);
+	r.duration("recovery_window_ns", value.recoveryWindowNs, true);
+	r.duration("keyframe_timeout_ns", value.keyframeTimeoutNs, true);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Policy &value, Error &error)
+/** Читает поля Policy из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Policy &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("asset_id", value.assetId);
 	r.field("watchdog", value.watchdog);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Stream &value, Error &error)
+/** Читает поля Stream из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Stream &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("name", value.name);
 	r.field("publication_key", value.publicationKey);
@@ -255,10 +322,12 @@ bool fromJson(const QJsonValue &json, Stream &value, Error &error)
 	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Destination &value, Error &error)
+/** Читает поля Destination из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Destination &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("stream_id", value.streamId);
 	r.field("group_id", value.groupId);
@@ -277,8 +346,10 @@ bool fromJson(const QJsonValue &json, Destination &value, Error &error)
 	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, FrameRate &value, Error &error)
+/** Читает поля FrameRate из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, FrameRate &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("numerator", value.numerator);
 	r.field("denominator", value.denominator);
@@ -288,8 +359,10 @@ bool fromJson(const QJsonValue &json, FrameRate &value, Error &error)
 	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Color &value, Error &error)
+/** Читает поля Color из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Color &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("range", value.range);
 	r.field("primaries", value.primaries);
@@ -297,8 +370,10 @@ bool fromJson(const QJsonValue &json, Color &value, Error &error)
 	r.field("matrix", value.matrix);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, VideoFormat &value, Error &error)
+/** Читает поля VideoFormat из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, VideoFormat &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("codec", value.codec);
 	r.field("width", value.width);
@@ -312,8 +387,10 @@ bool fromJson(const QJsonValue &json, VideoFormat &value, Error &error)
 	r.field("color", value.color);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, AudioFormat &value, Error &error)
+/** Читает поля AudioFormat из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, AudioFormat &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("codec", value.codec);
 	r.field("codec_profile", value.codecProfile);
@@ -322,15 +399,19 @@ bool fromJson(const QJsonValue &json, AudioFormat &value, Error &error)
 	r.field("channel_layout", value.channelLayout);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Format &value, Error &error)
+/** Читает поля Format из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Format &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("video", value.video);
 	r.field("audio", value.audio);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, VideoEncoding &value, Error &error)
+/** Читает поля VideoEncoding из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, VideoEncoding &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("target_bitrate_bps", value.targetBitrateBps);
 	r.field("max_bitrate_bps", value.maxBitrateBps);
@@ -340,26 +421,32 @@ bool fromJson(const QJsonValue &json, VideoEncoding &value, Error &error)
 	r.field("closed_gop", value.closedGop);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, AudioEncoding &value, Error &error)
+/** Читает поля AudioEncoding из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, AudioEncoding &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("bitrate_bps", value.bitrateBps);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Group &value, Error &error)
+/** Читает поля Group из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Group &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("stream_id", value.streamId);
 	r.field("profile_id", value.profileId);
 	r.field("name", value.name);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Receipt &value, Error &error)
+/** Читает квитанцию команды и временно прикладывает поддерево failure для однократного журнала. */
+bool fromJson(const JsonValue &json, Receipt &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("request_id", value.requestId);
 	r.field("kind", value.kind);
@@ -368,12 +455,16 @@ bool fromJson(const QJsonValue &json, Receipt &value, Error &error)
 	r.field("output_id", value.outputId);
 	r.field("status", value.status);
 	r.field("failure", value.failure);
+	if (r.good() && value.failure.hasValue())
+		value.failure.value.diagnosticBody = serializeJson(json.toObject().value(QStringLiteral("failure")));
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Asset &value, Error &error)
+/** Читает поля Asset из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Asset &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("name", value.name);
 	r.field("kind", value.kind);
@@ -383,10 +474,12 @@ bool fromJson(const QJsonValue &json, Asset &value, Error &error)
 	r.field("size_bytes", value.sizeBytes);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Generation &value, Error &error)
+/** Читает поля Generation из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Generation &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("asset_id", value.assetId);
 	r.field("kind", value.kind);
@@ -395,27 +488,33 @@ bool fromJson(const QJsonValue &json, Generation &value, Error &error)
 	r.field("failure", value.failure);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Rate &value, Error &error)
+/** Читает поля Rate из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Rate &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("status", value.status);
 	r.field("reason", value.reason);
 	r.field("value", value.value);
 	r.time("window_start", value.windowStart);
 	r.time("window_end", value.windowEnd);
-	r.field("duration_ns", value.durationNs);
+	r.duration("duration_ns", value.durationNs);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Rates &value, Error &error)
+/** Читает поля Rates из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Rates &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("fps", value.fps);
 	r.field("payload_bitrate", value.payloadBitrate);
 	r.field("written_bitrate", value.writtenBitrate);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, ObservedFormat &value, Error &error)
+/** Читает поля ObservedFormat из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, ObservedFormat &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("video_codec", value.videoCodec);
 	r.field("audio_codec", value.audioCodec);
@@ -425,8 +524,10 @@ bool fromJson(const QJsonValue &json, ObservedFormat &value, Error &error)
 	r.field("channels", value.channels);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, MediaMetrics &value, Error &error)
+/** Читает поля MediaMetrics из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, MediaMetrics &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.time("sampled_at", value.sampledAt);
 	r.field("video_frames", value.videoFrames);
@@ -439,31 +540,39 @@ bool fromJson(const QJsonValue &json, MediaMetrics &value, Error &error)
 	r.field("format", value.format);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, InputMetrics &value, Error &error)
+/** Читает поля InputMetrics из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, InputMetrics &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("media", value.media);
 	r.field("source_epoch", value.sourceEpoch);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Input &value, Error &error)
+/** Читает поля Input из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Input &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("connected", value.connected);
 	r.time("changed_at", value.changedAt);
 	r.field("metrics", value.metrics);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, GroupMetrics &value, Error &error)
+/** Читает поля GroupMetrics из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, GroupMetrics &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("live_input", value.liveInput);
 	r.field("fallback_input", value.fallbackInput);
 	r.field("output", value.output);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, OutputMetrics &value, Error &error)
+/** Читает поля OutputMetrics из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, OutputMetrics &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("media", value.media);
 	r.field("counters", value.counters);
@@ -478,8 +587,10 @@ bool fromJson(const QJsonValue &json, OutputMetrics &value, Error &error)
 	r.time("ack_last_anomaly_at", value.ackLastAnomalyAt);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, FFmpegProgress &value, Error &error)
+/** Читает поля FFmpegProgress из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, FFmpegProgress &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("frame", value.frame);
 	r.field("total_size_bytes", value.totalSizeBytes);
@@ -492,8 +603,10 @@ bool fromJson(const QJsonValue &json, FFmpegProgress &value, Error &error)
 	r.field("end", value.end);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, FFmpegMetrics &value, Error &error)
+/** Читает поля FFmpegMetrics из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, FFmpegMetrics &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("status", value.status);
 	r.field("reason", value.reason);
@@ -504,8 +617,10 @@ bool fromJson(const QJsonValue &json, FFmpegMetrics &value, Error &error)
 	r.field("progress", value.progress);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, GPUMetric &value, Error &error)
+/** Читает поля GPUMetric из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, GPUMetric &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("status", value.status);
 	r.field("reason", value.reason);
@@ -515,8 +630,10 @@ bool fromJson(const QJsonValue &json, GPUMetric &value, Error &error)
 	r.field("sampling_period_us", value.samplingPeriodUs);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, GPUDevice &value, Error &error)
+/** Читает поля GPUDevice из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, GPUDevice &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("uuid", value.uuid);
 	r.field("utilization", value.utilization);
@@ -526,20 +643,32 @@ bool fromJson(const QJsonValue &json, GPUDevice &value, Error &error)
 	r.field("memory_used_bytes", value.memoryUsedBytes);
 	r.field("memory_total_bytes", value.memoryTotalBytes);
 	r.field("memory_free_bytes", value.memoryFreeBytes);
+	// metric указывает одну из процентных величин; байтовые показатели сохраняют весь диапазон U64.
+	for (const auto *metric :
+	     {&value.utilization, &value.memoryUtilization, &value.encoderUtilization, &value.decoderUtilization}) {
+		if (metric->value.hasValue() && metric->value.value > 100) {
+			error = makeError(ErrorKind::Decode);
+			return false;
+		}
+	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, GPU &value, Error &error)
+/** Читает поля GPU из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, GPU &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("status", value.status);
 	r.field("reason", value.reason);
 	r.time("sampled_at", value.sampledAt);
-	r.field("stale_after_ns", value.staleAfterNs);
+	r.duration("stale_after_ns", value.staleAfterNs, true);
 	r.field("devices", value.devices);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Observation &value, Error &error)
+/** Читает поля Observation из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Observation &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("instance_id", value.instanceId);
 	r.field("revision", value.revision);
@@ -548,10 +677,12 @@ bool fromJson(const QJsonValue &json, Observation &value, Error &error)
 	r.field("failure", value.failure);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, RuntimeGroup &value, Error &error)
+/** Читает поля RuntimeGroup из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, RuntimeGroup &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Observation &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("group_id", value.groupId);
 	r.field("profile_id", value.profileId);
@@ -560,27 +691,33 @@ bool fromJson(const QJsonValue &json, RuntimeGroup &value, Error &error)
 	r.field("metrics", value.metrics);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, RuntimeOutput &value, Error &error)
+/** Читает поля RuntimeOutput из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, RuntimeOutput &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Observation &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("output_id", value.outputId);
 	r.field("metrics", value.metrics);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, RuntimeFFmpeg &value, Error &error)
+/** Читает поля RuntimeFFmpeg из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, RuntimeFFmpeg &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Observation &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("group_instance_id", value.groupInstanceId);
 	r.field("role", value.role);
 	r.field("metrics", value.metrics);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, RuntimeSession &value, Error &error)
+/** Читает поля RuntimeSession из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, RuntimeSession &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("session_id", value.sessionId);
 	r.field("observation", value.observation);
@@ -590,24 +727,30 @@ bool fromJson(const QJsonValue &json, RuntimeSession &value, Error &error)
 	r.field("ffmpeg", value.ffmpeg);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Anchor &value, Error &error)
+/** Читает поля Anchor из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Anchor &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("cursor", value.cursor);
 	r.field("sessions", value.sessions);
 	r.field("gpu", value.gpu);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, SessionMetrics &value, Error &error)
+/** Читает поля SessionMetrics из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, SessionMetrics &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("availability", value.availability);
 	r.field("reason", value.reason);
 	r.field("snapshot", value.snapshot);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, RuntimeEvent &value, Error &error)
+/** Читает поля RuntimeEvent из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, RuntimeEvent &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("cursor", value.cursor);
 	r.field("kind", value.kind);
@@ -630,8 +773,10 @@ bool fromJson(const QJsonValue &json, RuntimeEvent &value, Error &error)
 	r.field("gpu", value.gpu);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, NVENC &value, Error &error)
+/** Читает поля NVENC из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, NVENC &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("preset", value.preset);
 	r.field("tuning", value.tuning);
@@ -642,8 +787,10 @@ bool fromJson(const QJsonValue &json, NVENC &value, Error &error)
 	r.field("aq_strength", value.aqStrength);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, SVTAV1 &value, Error &error)
+/** Читает поля SVTAV1 из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, SVTAV1 &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("preset", value.preset);
 	r.field("tuning", value.tuning);
@@ -651,28 +798,62 @@ bool fromJson(const QJsonValue &json, SVTAV1 &value, Error &error)
 	r.field("lookahead_frames", value.lookaheadFrames);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Encoding &value, Error &error)
+/** Читает полный рецепт, точное качество и применимые блоки без legacy версии. */
+bool fromJson(const JsonValue &json, Encoding &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
-	r.field("version", value.version);
 	r.field("video_encoder", value.videoEncoder);
 	r.field("audio_encoder", value.audioEncoder);
 	r.field("rate_control", value.rateControl);
+	r.field("qp", value.qp);
+	// crf сохраняет Missing; явное значение переводится в сотые без округления.
+	const auto crf = json.toObject().value(QStringLiteral("crf"));
+	value.crfHundredths = {};
+	if (!crf.isUndefined()) {
+		// hundredths получает точное масштабированное качество с предметной границей 0..63.
+		qint64 hundredths = 0;
+		if (!crf.toScaledInteger(2, hundredths) || hundredths < 0 || hundredths > 6300) {
+			error = makeError(ErrorKind::Decode);
+			return false;
+		}
+		value.crfHundredths = {FieldState::Value, int(hundredths)};
+	}
 	r.field("rescale_output", value.rescaleOutput);
 	r.field("video_custom", value.videoCustom);
 	r.field("audio_custom", value.audioCustom);
 	r.field("nvenc", value.nvenc);
 	r.field("svt_av1", value.svtAv1);
-	if (value.version != 2) {
+	if (value.qp.isNull() || (value.qp.hasValue() && (value.qp.value < 0 || value.qp.value > 63)) ||
+	    value.nvenc.isNull() || value.svtAv1.isNull()) {
+		error = makeError(ErrorKind::Contract);
+		return false;
+	}
+	// knownEncoder ограничивает проверку применимости известным каталогом, сохраняя новые строки сервера.
+	const bool knownEncoder = QStringList{QStringLiteral("h264_nvenc"), QStringLiteral("libsvtav1"),
+					      QStringLiteral("libx264"),    QStringLiteral("libaom-av1"),
+					      QStringLiteral("libx265"),    QStringLiteral("hevc_nvenc"),
+					      QStringLiteral("libvpx-vp9")}
+					  .contains(value.videoEncoder);
+	if (knownEncoder && ((value.videoEncoder == QStringLiteral("h264_nvenc")) != value.nvenc.hasValue() ||
+			     (value.videoEncoder == QStringLiteral("libsvtav1")) != value.svtAv1.hasValue())) {
+		error = makeError(ErrorKind::Contract);
+		return false;
+	}
+	if ((value.rateControl == QStringLiteral("cqp") && (!value.qp.hasValue() || value.crfHundredths.hasValue())) ||
+	    (value.rateControl == QStringLiteral("crf") && (!value.crfHundredths.hasValue() || value.qp.hasValue())) ||
+	    ((value.rateControl == QStringLiteral("cbr") || value.rateControl == QStringLiteral("vbr")) &&
+	     (value.qp.hasValue() || value.crfHundredths.hasValue()))) {
 		error = makeError(ErrorKind::Contract);
 		return false;
 	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, GroupProfile &value, Error &error)
+/** Читает полный ответ профиля и сохраняет исходное дерево вместе с неизвестными настройками. */
+bool fromJson(const JsonValue &json, GroupProfile &value, Error &error)
 {
-	// Здесь проверяются режимы и их совместимость, а не весь набор серверных ограничений кодировщика.
-	// Важно сохранить Missing при чтении прежнего формата: подстановка copy изменила бы последующую полную замену.
+	// Ответ требует полной структуры; неизвестные строковые настройки остаются доступными для исправления.
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("mode", value.mode);
 	r.field("live_audio_mode", value.liveAudioMode);
@@ -680,47 +861,41 @@ bool fromJson(const QJsonValue &json, GroupProfile &value, Error &error)
 	r.field("video_encoding", value.videoEncoding);
 	r.field("audio_encoding", value.audioEncoding);
 	r.field("encoding", value.encoding);
-	// Отсутствующий режим аудио не заменяется значением по умолчанию: это отдельная наследуемая семантика.
-	if (value.liveAudioMode.isNull()) {
+	if (!r.good())
+		return false;
+	if (!value.liveAudioMode.hasValue() || !value.encoding.hasValue()) {
 		error = makeError(ErrorKind::Contract);
 		return false;
 	}
-	if (value.liveAudioMode.hasValue() && value.liveAudioMode.value != QStringLiteral("copy") &&
-	    value.liveAudioMode.value != QStringLiteral("transcode")) {
-		error = makeError(ErrorKind::Contract);
-		return false;
-	}
-	if (value.mode != QStringLiteral("copy") && value.mode != QStringLiteral("transcode")) {
-		error = makeError(ErrorKind::Contract);
-		return false;
-	}
-	if (value.mode == QStringLiteral("copy") && value.liveAudioMode.hasValue() &&
-	    value.liveAudioMode.value == QStringLiteral("transcode")) {
-		error = makeError(ErrorKind::Contract);
-		return false;
-	}
+	value.originalDocument = json;
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Profile &value, Error &error)
+/** Читает поля Profile из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Profile &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("name", value.name);
 	r.field("profile", value.profile);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, GroupSnapshot &value, Error &error)
+/** Читает поля GroupSnapshot из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, GroupSnapshot &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("group", value.group);
 	r.field("profile", value.profile);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Session &value, Error &error)
+/** Читает поля Session из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Session &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("stream_id", value.streamId);
 	r.field("state", value.state);
@@ -731,10 +906,12 @@ bool fromJson(const QJsonValue &json, Session &value, Error &error)
 	r.field("failure", value.failure);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Output &value, Error &error)
+/** Читает поля Output из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Output &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("session_id", value.sessionId);
 	r.field("destination", value.destination);
@@ -745,10 +922,12 @@ bool fromJson(const QJsonValue &json, Output &value, Error &error)
 	r.field("attached", value.attached);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Variant &value, Error &error)
+/** Читает поля Variant из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Variant &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("asset_id", value.assetId);
 	r.field("generation_id", value.generationId);
@@ -758,23 +937,29 @@ bool fromJson(const QJsonValue &json, Variant &value, Error &error)
 	r.field("size_bytes", value.sizeBytes);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Health &value, Error &error)
+/** Читает поля Health из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Health &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("status", value.status);
 	r.field("reason", value.reason);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Capability &value, Error &error)
+/** Читает поля Capability из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Capability &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("status", value.status);
 	r.field("reason", value.reason);
 	r.time("checked_at", value.checkedAt);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, Capabilities &value, Error &error)
+/** Читает поля Capabilities из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Capabilities &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("ffmpeg", value.ffmpeg);
 	r.field("ffprobe", value.ffprobe);
@@ -782,17 +967,25 @@ bool fromJson(const QJsonValue &json, Capabilities &value, Error &error)
 	r.field("nvidia", value.nvidia);
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, PolicyResult &value, Error &error)
+/** Читает поля PolicyResult из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, PolicyResult &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("revision", value.revision);
 	r.field("fallback", value.fallback);
+	if (r.good() && !value.revision) {
+		error = makeError(ErrorKind::Decode);
+		return false;
+	}
 	return r.good();
 }
-bool fromJson(const QJsonValue &json, OutputDetail &value, Error &error)
+/** Читает поля OutputDetail из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, OutputDetail &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Output &>(value), error))
 		return false;
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("runtime", value.runtime);
 	r.field("runtime_availability", value.runtimeAvailability);
@@ -800,7 +993,8 @@ bool fromJson(const QJsonValue &json, OutputDetail &value, Error &error)
 	return r.good();
 }
 // Принимает необязательные location/message; value не копируется в клиентскую модель.
-bool fromJson(const QJsonValue &json, FieldError &value, Error &error)
+/** Читает поля FieldError из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, FieldError &value, Error &error)
 {
 	if (!json.isObject()) {
 		error = makeError(ErrorKind::Decode);
@@ -816,7 +1010,8 @@ bool fromJson(const QJsonValue &json, FieldError &value, Error &error)
 }
 // Читает необязательные поля Problem; отсутствие/null списка errors означает отсутствие деталей.
 // Статус тела проверяется отдельно в decodeProblem, чтобы несовместимое тело не подменяло HTTP-отказ.
-bool fromJson(const QJsonValue &json, Problem &value, Error &error)
+/** Читает необязательные поля Problem Details и разрешённые строковые идентификаторы контекста. */
+bool fromJson(const JsonValue &json, Problem &value, Error &error)
 {
 	if (!json.isObject()) {
 		error = makeError(ErrorKind::Decode);
@@ -826,7 +1021,8 @@ bool fromJson(const QJsonValue &json, Problem &value, Error &error)
 	const auto object = json.toObject();
 	for (auto pair :
 	     {std::pair{"type", &value.type}, std::pair{"title", &value.title}, std::pair{"detail", &value.detail},
-	      std::pair{"instance", &value.instance}, std::pair{"code", &value.code}, std::pair{"field", &value.field}})
+	      std::pair{"instance", &value.instance}, std::pair{"code", &value.code}, std::pair{"field", &value.field},
+	      std::pair{"action", &value.action}})
 		if (object.contains(QLatin1String(pair.first)) &&
 		    !fromJson(object.value(QLatin1String(pair.first)), *pair.second, error))
 			return false;
@@ -838,20 +1034,25 @@ bool fromJson(const QJsonValue &json, Problem &value, Error &error)
 	value.errors.clear();
 	if (!errors.isUndefined() && !errors.isNull() && !fromJson(errors, value.errors, error))
 		return false;
-	return true;
+	return fromJson(object.value(QStringLiteral("context")), value.context, error);
 }
-bool fromJson(const QJsonValue &json, Preparation &value, Error &error)
+/** Читает поля Preparation из типизированного JSON; нарушение формы прекращает разбор с Error. */
+bool fromJson(const JsonValue &json, Preparation &value, Error &error)
 {
+	// r последовательно читает поля и сохраняет первую ошибку формы документа.
 	Reader r(json, error);
 	r.field("asset_id", value.assetId);
 	r.field("generation_id", value.generationId);
 	return r.good();
 }
+/** Проверяет согласованность оболочки события до его применения к дереву состояния. */
 bool validateRuntimeEvent(const RuntimeEvent &e)
 {
 	// Проверка формы связывает тип события, владельца и единственный допустимый набор данных.
 	// Проверка принадлежности исполнения существующему дереву выполняется отдельно в StateStore.
+	// kind выбирает вид изменения, owner определяет обязательные идентичности.
 	const auto kind = e.kind, owner = e.owner;
+	// payloads считает содержательные блоки, чтобы исключить смешение нескольких видов события.
 	const int payloads = int(e.input.hasValue()) + int(e.group.hasValue()) + int(e.output.hasValue()) +
 			     int(e.ffmpeg.hasValue()) + int(e.gpu.hasValue());
 	if (e.cursor.isEmpty() ||
@@ -897,12 +1098,15 @@ bool validateRuntimeEvent(const RuntimeEvent &e)
 			(kind == QStringLiteral("metrics") && e.ffmpeg.hasValue()));
 	return false;
 }
+/** Сохраняет HTTP-отказ и диагностику; Problem доверяется лишь при совпадении заявленного статуса. */
 Error decodeProblem(int status, const QByteArray &body)
 {
+	// result сохраняет HTTP-классификацию; problem добавляется только после полного корректного разбора.
 	auto result = makeError(ErrorKind::Http, status);
 	auto problem = decode<Problem>(body);
 	if (problem && problem.value->status == status)
 		result.problem = std::move(*problem.value);
+	result.diagnosticBody = body;
 	return result;
 }
 } // namespace gost::api

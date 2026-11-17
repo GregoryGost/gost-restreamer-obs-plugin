@@ -76,11 +76,13 @@ bool readOnly(const HttpServer &server)
 	});
 }
 
+// Возвращает независимые метрики выхода с числовым videoFrames для проверки обновления Dock.
 QJsonObject dockOutputMetrics(quint64 videoFrames)
 {
+	// metrics содержит метрики выхода; media задаёт изменяемые счётчики его медиапотока.
 	auto metrics = fixture::outputMetrics();
 	auto media = metrics.value(QStringLiteral("media")).toObject();
-	media.insert(QStringLiteral("video_frames"), QString::number(videoFrames));
+	media.insert(QStringLiteral("video_frames"), QJsonValue(qint64(videoFrames)));
 	metrics.insert(QStringLiteral("media"), media);
 	return metrics;
 }
@@ -122,11 +124,15 @@ QByteArray dockMetricsFrame(const QString &cursor, const QString &sessionId, con
 	return fixture::frame(event);
 }
 
+// Отвечает на request метаданными двух Stream, активной Session, её выходов и заглушки для проверок Dock.
+// При validExactSession=false детальный GET относит найденную Session к другому Stream, хотя список
+// возвращает кандидата. Одновременные current/pending поколения позволяют выявить чтение pending
+// вместо current; остальные маршруты обслуживает respond, включая готовность сервера и SSE.
 void respondWithDockMetadata(const HttpServer::Request &request, bool validExactSession)
 {
-	// Активный список всегда даёт кандидата, а детальный GET может вернуть другой Stream.
-	// current и pending одновременно существуют: запрос pending вместо точного current обнаруживается тестом.
+	// url отделяет параметры фильтрации от пути полученного запроса.
 	const QUrl url = QUrl::fromEncoded("http://local" + request.target);
+	// path выбирает точный ресурс без совпадений по префиксам соседних маршрутов.
 	const auto path = url.path();
 	if (path == QStringLiteral("/api/v1/streams")) {
 		HttpServer::reply(request,
@@ -134,10 +140,12 @@ void respondWithDockMetadata(const HttpServer::Request &request, bool validExact
 	} else if (path == QStringLiteral("/api/v1/events/snapshot")) {
 		HttpServer::reply(request, dockAnchor());
 	} else if (path == QStringLiteral("/api/v1/streams/stream/sessions")) {
+		// filter ограничивает непустой список состоянием RUNNING; другие активные состояния дают пустой список.
 		const auto filter = QUrlQuery(url).queryItemValue(QStringLiteral("state"));
 		HttpServer::reply(request, filter == QStringLiteral("RUNNING") ? fixture::page({fixture::session()})
 									       : fixture::page({}));
 	} else if (path == QStringLiteral("/api/v1/sessions/session")) {
+		// session подтверждает принадлежность кандидата либо намеренно указывает другой Stream.
 		auto session = fixture::session();
 		if (!validExactSession) {
 			session.insert(QStringLiteral("stream_id"), QStringLiteral("other"));
@@ -147,20 +155,22 @@ void respondWithDockMetadata(const HttpServer::Request &request, bool validExact
 	} else if (path == QStringLiteral("/api/v1/sessions/session/outputs")) {
 		HttpServer::reply(request, fixture::page({fixture::output()}));
 	} else if (path == QStringLiteral("/api/v1/streams/stream/fallback-policy")) {
-		HttpServer::reply(request, R"({"revision":"1","fallback":{"asset_id":"asset","watchdog":{
-"video_timeout_ns":"1000000000","audio_timeout_ns":"1000000000","recovery_window_ns":"1000000000",
-"keyframe_timeout_ns":"1000000000"}}})");
+		HttpServer::reply(request, R"({"revision":1,"fallback":{"asset_id":"asset","watchdog":{
+"video_timeout_ns":1000000000,"audio_timeout_ns":1000000000,"recovery_window_ns":1000000000,
+"keyframe_timeout_ns":1000000000}}})");
 	} else if (path == QStringLiteral("/api/v1/fallback-assets/asset")) {
+		// asset одновременно ссылается на текущее и ожидающее поколения; готовность читается только у current.
 		auto asset = fixture::asset();
 		asset.insert(QStringLiteral("current_generation_id"), QStringLiteral("current"));
 		asset.insert(QStringLiteral("pending_generation_id"), QStringLiteral("pending"));
 		HttpServer::reply(request, fixture::bytes(asset));
 	} else if (path == QStringLiteral("/api/v1/fallback-assets/asset/generations/current")) {
+		// generation содержит готовое текущее поколение точного asset, не подменяя его ожидающим pending.
 		auto generation = fixture::record(QStringLiteral("current"));
 		generation.insert(QStringLiteral("asset_id"), QStringLiteral("asset"));
 		generation.insert(QStringLiteral("kind"), QStringLiteral("image"));
 		generation.insert(QStringLiteral("status"), QStringLiteral("ready"));
-		generation.insert(QStringLiteral("size_bytes"), QStringLiteral("1024"));
+		generation.insert(QStringLiteral("size_bytes"), QJsonValue(qint64(1024)));
 		generation.insert(QStringLiteral("failure"), QJsonValue::Null);
 		HttpServer::reply(request, fixture::bytes(generation));
 	} else {
@@ -1240,6 +1250,8 @@ void ConnectionControllerTest::emptySessionDiscovery()
 	QVERIFY(server.listen());
 	// searches считает три фильтра активных состояний до публикации единого результата.
 	int searches = 0;
+	// Обработчик server.handler считает запросы request к списку Session и задаёт границу boundary:
+	// полный пустой ответ, продолжение списка или HTTP-отказ. Остальные чтения обслуживает respond.
 	server.handler = [&](const auto &request) {
 		if (request.target.startsWith("/api/v1/streams/stream/sessions")) {
 			++searches;
@@ -1247,7 +1259,7 @@ void ConnectionControllerTest::emptySessionDiscovery()
 					  fixture::page({}, boundary == 1 ? QStringLiteral("more") : QString{}),
 					  boundary == 2 ? 503 : 200);
 		} else if (request.target.startsWith("/api/v1/streams/stream/fallback-policy")) {
-			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+			HttpServer::reply(request, R"({"revision":1,"fallback":null})");
 		} else {
 			respond(request);
 		}
@@ -1296,8 +1308,10 @@ void ConnectionControllerTest::lateSessionPreservesIntentions()
 	QVERIFY(server.listen());
 	// appeared переключает сервер с полного отсутствия на точную выбранную Session.
 	bool appeared = false;
+	// Обработчик server.handler возвращает для request новую Session только после appeared, сохраняя
+	// sessionState, паузу и намерения её выходов. До появления он подтверждает полное отсутствие Session.
 	server.handler = [&](const auto &request) {
-		// url содержит полный адрес запроса; path отделяет адрес ресурса от фильтра state в query.
+		// url содержит полный адрес запроса; path отделяет адрес ресурса от параметра state в строке запроса.
 		const auto url = QUrl::fromEncoded("http://local" + request.target);
 		const auto path = url.path();
 		if (path == QStringLiteral("/api/v1/streams/stream/sessions")) {
@@ -1317,7 +1331,7 @@ void ConnectionControllerTest::lateSessionPreservesIntentions()
 			session.insert(QStringLiteral("desired_paused"), true);
 			HttpServer::reply(request, fixture::bytes(session));
 		} else if (path == QStringLiteral("/api/v1/sessions/session/outputs")) {
-			// stopped остаётся attached без desired_running; detached сохраняет отсоединение.
+			// stopped остаётся прикреплённым без desired_running; detached сохраняет отсоединение.
 			auto stopped = fixture::output();
 			stopped.insert(QStringLiteral("id"), QStringLiteral("stopped"));
 			stopped.insert(QStringLiteral("desired_running"), false);
@@ -1326,7 +1340,7 @@ void ConnectionControllerTest::lateSessionPreservesIntentions()
 			detached.insert(QStringLiteral("attached"), false);
 			HttpServer::reply(request, fixture::page({stopped, detached}));
 		} else if (path == QStringLiteral("/api/v1/streams/stream/fallback-policy")) {
-			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+			HttpServer::reply(request, R"({"revision":1,"fallback":null})");
 		} else {
 			respond(request);
 		}
@@ -1436,7 +1450,7 @@ void ConnectionControllerTest::destinationsAppearWithoutSessionOrManagement()
 	QTRY_VERIFY_WITH_TIMEOUT(waitingSession.socket && waitingFallback.socket, 3000);
 	QVERIFY(state.dockServer().sessionStatus.availability != RuntimeAvailability::Fresh);
 	HttpServer::reply(waitingSession, fixture::page({}));
-	HttpServer::reply(waitingFallback, R"({"revision":"1","fallback":null})");
+	HttpServer::reply(waitingFallback, R"({"revision":1,"fallback":null})");
 	QTRY_VERIFY_WITH_TIMEOUT(state.dockServer().sessionStatus.complete, 3000);
 	QVERIFY(!state.dockServer().session);
 	QCOMPARE(state.dockServer().destinations.size(), 1);
@@ -1497,7 +1511,7 @@ void ConnectionControllerTest::destinationReadPreservesValidatedKnowledge()
 		} else if (request.target.startsWith("/api/v1/streams/stream/sessions")) {
 			HttpServer::reply(request, fixture::page({}));
 		} else if (request.target.startsWith("/api/v1/streams/stream/fallback-policy")) {
-			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+			HttpServer::reply(request, R"({"revision":1,"fallback":null})");
 		} else {
 			respond(request);
 		}
@@ -1632,7 +1646,7 @@ void ConnectionControllerTest::streamSwitchRejectsLateDestinationRead()
 		} else if (request.target.contains("/sessions")) {
 			HttpServer::reply(request, fixture::page({}));
 		} else if (request.target.contains("/fallback-policy")) {
-			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+			HttpServer::reply(request, R"({"revision":1,"fallback":null})");
 		} else {
 			respond(request);
 		}

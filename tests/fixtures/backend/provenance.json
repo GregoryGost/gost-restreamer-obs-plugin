@@ -2,15 +2,24 @@
   "repository": "https://github.com/GregoryGost/gost-restreamer",
   "branch": "develop",
   "commit": null,
-  "contract_source_commit": "067388bc1e36ac5220e001c72c47220ef0b72173",
+  "contract_source_commit": "252669d054401f8c6081be49521f1c7f44410bec",
   "contract": "docs/api-contracts.md",
-  "server_origin": "http://192.168.88.8:8080",
+  "schema_source_commit": "95f5245cd704e088d64defde99337b9a22c970c2",
+  "schema_source_path": "docs/openapi.json",
+  "schema_source_url": "https://github.com/GregoryGost/gost-restreamer/blob/95f5245cd704e088d64defde99337b9a22c970c2/docs/openapi.json",
   "schema_route": "/api/v1/openapi.json",
-  "retrieved_at_utc": "2026-11-13T12:28:44.7700788Z",
-  "schema_sha256": "9892041D9F9B746C496CFB9A1E13067517D21D2D43B066A9B1EE8FC0170D87E8",
-  "previous_schema_sha256": "9F6C45C1A8C1EEF0B3CD9BD1457AAE31EE0366AE096740F404640A5746EAA50C",
-  "previous_fixture_backend_commit": "103d839b11591fbb786fd027aefa143a2ff79036",
+  "retrieved_at_utc": "2026-11-17T21:02:10.466Z",
+  "schema_sha256": "06A33A45F49D1D12C95CB3226EE250B94221DA3944E68A785E868F0F2BD9FB00",
+  "schema_size_bytes": 462246,
   "api_version": "1.0.0",
-  "deployment_evidence": "Получена текущая схема с настроенного backend и сверена с API-контрактом закреплённой dev.7-ревизии. От прежней dev.6-fixture отличаются EncodingInput и OutputMetricsDTO. Commit и хеш установленного бинарника не измерялись; commit=null обозначает эту неизвестность, contract_source_commit относится только к исходникам контракта.",
-  "binary_hash_verified": false
+  "deployment_evidence": "Схема скопирована без преобразования JSON из Git-репозитория. Сравнение коммитов подтвердило: 95f5245 находится ровно на один коммит после закреплённой dev.8 и добавляет только docs/openapi.json и docs/openapi.yaml. Схема описывает те же исполняемые исходники; фактическая установленная сборка backend не проверялась, commit=null сохраняет эту неизвестность.",
+  "binary_hash_verified": false,
+  "previous_fixture": {
+    "schema_sha256": "9892041D9F9B746C496CFB9A1E13067517D21D2D43B066A9B1EE8FC0170D87E8",
+    "contract_source_commit": "067388bc1e36ac5220e001c72c47220ef0b72173",
+    "retrieved_at_utc": "2026-11-13T12:28:44.7700788Z",
+    "server_origin": "http://192.168.88.8:8080",
+    "previous_schema_sha256": "9F6C45C1A8C1EEF0B3CD9BD1457AAE31EE0366AE096740F404640A5746EAA50C",
+    "previous_fixture_backend_commit": "103d839b11591fbb786fd027aefa143a2ff79036"
+  }
 }

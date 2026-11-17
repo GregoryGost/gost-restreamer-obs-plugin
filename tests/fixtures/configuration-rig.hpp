@@ -93,7 +93,7 @@ public:
 			for (const auto &key : body.keys())
 				if (key != QStringLiteral("expected_revision"))
 					value.insert(key, body.value(key));
-			value.insert(QStringLiteral("revision"), QStringLiteral("2"));
+			value.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 			if (path.startsWith(QStringLiteral("/api/v1/streams")))
 				stream = value;
 			if (path.startsWith(QStringLiteral("/api/v1/destinations")))
@@ -106,7 +106,7 @@ public:
 			return;
 		}
 		if (path.endsWith(QStringLiteral("/fallback-policy"))) {
-			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+			HttpServer::reply(request, R"({"revision":1,"fallback":null})");
 			return;
 		}
 		if (path.endsWith(QStringLiteral("/sessions")) || path.endsWith(QStringLiteral("/outputs"))) {

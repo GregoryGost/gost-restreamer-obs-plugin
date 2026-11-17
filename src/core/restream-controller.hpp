@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/operations-state.hpp"
+#include "core/operation-failure.hpp"
 
 #include <QObject>
 #include <memory>
@@ -74,6 +75,10 @@ public:
 	bool retryUnknown(const DockContext &context);
 	// Идемпотентно запрещает новые действия, отменяет принадлежащие запросы и прекращает callbacks.
 	void shutdown();
+
+signals:
+	// Передаёт однократный проверенный отказ явной mutation, без хранения диагностики в StateStore.
+	void operationFailed(const gost::OperationFailure &failure);
 
 private:
 	// Реализация хранит неизменяемый живой шаг и ограниченный план в RAM.

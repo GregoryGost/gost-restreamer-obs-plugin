@@ -3189,7 +3189,7 @@ void PluginLifecycleTest::largeStreamListAndRuntimeTrafficAllowGuiProgress()
 			auto metrics = fixture::outputMetrics();
 			// media содержит счётчики медиапотока текущего серверного выхода.
 			auto media = fixture::media();
-			media.insert(QStringLiteral("video_frames"), QString::number(number + 1));
+			media.insert(QStringLiteral("video_frames"), QJsonValue(number + 1));
 			metrics.insert(QStringLiteral("media"), media);
 			event.insert(QStringLiteral("output"), metrics);
 			wire += fixture::frame(event);

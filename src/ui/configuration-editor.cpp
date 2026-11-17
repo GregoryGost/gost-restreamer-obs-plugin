@@ -114,7 +114,8 @@ QString fieldCaption(const QString &path, const TextLookup &text)
 		{QStringLiteral("profile.audio_encoding"), "Profile.AudioBitrate"},
 		{QStringLiteral("profile.audio_encoding.bitrate_bps"), "Profile.AudioBitrate"},
 		{QStringLiteral("profile.encoding"), "Profile.Encoding"},
-		{QStringLiteral("profile.encoding.version"), "Profile.Encoding"},
+		{QStringLiteral("profile.encoding.qp"), "Profile.Qp"},
+		{QStringLiteral("profile.encoding.crf"), "Profile.Crf"},
 		{QStringLiteral("profile.encoding.video_encoder"), "Profile.VideoEncoder"},
 		{QStringLiteral("profile.encoding.audio_encoder"), "Profile.AudioEncoder"},
 		{QStringLiteral("profile.encoding.rate_control"), "Profile.RateControl"},
@@ -205,6 +206,8 @@ public:
 	void conflict();
 	// Явно разрешает конфликт, начиная с нового серверного DTO, затем отправляет подтверждённый draft.
 	void resolveConflict();
+	// Разрешает полную замену только при корректном вводе; переименование не проверяет незатронутый рецепт.
+	bool profileCanSave() const;
 	// Передаёт save только после локальной валидации полного профиля и текущего ввода.
 	void save();
 	// Запрашивает подтверждение с PlainText без интерпретации серверных имён как HTML.
@@ -919,13 +922,13 @@ void ConfigurationEditor::Impl::refresh()
 					.arg(editor.destinationNames.value(outcome.key(), text_("Dock.UnnamedOutput")),
 					     text_(key)));
 		}
-		// issue сохраняет полный путь; переводится только доверенный локальный ключ, detail остаётся текстом.
+		// issue содержит только доверенный локальный ключ; серверную причину показывает единый диалог Runtime.
 		for (auto issue = editor.fieldIssues.cbegin();
 		     localError_.isEmpty() && issue != editor.fieldIssues.cend(); ++issue) {
-			// reason содержит локализованную причину либо структурированное пояснение сервера.
-			const auto reason = !issue->messageKey.isEmpty() ? text_(issue->messageKey.toUtf8().constData())
-					    : issue->detail.isEmpty()    ? text_("Configuration.InvalidField")
-									 : issue->detail;
+			if (issue->messageKey.isEmpty())
+				continue;
+			// reason переводит только локальную проверку и не читает серверный detail/action.
+			const auto reason = text_(issue->messageKey.toUtf8().constData());
 			messages.append(text_("Editor.FieldIssue").arg(fieldCaption(issue.key(), text_), reason));
 		}
 		// endpointError учитывает отдельную inline-причину без её повторения в общей сводке.
@@ -941,7 +944,7 @@ void ConfigurationEditor::Impl::refresh()
 	}
 
 	save_->setEnabled(editable && !editor.reconciliationRequired && !editor.serverConflict &&
-			  editor.destinationReconciliation.isEmpty() &&
+			  editor.destinationReconciliation.isEmpty() && profileCanSave() &&
 			  (editor.creating || !editor.dirtyFields.isEmpty() || !editor.destinationChanges.isEmpty()));
 	remove_->setEnabled(editable && !editor.creating && editor.base.has_value() && !editor.reconciliationRequired &&
 			    !editor.serverConflict);
@@ -1027,7 +1030,7 @@ void ConfigurationEditor::Impl::edited(const QString &field)
 	updateEndpointRequiredError(updatedEditor);
 	// Доступность действий меняется без populate, сохраняя невалидный текст в форме.
 	save_->setEnabled(!editor.reconciliationRequired && !editor.serverConflict &&
-			  editor.destinationReconciliation.isEmpty());
+			  editor.destinationReconciliation.isEmpty() && profileCanSave());
 	if (editor.serverConflict) {
 		conflictIdentity_.clear();
 		conflict();
@@ -1064,6 +1067,21 @@ void ConfigurationEditor::Impl::updateEndpointRequiredError(const ConfigurationE
 	endpointRequiredError_->setStatus(visible ? text_("Editor.EndpointRequired") : QString{},
 					  visible ? StatusLabel::Tone::Error : StatusLabel::Tone::Neutral);
 	endpointRequiredError_->setVisible(visible);
+}
+
+// Проверяет полный профиль, когда он действительно входит в будущее создание или PATCH.
+bool ConfigurationEditor::Impl::profileCanSave() const
+{
+	if (!profileEditor_ || !ownsEditor())
+		return true;
+	// editor определяет состав PATCH, чтобы неизвестные исходные настройки не мешали смене имени.
+	const auto &editor = state_.configurationEditor();
+	if (!editor.creating && !profileDirty_ && !editor.dirtyFields.contains(QStringLiteral("profile")))
+		return true;
+	// checked и ignored нужны только для доступности кнопки; исходный draft и строки не меняются.
+	api::GroupProfile checked;
+	QString ignored;
+	return profileEditor_->readProfile(checked, ignored);
 }
 
 void ConfigurationEditor::Impl::save()

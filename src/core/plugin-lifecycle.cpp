@@ -11,6 +11,7 @@
 #include "obs/obs-controller.hpp"
 #include "ui/management-window.hpp"
 #include "ui/restream-dock.hpp"
+#include "ui/operation-error-dialog.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -30,8 +31,11 @@ namespace gost {
 class PluginLifecycle::Runtime final : public QObject {
 public:
 	// Создаёт три независимые области отмены с суммарным REST-бюджетом 4/32.
-	// frontend и options заимствованы на вызов, logSink копируется для всего времени жизни Runtime.
-	explicit Runtime(Frontend &frontend, const PluginOptions &options) : logSink(options.logSink)
+	// frontend переживает Runtime; options и text копируются в необходимые значения сервисов/presenter.
+	explicit Runtime(Frontend &frontend, const PluginOptions &options, TextLookup text)
+		: logSink(options.logSink),
+		  presentationFrontend(frontend),
+		  notificationText(std::move(text))
 	{
 		stateStore = std::make_unique<StateStore>();
 		settings = std::make_unique<SettingsStore>(options.settingsFile);
@@ -56,6 +60,11 @@ public:
 		restream = std::make_unique<RestreamController>(*stateStore, *commandApi, *connection, *controller);
 		configuration = std::make_unique<ConfigurationController>(*stateStore, *configurationApi, *connection,
 									  *restream);
+		// Оба контроллера публикуют отказ после проверки владельца шага; наблюдение StateStore окна не создаёт.
+		connect(restream.get(), &RestreamController::operationFailed, this,
+			[this](const OperationFailure &failure) { presentOperationFailure(failure); });
+		connect(configuration.get(), &ConfigurationController::operationFailed, this,
+			[this](const OperationFailure &failure) { presentOperationFailure(failure); });
 		connect(controller.get(), &OBSController::profileObserved, connection.get(),
 			&ConnectionController::observeProfile);
 		// Изменение предпочтений действует на будущие HTTP-задания всех трёх областей.
@@ -80,6 +89,7 @@ public:
 	// Прекращает workflow раньше OBS и сети; удаление скрытого окна предшествует удалению StateStore.
 	~Runtime() override
 	{
+		shutdownPresenter();
 		configuration->shutdown();
 		restream->shutdown();
 		connection->shutdown();
@@ -87,7 +97,63 @@ public:
 		delete managementWindow.data();
 	}
 
-	// Передаёт безопасное message с уровнем severity в адаптер; отказ журнала не выходит в event loop Qt.
+	// Запрещает новые уведомления до отмены сервисов и синхронно удаляет принадлежащее Runtime окно.
+	void shutdownPresenter()
+	{
+		presenterEnabled = false;
+		delete operationErrorDialog.data();
+	}
+
+	// Принимает только отказ нынешнего сервера/профиля/рабочего выбора, пишет его один раз в обоих
+	// режимах журнала и заменяет содержимое единственного окна. Payload в истории не сохраняется.
+	void presentOperationFailure(const OperationFailure &failure)
+	{
+		if (!presenterEnabled || failure.context.origin != stateStore->serverOrigin() ||
+		    !stateStore->profileResolved() ||
+		    failure.context.profileUuid != stateStore->dockContext().profileUuid ||
+		    failure.context.streamId != stateStore->selectedStreamId())
+			return;
+		if (lastFailureSource == failure.source && lastFailureGeneration == failure.generation &&
+		    lastFailureStep == failure.stepIdentity && lastFailureContext == failure.context)
+			return;
+		lastFailureSource = failure.source;
+		lastFailureGeneration = failure.generation;
+		lastFailureStep = failure.stepIdentity;
+		lastFailureContext = failure.context;
+		// reason и action копируются до вызова внешнего адаптера журнала и событий показа окна.
+		const auto reason = failure.reason.isEmpty() ? notificationText("Operation.ErrorUnknownReason")
+							     : failure.reason;
+		const auto action = failure.action;
+		// message содержит только полученную диагностику отказа, без запроса, конфигурации или успешного тела.
+		QString message = QStringLiteral("Отказ операции: ") + failure.code + QLatin1Char('\n') + reason;
+		if (!action.isEmpty())
+			message += QStringLiteral("\nДействие: ") + action;
+		if (!failure.field.isEmpty())
+			message += QStringLiteral("\nПоле: ") + failure.field;
+		// id перечисляет только проверенные декодером идентификаторы контекста отказа.
+		for (auto id = failure.ids.cbegin(); id != failure.ids.cend(); ++id)
+			message += QLatin1Char('\n') + id.key() + QStringLiteral(": ") + id.value();
+		if (!failure.diagnosticBody.isEmpty())
+			message += QStringLiteral("\nДиагностика: ") + QString::fromUtf8(failure.diagnosticBody);
+		// OBS принимает C-строку: явное представление NUL сохраняет следующую часть диагностики в журнале.
+		message.replace(QChar::Null, QStringLiteral("\\u0000"));
+		// guard замечает удаление Runtime из внешнего callback или вложенного события Qt.
+		const QPointer<Runtime> guard = this;
+		writeLog(LogSeverity::Warning, message);
+		if (!guard || !presenterEnabled)
+			return;
+		try {
+			if (!operationErrorDialog)
+				operationErrorDialog =
+					new OperationErrorDialog(notificationText, presentationFrontend.mainWindow());
+			operationErrorDialog->present(reason, action);
+		} catch (...) {
+			// Отказ окна не прерывает обработку исходного результата операции, уже записанного в OBS log.
+			qWarning("Не удалось показать отказ операции GOST Restreamer.");
+		}
+	}
+
+	// Передаёт готовое message с уровнем severity в адаптер; отказ журнала не выходит в event loop Qt.
 	void writeLog(LogSeverity severity, const QString &message) const noexcept
 	{
 		if (!logSink)
@@ -233,6 +299,20 @@ public:
 
 	// logSink и признаки последних записей переживают все принадлежащие Runtime сервисы.
 	LogSink logSink;
+	// presentationFrontend заимствован до shutdown и даёт родительское главное окно OBS.
+	Frontend &presentationFrontend;
+	// notificationText переводит подписи окна без зависимости от ManagementWindow.
+	TextLookup notificationText;
+	// presenterEnabled отзывается до shutdown сервисов, исключая уведомления из callbacks отмены.
+	bool presenterEnabled = true;
+	// operationErrorDialog отслеживает единственное окно; удаление главным окном OBS обнуляет указатель.
+	QPointer<OperationErrorDialog> operationErrorDialog;
+	// lastFailureSource, lastFailureGeneration, lastFailureStep и lastFailureContext описывают только
+	// последний доставленный шаг для защиты от повторного сигнала; диагностического payload здесь нет.
+	std::optional<OperationFailureSource> lastFailureSource;
+	quint64 lastFailureGeneration = 0;
+	QString lastFailureStep;
+	DockContext lastFailureContext;
 	// loggedConnection подавляет повторение одной фазы при поступлении метрик.
 	std::optional<ConnectionStatus> loggedConnection;
 	// loggedOperation и loggedConfiguration содержат только подготовленные безопасные сообщения.
@@ -291,7 +371,7 @@ bool PluginLifecycle::load()
 		return true;
 	}
 	try {
-		runtime_ = std::make_unique<Runtime>(frontend_, options_);
+		runtime_ = std::make_unique<Runtime>(frontend_, options_, text_);
 		// dock удерживает виджет до успешной передачи Frontend; отказ регистрации не оставляет утечки.
 		auto dock = std::make_unique<RestreamDock>(*runtime_->stateStore, text_, nullptr, options_.version,
 							   runtime_->restream.get(), runtime_->connection.get());
@@ -348,6 +428,8 @@ void PluginLifecycle::shutdown() noexcept
 	shuttingDown_ = true;
 	Q_ASSERT(!runtime_ || QThread::currentThread() == thread());
 	if (runtime_) {
+		// Окно и доставка отказов завершаются до сервисов и любых callbacks отмены.
+		runtime_->shutdownPresenter();
 		// Останавливаем чтение OBS и сетевые обновления, пока общее состояние ещё существует.
 		runtime_->configuration->shutdown();
 		runtime_->restream->shutdown();

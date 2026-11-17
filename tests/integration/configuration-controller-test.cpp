@@ -51,10 +51,8 @@ bool serveDestinations(const HttpServer::Request &request, QMap<QString, QJsonOb
 			// body содержит только намерение, реально поступившее через HTTP, а не RAM-форму.
 			const auto body = QJsonDocument::fromJson(request.body).object();
 			document.insert(QStringLiteral("enabled"), body.value(QStringLiteral("enabled")));
-			document.insert(
-				QStringLiteral("revision"),
-				QString::number(document.value(QStringLiteral("revision")).toString().toULongLong() +
-						1));
+			document.insert(QStringLiteral("revision"),
+					QJsonValue(document.value(QStringLiteral("revision")).toInteger() + 1));
 			documents[id] = document;
 		}
 		HttpServer::reply(request, fixture::bytes(document));
@@ -84,7 +82,7 @@ private slots:
 	void rereadCannotOverwriteDirtyDraftOrWorkingStream();
 	// Два редактора одной ревизии требуют явного сравнения и подтверждения нового PATCH.
 	void conflictPreservesBaseDraftAndServerUntilExplicitConfirmation();
-	// Повторный 409 с прежней ревизией означает запрет использования, а не разрешение перезаписи.
+	// Предметный 409 не разрешает CAS-сравнение независимо от ревизии последующего чтения.
 	void sameRevisionConflictRemainsRejected();
 	// Задаёт неоднозначные исходы уже отправленного PATCH и подтверждённый отказ.
 	void failedMutationsKeepIntentAndRequireReconciliation_data();
@@ -104,7 +102,7 @@ private slots:
 	void staleCollectionReadCannotUndoSuccessfulWrite();
 	// Параллельные чтения разных коллекций обновляют только собственные части aggregate.
 	void independentCollectionsKeepEachOthersResults();
-	// Серверные пути body.field привязываются к форме без вывода секретного value.
+	// Серверные пути и причины передаются уведомлению операции без повторения в форме.
 	void fieldValidationMapsKnownBodyLocations();
 	// Локальный CBR-отказ сохраняет точную причину, вложенный путь и исходный максимум до явного исправления.
 	void cbrBitrateMismatchPreservesReasonAndDraftBeforeHttp();
@@ -167,7 +165,7 @@ void ConfigurationControllerTest::rereadCannotOverwriteDirtyDraftOrWorkingStream
 	draft.revision = 999;
 	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("name")}));
 	QVERIFY(!rig.configuration.open(ConfigurationKind::Group, QStringLiteral("group")));
-	rig.stream.insert(QStringLiteral("revision"), QStringLiteral("2"));
+	rig.stream.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 	rig.stream.insert(QStringLiteral("name"), QStringLiteral("Серверное имя"));
 	QVERIFY(rig.configuration.reload());
 	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading, 2000);
@@ -190,9 +188,10 @@ void ConfigurationControllerTest::conflictPreservesBaseDraftAndServerUntilExplic
 		++patches;
 		if (patches != 1)
 			return false;
-		rig.destination.insert(QStringLiteral("revision"), QStringLiteral("2"));
+		rig.destination.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 		rig.destination.insert(QStringLiteral("name"), QStringLiteral("Чужая запись"));
-		HttpServer::reply(request, R"({"status":409,"title":"Conflict"})", 409, "application/problem+json");
+		HttpServer::reply(request, R"({"status":409,"code":"revision_conflict","title":"Conflict"})", 409,
+				  "application/problem+json");
 		return true;
 	};
 	QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
@@ -213,8 +212,8 @@ void ConfigurationControllerTest::conflictPreservesBaseDraftAndServerUntilExplic
 	QCOMPARE(QJsonDocument::fromJson(rig.mutations().first().body)
 			 .object()
 			 .value(QStringLiteral("expected_revision"))
-			 .toString(),
-		 QStringLiteral("1"));
+			 .toInteger(),
+		 qint64(1));
 	QVERIFY(rig.configuration.confirmConflict(draft, {QStringLiteral("name")}));
 	QCOMPARE(patches, 1);
 	QVERIFY(rig.configuration.save());
@@ -222,17 +221,19 @@ void ConfigurationControllerTest::conflictPreservesBaseDraftAndServerUntilExplic
 	QCOMPARE(patches, 2);
 	QCOMPARE(QJsonDocument::fromJson(rig.mutations().last().body).object(),
 		 QJsonObject({{QStringLiteral("name"), QStringLiteral("Моя запись")},
-			      {QStringLiteral("expected_revision"), QStringLiteral("2")}}));
+			      {QStringLiteral("expected_revision"), QJsonValue(qint64(2))}}));
 }
 void ConfigurationControllerTest::sameRevisionConflictRemainsRejected()
 {
-	// rig оставляет ту же revision после 409, моделируя серверный in-use.
+	// rig публикует более новую revision после предметного409; это не разрешает CAS-сравнение.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
-	rig.intercept = [](const HttpServer::Request &request) {
+	rig.intercept = [&rig](const HttpServer::Request &request) {
 		if (request.method != "DELETE")
 			return false;
-		HttpServer::reply(request, R"({"status":409,"title":"In use"})", 409, "application/problem+json");
+		rig.group.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
+		HttpServer::reply(request, R"({"status":409,"code":"resource_in_use","title":"In use"})", 409,
+				  "application/problem+json");
 		return true;
 	};
 	QVERIFY(rig.configuration.open(ConfigurationKind::Group, QStringLiteral("group")));
@@ -251,7 +252,7 @@ void ConfigurationControllerTest::failedMutationsKeepIntentAndRequireReconciliat
 	QTest::addColumn<bool>("unknown");
 	QTest::newRow("lost-response") << 0 << true;
 	QTest::newRow("timeout") << -1 << true;
-	QTest::newRow("server-error") << 503 << true;
+	QTest::newRow("server-error") << 503 << false;
 	QTest::newRow("invalid-success") << 200 << true;
 	QTest::newRow("validation-rejected") << 422 << false;
 }
@@ -334,7 +335,9 @@ void ConfigurationControllerTest::unknownReconciliationRejectsLateDockCatalog()
 	// Перехватчик request обслуживает handshake, потерянный результат CRUD и независимые границы двух GET.
 	rig.intercept = [&](const HttpServer::Request &request) {
 		if (request.method == "PATCH" || request.method == "DELETE" || request.method == "POST") {
-			HttpServer::reply(request, "{}", 503);
+			// Разрыв после получения полного намерения оставляет применение записи неопределённым.
+			if (request.socket)
+				request.socket->abort();
 			return true;
 		}
 		if (request.target.startsWith("/api/v1/health/ready"))
@@ -420,7 +423,7 @@ void ConfigurationControllerTest::unknownReconciliationRejectsLateDockCatalog()
 	QVERIFY(!rig.configuration.save());
 	committed = true;
 	if (!removed && !creating) {
-		rig.destination.insert(QStringLiteral("revision"), QStringLiteral("2"));
+		rig.destination.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 		rig.destination.insert(QStringLiteral("name"), draft.name);
 	}
 	// publishedOld отмечает запрещённое подтверждение прежнего состава после начала сверки.
@@ -642,6 +645,9 @@ void ConfigurationControllerTest::fieldValidationMapsKnownBodyLocations()
 	// rig возвращает стандартный Huma location body.name и потенциально секретное value.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
+	// failures получает серверную причину только для popup, без копирования в локальную валидацию формы.
+	QSignalSpy failures(&rig.configuration, &ConfigurationController::operationFailed);
+	QVERIFY(failures.isValid());
 	// Перехватчик request отклоняет PATCH, сохраняя чтение карточки в обычной петлевой фикстуре.
 	rig.intercept = [](const HttpServer::Request &request) {
 		if (request.method != "PATCH")
@@ -662,16 +668,16 @@ void ConfigurationControllerTest::fieldValidationMapsKnownBodyLocations()
 	QVERIFY(rig.configuration.save());
 	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 1000);
 	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Rejected);
-	QCOMPARE(rig.state.configurationEditor().fieldIssues.size(), 1);
-	QVERIFY(rig.state.configurationEditor().fieldIssues.contains(QStringLiteral("name")));
-	// issue содержит только доверенный локальный ключ либо обычную серверную причину, без отдельного value.
-	const auto issue = rig.state.configurationEditor().fieldIssues.value(QStringLiteral("name"));
-	QVERIFY(issue.messageKey.isEmpty());
-	QCOMPARE(issue.detail, QStringLiteral("Required"));
-	QVERIFY(!issue.detail.contains(QStringLiteral("synthetic-secret")));
+	QVERIFY(rig.state.configurationEditor().fieldIssues.isEmpty());
+	QCOMPARE(failures.size(), 1);
+	// notification сохраняет полный исходный путь и обычную причину в событии владельца операции.
+	const auto notification = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	QVERIFY(notification.reason.contains(QStringLiteral("body.name")));
+	QVERIFY(notification.reason.contains(QStringLiteral("Required")));
+	QVERIFY(notification.diagnosticBody.contains("synthetic-secret"));
 }
 
-// Меняет лишь основной битрейт современного CBR-профиля; отказ не отправляет HTTP и не исправляет максимум.
+// Локальная CBR ошибка сохраняет точный путь и значения до явного исправления.
 void ConfigurationControllerTest::cbrBitrateMismatchPreservesReasonAndDraftBeforeHttp()
 {
 	// rig предоставляет независимый серверный профиль с согласованными CBR-битрейтами 12 Мбит/с.
@@ -684,8 +690,8 @@ void ConfigurationControllerTest::cbrBitrateMismatchPreservesReasonAndDraftBefor
 	profile.insert(QStringLiteral("encoding"), encoding);
 	profile.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
 	auto video = profile.value(QStringLiteral("video_encoding")).toObject();
-	video.insert(QStringLiteral("target_bitrate_bps"), QStringLiteral("12000000"));
-	video.insert(QStringLiteral("max_bitrate_bps"), QStringLiteral("12000000"));
+	video.insert(QStringLiteral("target_bitrate_bps"), QJsonValue(qint64(12000000)));
+	video.insert(QStringLiteral("max_bitrate_bps"), QJsonValue(qint64(12000000)));
 	profile.insert(QStringLiteral("video_encoding"), video);
 	rig.profile.insert(QStringLiteral("profile"), profile);
 	QVERIFY(rig.configuration.open(ConfigurationKind::Profile, QStringLiteral("profile")));
@@ -748,14 +754,14 @@ void ConfigurationControllerTest::configurationWriteSurvivesOtherChannelCancella
 	rig.command.cancelAll();
 	rig.events.close();
 	rig.stream.insert(QStringLiteral("name"), draft.name);
-	rig.stream.insert(QStringLiteral("revision"), QStringLiteral("2"));
+	rig.stream.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 	HttpServer::reply(*held, fixture::bytes(rig.stream));
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Saved, 1000);
 	QCOMPARE(rig.state.configuration().streams.value(QStringLiteral("stream")).name, draft.name);
 }
 void ConfigurationControllerTest::conflictCannotEraseExplicitProfileContract()
 {
-	// rig обновляет серверный legacy-профиль до explicit AAC/v2 между GET и PATCH.
+	// rig обновляет полный серверный профиль между GET и PATCH.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize());
 	rig.intercept = [&](const HttpServer::Request &request) {
@@ -766,18 +772,20 @@ void ConfigurationControllerTest::conflictCannotEraseExplicitProfileContract()
 		modern.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
 		modern.insert(QStringLiteral("encoding"), fixture::encoding());
 		rig.profile.insert(QStringLiteral("profile"), modern);
-		rig.profile.insert(QStringLiteral("revision"), QStringLiteral("2"));
-		HttpServer::reply(request, R"({"status":409,"title":"Conflict"})", 409, "application/problem+json");
+		rig.profile.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
+		HttpServer::reply(request, R"({"status":409,"code":"revision_conflict","title":"Conflict"})", 409,
+				  "application/problem+json");
 		return true;
 	};
 	QVERIFY(rig.configuration.open(ConfigurationKind::Profile, QStringLiteral("profile")));
 	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
-	// draft сохраняет legacy-семантику, но после чужой миграции требует явного обновления полного рецепта.
+	// draft сохраняет полное намерение; конфликт не разрешает удалить обязательный encoding.
 	auto draft = std::get<Profile>(*rig.state.configurationEditor().draft);
 	draft.profile.audioEncoding.bitrateBps = 128000;
 	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("profile")}));
 	QVERIFY(rig.configuration.save());
 	QTRY_COMPARE_WITH_TIMEOUT(rig.state.configurationEditor().outcome, ConfigurationOutcome::Conflict, 1000);
+	draft.profile.encoding.state = FieldState::Missing;
 	QVERIFY(!rig.configuration.confirmConflict(draft, {QStringLiteral("profile")}));
 	QCOMPARE(rig.mutations().size(), 1);
 }
@@ -852,7 +860,7 @@ void ConfigurationControllerTest::streamSelectionContinuesAfterPartialFailure()
 		QVERIFY(request.target.startsWith("/api/v1/destinations/"));
 		QCOMPARE(QJsonDocument::fromJson(request.body).object(),
 			 (QJsonObject{{QStringLiteral("enabled"), false},
-				      {QStringLiteral("expected_revision"), QStringLiteral("1")}}));
+				      {QStringLiteral("expected_revision"), QJsonValue(qint64(1))}}));
 	}
 	QCOMPARE(rig.state.selectedStreamId(), QStringLiteral("stream"));
 }
@@ -882,11 +890,13 @@ void ConfigurationControllerTest::streamSelectionReconcilesUncertainAndConflicti
 	rig.intercept = [&](const HttpServer::Request &request) {
 		if (request.method == "PATCH" && destinationRequestId(request) == QStringLiteral("a") && firstFailure) {
 			firstFailure = false;
-			documents[QStringLiteral("a")].insert(QStringLiteral("revision"), QStringLiteral("2"));
+			documents[QStringLiteral("a")].insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 			if (committed)
 				documents[QStringLiteral("a")].insert(QStringLiteral("enabled"), false);
 			if (status)
-				HttpServer::reply(request, "{}", status, "application/problem+json");
+				HttpServer::reply(request,
+						  status == 409 ? R"({"status":409,"code":"revision_conflict"})" : "{}",
+						  status, "application/problem+json");
 			else if (request.socket)
 				request.socket->abort();
 			return true;
@@ -916,8 +926,8 @@ void ConfigurationControllerTest::streamSelectionReconcilesUncertainAndConflicti
 		QCOMPARE(QJsonDocument::fromJson(rig.mutations().last().body)
 				 .object()
 				 .value(QStringLiteral("expected_revision"))
-				 .toString(),
-			 QStringLiteral("2"));
+				 .toInteger(),
+			 qint64(2));
 		QVERIFY(rig.state.configurationEditor().destinationChanges.isEmpty());
 	}
 }
@@ -1014,7 +1024,7 @@ void ConfigurationControllerTest::streamSelectionReconciliationDistinguishesUnav
 				// moved — полный подтверждённый DTO, чья принадлежность изменилась независимо от клиента.
 				auto moved = documents.value(QStringLiteral("a"));
 				moved.insert(QStringLiteral("stream_id"), QStringLiteral("other-stream"));
-				moved.insert(QStringLiteral("revision"), QStringLiteral("2"));
+				moved.insert(QStringLiteral("revision"), QJsonValue(qint64(2)));
 				HttpServer::reply(request, fixture::bytes(moved));
 			} else
 				HttpServer::reply(request, "{}", readStatus, "application/problem+json");

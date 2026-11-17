@@ -24,6 +24,7 @@
 #include <QTimer>
 #include <QUrlQuery>
 #include <algorithm>
+#include <memory>
 
 using namespace gost;
 using namespace gost::api;
@@ -63,7 +64,7 @@ public:
 		// stream/error являются значением REST Stream и возможной ошибкой разбора синтетического документа.
 		Stream stream;
 		Error error;
-		if (!fromJson(fixture::stream(), stream, error))
+		if (!fromJson(fixture::wire(fixture::stream()), stream, error))
 			return false;
 		state.setStreams({stream}, true);
 		state.setSelection(QStringLiteral("stream"), true, {}, {}, QStringLiteral("profile-uuid"));
@@ -183,7 +184,7 @@ public:
 		} else if (path == QStringLiteral("/api/v1/streams/stream/fallback-policy")) {
 			HttpServer::reply(
 				request,
-				R"({"revision":"1","fallback":{"asset_id":"asset","watchdog":{"video_timeout_ns":"1","audio_timeout_ns":"1","recovery_window_ns":"1","keyframe_timeout_ns":"1"}}})");
+				R"({"revision":1,"fallback":{"asset_id":"asset","watchdog":{"video_timeout_ns":1,"audio_timeout_ns":1,"recovery_window_ns":1,"keyframe_timeout_ns":1}}})");
 		} else if (path == QStringLiteral("/api/v1/fallback-assets/asset")) {
 			// asset публикует current и pending одновременно: выбирать pending запрещено.
 			auto asset = fixture::asset();
@@ -196,7 +197,7 @@ public:
 			generation.insert(QStringLiteral("asset_id"), QStringLiteral("asset"));
 			generation.insert(QStringLiteral("kind"), QStringLiteral("image"));
 			generation.insert(QStringLiteral("status"), QStringLiteral("ready"));
-			generation.insert(QStringLiteral("size_bytes"), QStringLiteral("1024"));
+			generation.insert(QStringLiteral("size_bytes"), QJsonValue(qint64(1024)));
 			generation.insert(QStringLiteral("failure"), QJsonValue::Null);
 			HttpServer::reply(request, fixture::bytes(generation));
 		} else if (path == QStringLiteral("/api/v1/fallback-assets/asset/variants")) {
@@ -419,7 +420,7 @@ public:
 			return true;
 		}
 		if (violation == QStringLiteral("no-policy") && path.endsWith(QStringLiteral("/fallback-policy"))) {
-			HttpServer::reply(request, R"({"revision":"1","fallback":null})");
+			HttpServer::reply(request, R"({"revision":1,"fallback":null})");
 			return true;
 		}
 		if (violation == QStringLiteral("no-current") &&
@@ -821,6 +822,10 @@ private slots:
 	void passiveEventsNeverControlServer();
 	// Состояние RUNNING точной Session обязательно даже при SUCCEEDED и активном OBS.
 	void fallbackReceiptDoesNotReplaceRunningSession();
+	// Задаёт оба оракула собственной Session, оба терминальных отказа и вытеснение контекста.
+	void ownSessionFailureNotifiesOnce_data();
+	// SUCCEEDED не скрывает отказ точной Session; поздний ответ старого контекста остаётся без уведомления.
+	void ownSessionFailureNotifiesOnce();
 	// Статус чтения отсутствия Session контролирует пригодность первого предварительного запуска.
 	void fallbackRequiresConfirmedAbsence_data();
 	// Неизвестное/неполное отсутствие не разрешает start, известная завершённая Session его не блокирует.
@@ -1222,6 +1227,10 @@ void RestreamOperationsTest::invalidReceipts()
 	// rig принимает POST корректно, но GET квитанции возвращает независимо повреждённый контракт.
 	OperationRig rig;
 	QVERIFY(rig.initialize());
+	// failures отслеживает только подтверждённый отказ собственной квитанции, без уведомления для чужой identity.
+	QSignalSpy failures(&rig.operations, &RestreamController::operationFailed);
+	QVERIFY(failures.isValid());
+	// Перехватчик request меняет только GET собственной квитанции, сохраняя исходный принятый POST.
 	rig.intercept = [&](const auto &request) {
 		if (!request.target.startsWith("/api/v1/commands/"))
 			return false;
@@ -1230,6 +1239,11 @@ void RestreamOperationsTest::invalidReceipts()
 			rig.receipts.value(QUrl::fromEncoded("http://local" + request.target).path().section('/', -1));
 		receipt.insert(QStringLiteral("status"), QStringLiteral("SUCCEEDED"));
 		receipt.insert(field, value);
+		if (terminalFailure)
+			receipt.insert(
+				QStringLiteral("failure"),
+				fixture::object(
+					R"({"code":"command_failed","message":"<b>failure</b>","action":"repair","field":"session_id","context":{"session_id":"session"},"diagnostic":"receipt-secret-marker"})"));
 		HttpServer::reply(request, fixture::bytes(receipt));
 		return true;
 	};
@@ -1239,6 +1253,22 @@ void RestreamOperationsTest::invalidReceipts()
 		 terminalFailure ? OperationOutcome::Failed : OperationOutcome::Unknown);
 	QVERIFY(!rig.state.operations().current->stateConfirmed);
 	QCOMPARE(rig.posts().size(), 1);
+	QCOMPARE(failures.size(), terminalFailure ? 1 : 0);
+	if (terminalFailure) {
+		// failure сохраняет временную диагностику, stored — долговечный результат без тела.
+		const auto failure = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+		const auto &stored = rig.state.operations().current->receipt;
+		QCOMPARE(failure.code, QStringLiteral("command_failed"));
+		QCOMPARE(failure.reason, QStringLiteral("<b>failure</b>"));
+		QCOMPARE(failure.action, QStringLiteral("repair"));
+		QCOMPARE(failure.ids.value(QStringLiteral("session_id")), QStringLiteral("session"));
+		QVERIFY(failure.diagnosticBody.contains("receipt-secret-marker"));
+		QVERIFY(stored && stored->failure.hasValue());
+		QVERIFY(stored->failure->diagnosticBody.isEmpty());
+		// Повтор StateStore repaint не является новой пользовательской операцией.
+		rig.state.setOperations(rig.state.operations());
+		QCOMPARE(failures.size(), 1);
+	}
 }
 
 void RestreamOperationsTest::receiptWithoutStateIsUnknown()
@@ -1507,8 +1537,8 @@ void RestreamOperationsTest::fallbackRejectsMissingCompatibility_data()
 {
 	QTest::addColumn<int>("difference");
 	QTest::newRow("no-enabled-destinations") << 0;
-	QTest::newRow("live-audio-is-not-legacy") << 1;
-	QTest::newRow("encoding-v2-is-not-null") << 2;
+	QTest::newRow("different-live-audio") << 1;
+	QTest::newRow("different-full-encoding") << 2;
 	QTest::newRow("wrong-generation") << 3;
 }
 
@@ -1523,11 +1553,14 @@ void RestreamOperationsTest::fallbackRejectsMissingCompatibility()
 		rig.enabled = false;
 	if (difference == 1) {
 		rig.variantProfile = fixture::groupProfile();
-		rig.variantProfile.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
+		rig.variantProfile.insert(QStringLiteral("live_audio_mode"), QStringLiteral("transcode"));
 	}
 	if (difference == 2) {
 		rig.variantProfile = fixture::groupProfile();
-		rig.variantProfile.insert(QStringLiteral("encoding"), fixture::encoding());
+		// encoding отличается только разрешённой custom парой, которую полный recipe matcher обязан учитывать.
+		auto encoding = fixture::encoding();
+		encoding.insert(QStringLiteral("video_custom"), QStringLiteral("nonref_p=0"));
+		rig.variantProfile.insert(QStringLiteral("encoding"), encoding);
 	}
 	if (difference == 3) {
 		rig.intercept = [&](const auto &request) {
@@ -1763,8 +1796,16 @@ void RestreamOperationsTest::manualRetryHasFreshBoundedBudget()
 void RestreamOperationsTest::passiveEventsNeverControlServer()
 {
 	// Начальное наблюдение RUNNING не даёт права посылать start/resume/stop.
+	// rig содержит только пассивные наблюдения без собственного командного намерения.
 	OperationRig rig;
 	QVERIFY(rig.initialize());
+	// failures выявляет недопустимое уведомление от пассивного наблюдения без собственной операции.
+	QSignalSpy failures(&rig.operations, &RestreamController::operationFailed);
+	QVERIFY(failures.isValid());
+	// metadata показывает чужой терминальный отказ; он не становится отказом пользовательской команды.
+	auto metadata = rig.state.dockServer();
+	metadata.session->state = QStringLiteral("FAILED");
+	rig.state.setDockServer(metadata);
 	rig.frontend.streaming = true;
 	rig.obs.handleEvent(FrontendEvent::StreamingStarted);
 	rig.frontend.streaming = false;
@@ -1774,9 +1815,119 @@ void RestreamOperationsTest::passiveEventsNeverControlServer()
 	QCOMPARE(rig.posts().size(), 0);
 	QVERIFY(!rig.state.operations().current);
 	QCOMPARE(rig.frontend.stopRequests, 0);
+	QCOMPARE(failures.size(), 0);
 	rig.operations.shutdown();
 	QCOMPARE(rig.posts().size(), 0);
 	QCOMPARE(rig.frontend.stopRequests, 0);
+}
+
+// Оба способа собственного запуска требуют отдельного подтверждения Session после точной квитанции.
+void RestreamOperationsTest::ownSessionFailureNotifiesOnce_data()
+{
+	QTest::addColumn<bool>("selected");
+	QTest::addColumn<QString>("terminalState");
+	QTest::addColumn<bool>("lateContext");
+	// selected выбирает отдельное назначение; terminalState задаёт отказ; lateContext отзывает его поколение.
+	for (const bool selected : {false, true})
+		for (const auto &terminalState : {QStringLiteral("FAILED"), QStringLiteral("INTERRUPTED")})
+			for (const bool lateContext : {false, true})
+				QTest::newRow(qPrintable(
+					QStringLiteral("%1-%2-%3")
+						.arg(selected ? QStringLiteral("destination")
+							      : QStringLiteral("fallback"),
+						     terminalState,
+						     lateContext ? QStringLiteral("late") : QStringLiteral("current"))))
+					<< selected << terminalState << lateContext;
+}
+
+// Подтверждённый отказ собственной Session доставляет reason/action/IDs ровно один раз текущему намерению.
+void RestreamOperationsTest::ownSessionFailureNotifiesOnce()
+{
+	// selected задаёт ветвь запуска, terminalState — ответ сервера, lateContext — потерю исходного выбора.
+	QFETCH(bool, selected);
+	QFETCH(QString, terminalState);
+	QFETCH(bool, lateContext);
+	// rig предоставляет полный preflight; scenario нужен только для выбранного отдельного назначения.
+	OperationRig rig({2000, 5, 20});
+	QVERIFY(rig.initialize(false));
+	std::unique_ptr<StartDestinationScenario> scenario;
+	if (selected)
+		scenario = std::make_unique<StartDestinationScenario>(rig);
+	// oracle удерживает отдельный GET Session после SUCCEEDED, не подменяя его runtime-наблюдением.
+	HttpServer::Request oracle;
+	// holdSession перехватывает только точный oracle собственной Session, остальные маршруты остаются штатными.
+	const auto holdSession = [&](const HttpServer::Request &request) {
+		if (request.method != "GET" || request.target != "/api/v1/sessions/session")
+			return false;
+		oracle = request;
+		return true;
+	};
+	if (scenario)
+		scenario->before = holdSession;
+	else
+		rig.intercept = holdSession;
+	// expected фиксирует пользовательский контекст; failures принимает события самого контроллера.
+	const auto expected = rig.context();
+	QSignalSpy failures(&rig.operations, &RestreamController::operationFailed);
+	QVERIFY(failures.isValid());
+	if (selected)
+		QVERIFY(rig.operations.startDestination(expected, QStringLiteral("destination")));
+	else {
+		QVERIFY(rig.operations.checkFallback(expected));
+		QTRY_COMPARE_WITH_TIMEOUT(rig.state.operations().fallback.readiness, FallbackReadiness::Ready, 2000);
+		QVERIFY(rig.operations.startFallback(expected, rig.state.operations().fallback.revision));
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(oracle.socket, 2000);
+	QVERIFY(rig.state.operations().current && rig.state.operations().current->receipt);
+	QCOMPARE(rig.state.operations().current->receipt->status, QStringLiteral("SUCCEEDED"));
+	QCOMPARE(failures.size(), 0);
+	// requestId доказывает связь уведомления с исходным POST, а не с одним серверным Session ID.
+	const auto requestId = QJsonDocument::fromJson(rig.posts().first().body)
+				       .object()
+				       .value(QStringLiteral("request_id"))
+				       .toString();
+	QVERIFY(!requestId.isEmpty());
+	if (lateContext)
+		rig.state.setSelection(QStringLiteral("other-stream"), true, {}, {}, QStringLiteral("profile-uuid"));
+	// failed содержит тот же Stream/Session, собственный отказ и синтетическую диагностику без реальных секретов.
+	auto failed = fixture::session();
+	failed.insert(QStringLiteral("state"), terminalState);
+	failed.insert(
+		QStringLiteral("failure"),
+		fixture::object(
+			R"({"code":"session_failed","message":"<b>session rejected</b>","action":"repair source","field":"stream_id","context":{"session_id":"session","stream_id":"stream"},"diagnostic":"synthetic-session-diagnostic"})"));
+	HttpServer::reply(oracle, fixture::bytes(failed));
+	if (lateContext) {
+		// settled отмечает контрольное продолжение в цикле Qt; callback только выставляет этот флаг после отмены.
+		bool settled = false;
+		QTimer::singleShot(0, &rig.operations, [&] { settled = true; });
+		QTRY_VERIFY_WITH_TIMEOUT(settled, 1000);
+		QCOMPARE(failures.size(), 0);
+		QCOMPARE(rig.posts().size(), 1);
+		return;
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
+	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Failed);
+	QVERIFY(!rig.state.operations().current->stateConfirmed);
+	QCOMPARE(failures.size(), 1);
+	// failure проверяется по полям: число сигналов само по себе не доказывает правильность получателя и причины.
+	const auto failure = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	QCOMPARE(failure.source, OperationFailureSource::Runtime);
+	QCOMPARE(failure.context, expected);
+	QVERIFY(failure.generation > 0);
+	QVERIFY(failure.stepIdentity.startsWith(requestId + QLatin1Char('/')));
+	QCOMPARE(failure.code, QStringLiteral("session_failed"));
+	QCOMPARE(failure.reason, QStringLiteral("<b>session rejected</b>"));
+	QCOMPARE(failure.action, QStringLiteral("repair source"));
+	QCOMPARE(failure.field, QStringLiteral("stream_id"));
+	QCOMPARE(failure.ids.value(QStringLiteral("session_id")), QStringLiteral("session"));
+	QCOMPARE(failure.ids.value(QStringLiteral("stream_id")), QStringLiteral("stream"));
+	QCOMPARE(rig.posts().size(), 1);
+	// Повтор публикации модели и свежего наблюдения не создаёт второй отказ уже завершённого шага.
+	rig.state.setOperations(rig.state.operations());
+	rig.state.setDockServer(rig.state.dockServer());
+	QCoreApplication::processEvents();
+	QCOMPARE(failures.size(), 1);
 }
 
 void RestreamOperationsTest::fallbackReceiptDoesNotReplaceRunningSession()
@@ -1970,7 +2121,7 @@ void RestreamOperationsTest::selectedDestinationRequiresPreparedCurrentFallback(
 	scenario.violation = violation;
 	if (violation == QStringLiteral("incompatible-profile")) {
 		rig.variantProfile = fixture::groupProfile();
-		rig.variantProfile.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
+		rig.variantProfile.insert(QStringLiteral("live_audio_mode"), QStringLiteral("transcode"));
 	}
 	QVERIFY(rig.operations.startDestination(rig.context(), QStringLiteral("destination")));
 	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);

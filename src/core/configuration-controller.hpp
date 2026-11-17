@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/configuration-state.hpp"
+#include "core/operation-failure.hpp"
 #include <QObject>
 #include <memory>
 
@@ -54,6 +55,10 @@ public:
 	bool confirmConflict(ConfigurationEntity resolvedDraft, QSet<QString> dirtyFields);
 	// Завершает канал конфигурации; уже отправленная запись получает Unknown.
 	void shutdown();
+
+signals:
+	// Передаёт отказ текущего CRUD-намерения после проверки его контекста и поколения.
+	void operationFailed(const gost::OperationFailure &failure);
 
 private:
 	// Реализация хранит поколения чтений, активный ввод и припаркованные карточки.

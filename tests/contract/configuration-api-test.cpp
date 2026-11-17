@@ -17,13 +17,25 @@ using namespace gost::api;
 class ConfigurationApiTest final : public QObject {
 	Q_OBJECT
 private slots:
+	// Проверяет видео-, аудиопривязки и режимы битрейта по закреплённому контракту, включая нарушения.
+	void completeBindingMatrix_data();
+	// Сверяет все привязки и предметные отрицательные изменения с полным валидатором.
+	void completeBindingMatrix();
+	// Различает полный запрошенный рецепт и допустимое измерение, включая синонимы и математический FPS.
+	void recipeAndMeasuredCompatibility();
+	// Проверяет режимы постоянного качества, точный CRF и широкие промежуточные арифметические значения.
+	void exactQualityAndArithmeticBoundaries();
+	// Задаёт независимые пределы AV1 high: сетку тайлов, число отображаемых пикселей в секунду и секундный VBV.
+	void av1HighTierBoundaries_data();
+	// Сверяет полный рецепт SVT с tier=high с закреплёнными пределами уровня и сетки тайлов.
+	void av1HighTierBoundaries();
 	// Отсутствующее поле сохраняется, а false и пустой ключ передаются как явное изменение.
 	void patchesPreserveIntentAndExactRevision();
-	// Задаёт старые и новые профили, включая отсутствующие значения и двоичный текст.
+	// Задаёт полные профили с явными режимами обработки звука.
 	void fullProfilesRoundTrip_data();
-	// Полная замена сохраняет независимый LIVE AAC, FPS, encoding и исходные байты.
+	// Полная замена сохраняет отдельный режим LIVE-звука, AAC заглушки, FPS, encoding и строковые значения.
 	void fullProfilesRoundTrip();
-	// Задаёт нарушения документированных диапазонов и разрешённых custom-параметров.
+	// Задаёт нарушения документированных диапазонов и ограничений пользовательских параметров.
 	void invalidProfilesAreRejectedLocally_data();
 	// Некорректный полный рецепт не превращается в допустимый исходящий документ.
 	void invalidProfilesAreRejectedLocally();
@@ -33,11 +45,11 @@ private slots:
 	void cbrBitrateBoundaryKeepsSpecificLocalReason();
 	// Задаёт все четыре семейства CRUD и их публичные маршруты.
 	void typedCrudUsesEntityStatuses_data();
-	// Create/PATCH декодируют DTO, а DELETE принимает пустой 204 без JSON/MIME.
+	// Создание и PATCH декодируют DTO, а DELETE принимает пустой 204 без JSON/MIME.
 	void typedCrudUsesEntityStatuses();
 	// Задаёт ответы, которые нельзя выдать за подтверждённую успешную запись.
 	void mutationFailuresRememberWhetherTheyWereSent_data();
-	// HTTP/contract/decode/transport отказ сохраняет факт отправки и не запускает повтор.
+	// Ошибки HTTP, контракта, декодирования и транспорта сохраняют факт отправки и не запускают повтор.
 	void mutationFailuresRememberWhetherTheyWereSent();
 	// Локальный отказ до транспорта явно отличается от неоднозначного результата записи.
 	void localValidationNeverClaimsRequestWasSent();
@@ -45,7 +57,7 @@ private slots:
 	void fieldProblemsKeepLocationsWithoutEchoingValues();
 	// AddOutput передаёт только назначение и request_id точной Session и сохраняет начальный Output ID.
 	void addOutputUsesSessionTargetAndInitialOutputIdentity();
-	// Новый REST timeout действует на новые задания и не продлевает уже отправленный запрос.
+	// Новый срок ожидания REST действует на новые задания и не продлевает уже отправленный запрос.
 	void changingTimeoutDoesNotExtendAnAcceptedJob();
 };
 
@@ -59,76 +71,51 @@ void ConfigurationApiTest::patchesPreserveIntentAndExactRevision()
 	untouched.expectedRevision = revision;
 	untouched.name = QStringLiteral("Новое имя");
 	// first содержит частичный PATCH, который должен состоять ровно из двух полей.
-	const auto first = encodeRequest(untouched);
+	const auto first = fixture::qtResult(encodeRequest(untouched));
 	QVERIFY(first);
-	QCOMPARE(*first.value,
-		 QJsonObject({{QStringLiteral("expected_revision"), QStringLiteral("18446744073709551615")},
-			      {QStringLiteral("name"), QStringLiteral("Новое имя")}}));
+	// raw проверяет числовую ревизию в реально сериализованном документе без Qt double.
+	const auto raw = encodeRequest(untouched);
+	QVERIFY(raw);
+	QVERIFY(serializeJson(*raw.value).contains("\"expected_revision\":18446744073709551615"));
+	QCOMPARE(first.value->value(QStringLiteral("name")).toString(), QStringLiteral("Новое имя"));
+	QCOMPARE(first.value->size(), 2);
 	untouched.enabled = false;
 	untouched.streamKey = QString{};
 	untouched.endpoint = endpoint;
 	// explicitChange фиксирует намеренные false, очистку ключа и точный URL.
-	const auto explicitChange = encodeRequest(untouched);
+	const auto explicitChange = fixture::qtResult(encodeRequest(untouched));
 	QVERIFY(explicitChange);
 	QCOMPARE(explicitChange.value->value(QStringLiteral("enabled")), QJsonValue(false));
 	QCOMPARE(explicitChange.value->value(QStringLiteral("stream_key")), QJsonValue(QString{}));
 	QCOMPARE(explicitChange.value->value(QStringLiteral("endpoint")).toString(), endpoint);
 	QCOMPARE(explicitChange.value->size(), 5);
 	// nameOnly не должен включать полную замену профиля при обычном переименовании.
-	const auto nameOnly = encodeRequest(ProfilePatch{revision, QStringLiteral("Имя"), std::nullopt});
+	const auto nameOnly =
+		fixture::qtResult(encodeRequest(ProfilePatch{revision, QStringLiteral("Имя"), std::nullopt}));
 	QVERIFY(nameOnly);
 	QVERIFY(!nameOnly.value->contains(QStringLiteral("profile")));
-	QCOMPARE(nameOnly.value->value(QStringLiteral("expected_revision")).toString(),
-		 QStringLiteral("18446744073709551615"));
+	// nameWire доказывает точное числовое поле и отсутствие полной замены.
+	const auto nameWire = encodeRequest(ProfilePatch{revision, QStringLiteral("Имя"), std::nullopt});
+	QVERIFY(nameWire);
+	QVERIFY(serializeJson(*nameWire.value).contains("\"expected_revision\":18446744073709551615"));
+
 	// stream не предоставляет полей изменения постоянного publication_key или fallback-policy.
-	const auto stream = encodeRequest(StreamPatch{revision, QStringLiteral("Имя")});
+	const auto stream = fixture::qtResult(encodeRequest(StreamPatch{revision, QStringLiteral("Имя")}));
 	QVERIFY(stream);
 	QCOMPARE(stream.value->size(), 2);
 	QVERIFY(!stream.value->contains(QStringLiteral("publication_key")));
 	QVERIFY(!stream.value->contains(QStringLiteral("fallback")));
 }
 
+// Полная замена всегда содержит явный режим звука и encoding без поля version.
 void ConfigurationApiTest::fullProfilesRoundTrip_data()
 {
 	QTest::addColumn<QJsonObject>("document");
-	// legacy сохраняет encoding:null и отсутствие live_audio_mode без подстановки defaults.
-	auto legacy = fixture::groupProfile();
-	QTest::newRow("legacy-null") << legacy;
-	legacy.remove(QStringLiteral("encoding"));
-	QTest::newRow("legacy-missing") << legacy;
-	// modern представляет полный уже материализованный сервером рецепт v2.
+	// modern задаёт полный H.264-рецепт; режим LIVE-звука меняется независимо от AAC заглушки.
 	auto modern = fixture::groupProfile();
-	modern.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
-	modern.insert(QStringLiteral("encoding"), fixture::encoding());
-	QTest::newRow("explicit-copy-v2") << modern;
+	QTest::newRow("explicit-copy") << modern;
 	modern.insert(QStringLiteral("live_audio_mode"), QStringLiteral("transcode"));
-	QTest::newRow("explicit-transcode-v2") << modern;
-	// format/video получают независимую копию, чтобы проверить непредставимый в UTF-8 ProfileText.
-	auto format = modern.value(QStringLiteral("format")).toObject();
-	auto video = format.value(QStringLiteral("video")).toObject();
-	video.insert(QStringLiteral("level"), fixture::object(R"({"encoding":"base64","value":"/wBh"})"));
-	format.insert(QStringLiteral("video"), video);
-	modern.insert(QStringLiteral("format"), format);
-	QTest::newRow("binary-profile-text") << modern;
-	// av1 описывает copy-видео с серверным SVT-AV1 рецептом только для заглушки.
-	auto av1 = fixture::groupProfile();
-	av1.insert(QStringLiteral("mode"), QStringLiteral("copy"));
-	av1.insert(QStringLiteral("live_audio_mode"), QStringLiteral("copy"));
-	format = fixture::format();
-	video = format.value(QStringLiteral("video")).toObject();
-	video.insert(QStringLiteral("codec"), QStringLiteral("av1"));
-	video.insert(QStringLiteral("codec_profile"), QStringLiteral("main"));
-	format.insert(QStringLiteral("video"), video);
-	av1.insert(QStringLiteral("format"), format);
-	av1.insert(
-		QStringLiteral("video_encoding"),
-		fixture::object(
-			R"({"target_bitrate_bps":"6000000","max_bitrate_bps":"0","buffer_bits":"0","gop_frames":120,"max_b_frames":0,"closed_gop":true})"));
-	av1.insert(
-		QStringLiteral("encoding"),
-		fixture::object(
-			R"({"version":2,"video_encoder":"libsvtav1","audio_encoder":"aac","rate_control":"vbr","rescale_output":false,"video_custom":"lp=0","audio_custom":"aac_coder=fast","svt_av1":{"preset":13,"tuning":"vq","aq_mode":2,"lookahead_frames":-1}})"));
-	QTest::newRow("av1-vbr-copy") << av1;
+	QTest::newRow("explicit-transcode") << modern;
 }
 
 void ConfigurationApiTest::fullProfilesRoundTrip()
@@ -138,15 +125,15 @@ void ConfigurationApiTest::fullProfilesRoundTrip()
 	// decoded моделирует открытие сохранённого профиля, encoded — его полную замену без изменений.
 	const auto decoded = decode<GroupProfile>(fixture::bytes(document));
 	QVERIFY(decoded);
-	const auto encoded = encodeProfile(*decoded.value);
+	const auto encoded = fixture::qtResult(encodeProfile(*decoded.value));
 	QVERIFY(encoded);
 	QCOMPARE(*encoded.value, document);
 	// replacement проверяет тот же рецепт в реальном конверте PATCH с точной ревизией.
-	const auto replacement = encodeRequest(ProfilePatch{9007199254740993ULL, std::nullopt, *decoded.value});
+	const auto replacement =
+		fixture::qtResult(encodeRequest(ProfilePatch{9007199254740993ULL, std::nullopt, *decoded.value}));
 	QVERIFY(replacement);
 	QCOMPARE(replacement.value->value(QStringLiteral("profile")).toObject(), document);
-	QCOMPARE(replacement.value->value(QStringLiteral("expected_revision")).toString(),
-		 QStringLiteral("9007199254740993"));
+	QCOMPARE(replacement.value->value(QStringLiteral("expected_revision")).toInteger(), qint64(9007199254740993LL));
 }
 
 void ConfigurationApiTest::invalidProfilesAreRejectedLocally_data()
@@ -191,13 +178,14 @@ void ConfigurationApiTest::invalidProfilesAreRejectedLocally()
 	QVERIFY(decoded);
 	auto profile = *decoded.value;
 	profile.liveAudioMode = {FieldState::Value, QStringLiteral("copy")};
-	// encoding нужен для негативных проверок NVENC/CBR/custom независимо от legacy.
+	// encoding задаёт независимый полный рецепт NVENC для отрицательных проверок.
 	const auto encoding = decode<Encoding>(fixture::bytes(fixture::encoding()));
 	QVERIFY(encoding);
 	profile.encoding = {FieldState::Value, *encoding.value};
 	if (violation.startsWith(QStringLiteral("av1-"))) {
 		profile.mode = QStringLiteral("copy");
 		profile.format.video.codec = QStringLiteral("av1");
+		profile.format.video.level.bytes = "auto";
 		profile.format.video.codecProfile.bytes = "main";
 		profile.videoEncoding.maxBFrames = 0;
 		profile.videoEncoding.maxBitrateBps = 0;
@@ -261,7 +249,7 @@ void ConfigurationApiTest::invalidProfilesAreRejectedLocally()
 	if (violation == QStringLiteral("av1-rescale"))
 		profile.encoding->rescaleOutput = true;
 	if (violation == QStringLiteral("av1-custom"))
-		profile.encoding->videoCustom = QStringLiteral("lp=7");
+		profile.encoding->videoCustom = QStringLiteral("lp=-1");
 	if (violation == QStringLiteral("av1-cbr-buffer")) {
 		profile.encoding->rateControl = QStringLiteral("cbr");
 		profile.encoding->svtAv1->lookaheadFrames = 0;
@@ -269,7 +257,7 @@ void ConfigurationApiTest::invalidProfilesAreRejectedLocally()
 		profile.videoEncoding.bufferBits = 123457;
 	}
 	// result обязан отказать до HTTP, без выдуманной корректировки пользовательских значений.
-	const auto result = encodeProfile(profile);
+	const auto result = fixture::qtResult(encodeProfile(profile));
 	QVERIFY(!result);
 	QVERIFY(result.error.has_value());
 	QCOMPARE(result.error->kind, ErrorKind::Contract);
@@ -303,7 +291,7 @@ void ConfigurationApiTest::cbrBitrateBoundaryKeepsSpecificLocalReason()
 	profile.videoEncoding.targetBitrateBps = target;
 	profile.videoEncoding.maxBitrateBps = 12000000;
 	// result содержит документ только для равных битрейтов; ошибка не означает отправку HTTP.
-	const auto result = encodeRequest(ProfilePatch{1, std::nullopt, profile});
+	const auto result = fixture::qtResult(encodeRequest(ProfilePatch{1, std::nullopt, profile}));
 	QCOMPARE(bool(result), accepted);
 	QCOMPARE(profile.videoEncoding.targetBitrateBps, target);
 	QCOMPARE(profile.videoEncoding.maxBitrateBps, quint64(12000000));
@@ -313,8 +301,8 @@ void ConfigurationApiTest::cbrBitrateBoundaryKeepsSpecificLocalReason()
 				 .value(QStringLiteral("video_encoding"))
 				 .toObject()
 				 .value(QStringLiteral("target_bitrate_bps"))
-				 .toString(),
-			 QStringLiteral("12000000"));
+				 .toInteger(),
+			 qint64(12000000));
 	} else {
 		QVERIFY(result.error.has_value());
 		QVERIFY(!result.error->requestSent);
@@ -323,14 +311,8 @@ void ConfigurationApiTest::cbrBitrateBoundaryKeepsSpecificLocalReason()
 		QCOMPARE(result.error->problem->errors.size(), 1);
 		QCOMPARE(result.error->problem->errors.first().location,
 			 QStringLiteral("profile.video_encoding.max_bitrate_bps"));
-		if (target < 12000000)
-			QCOMPARE(result.error->problem->errors.first().messageKey,
-				 QStringLiteral("Validation.CbrBitrateMismatch"));
-		else {
-			QVERIFY(!result.error->problem->errors.first().messageKey.isEmpty());
-			QVERIFY(result.error->problem->errors.first().messageKey !=
-				QStringLiteral("Configuration.InvalidField"));
-		}
+		QCOMPARE(result.error->problem->errors.first().messageKey,
+			 QStringLiteral("Validation.CbrBitrateMismatch"));
 	}
 }
 
@@ -339,7 +321,7 @@ void ConfigurationApiTest::typedCrudUsesEntityStatuses_data()
 	QTest::addColumn<int>("kind");
 	QTest::addColumn<int>("operation");
 	QTest::addColumn<QByteArray>("route");
-	// kind выбирает сущность, operation — create/PATCH/DELETE; имена строк описывают HTTP-контракт.
+	// kind выбирает сущность, operation — создание/PATCH/DELETE; имена строк описывают HTTP-контракт.
 	for (int kind = 0; kind < 4; ++kind) {
 		// route содержит публичный путь коллекции конкретной сущности.
 		const auto route =
@@ -353,11 +335,12 @@ void ConfigurationApiTest::typedCrudUsesEntityStatuses_data()
 
 void ConfigurationApiTest::typedCrudUsesEntityStatuses()
 {
-	// kind выбирает сущность; operation задаёт create/PATCH/DELETE; route содержит точный путь API.
+	// kind выбирает сущность; operation задаёт создание/PATCH/DELETE; route содержит точный путь API.
 	QFETCH(int, kind);
 	QFETCH(int, operation);
 	QFETCH(QByteArray, route);
-	// server отдаёт разные статусы согласно семейству CRUD и намеренно не отдаёт JSON для DELETE.
+	// server обслуживает семейства CRUD; его обработчик возвращает для request статус выбранной operation
+	// и DTO сущности kind, а для DELETE — пустой ответ без JSON.
 	HttpServer server;
 	QVERIFY(server.listen());
 	server.handler = [kind, operation](const HttpServer::Request &request) {
@@ -374,13 +357,13 @@ void ConfigurationApiTest::typedCrudUsesEntityStatuses()
 						   : 204,
 				  operation == 2 ? QByteArray{} : QByteArray("application/json"));
 	};
-	// client работает только с петлевым сервером, received/succeeded/error фиксируют callback.
+	// client работает с петлевым сервером; received отмечает завершение, succeeded — успешность, error — отказ.
 	APIClient client;
 	client.configure(server.origin(), {7, 9});
 	bool received = false;
 	bool succeeded = false;
 	std::optional<Error> error;
-	// callback проверяет контекст независимо от конкретного типа CRUD-результата.
+	// callback проверяет context, отмечает получение result и сохраняет его успешность и ошибку независимо от типа DTO.
 	const auto callback = [&](RequestContext context, auto result) {
 		QCOMPARE(context, (RequestContext{7, 9}));
 		received = true;
@@ -440,8 +423,8 @@ void ConfigurationApiTest::typedCrudUsesEntityStatuses()
 		QCOMPARE(QJsonDocument::fromJson(server.requests.first().body)
 				 .object()
 				 .value(QStringLiteral("expected_revision"))
-				 .toString(),
-			 QStringLiteral("9007199254740993"));
+				 .toInteger(),
+			 qint64(9007199254740993));
 	}
 }
 
@@ -468,16 +451,18 @@ void ConfigurationApiTest::mutationFailuresRememberWhetherTheyWereSent()
 	// server либо возвращает заданный отказ, либо разрывает соединение после полного POST.
 	HttpServer server;
 	QVERIFY(server.listen());
+	// Обработчик server.handler отвечает на request значениями body/status/mime либо разрывает сокет при status=0.
 	server.handler = [&](const HttpServer::Request &request) {
 		if (status)
 			HttpServer::reply(request, body, status, mime);
 		else if (request.socket)
 			request.socket->abort();
 	};
-	// client отправляет одно намерение; result фиксирует проверенный исход после ответа/разрыва.
+	// client отправляет одно намерение; result фиксирует проверенный исход после ответа или разрыва.
 	APIClient client;
 	client.configure(server.origin(), {});
 	std::optional<Result<Stream>> result;
+	// Обратный вызов сохраняет received в result после ответа или потери связи.
 	client.createStream({QStringLiteral("Имя"), QStringLiteral("synthetic-secret")}, this,
 			    [&](RequestContext, Result<Stream> received) { result = std::move(received); });
 	QTRY_VERIFY_WITH_TIMEOUT(result.has_value(), 2000);
@@ -495,6 +480,7 @@ void ConfigurationApiTest::localValidationNeverClaimsRequestWasSent()
 	APIClient client;
 	client.configure(server.origin(), {});
 	std::optional<Result<Stream>> result;
+	// Обратный вызов сохраняет received в result, чтобы отличить локальный отказ от отправленного запроса.
 	client.createStream({QStringLiteral("Имя"), QString{}}, this,
 			    [&](RequestContext, Result<Stream> received) { result = std::move(received); });
 	QTRY_VERIFY_WITH_TIMEOUT(result.has_value(), 1000);
@@ -525,6 +511,7 @@ void ConfigurationApiTest::addOutputUsesSessionTargetAndInitialOutputIdentity()
 	// server возвращает именно начальную PENDING-квитанцию с уже выделенным Output ID.
 	HttpServer server;
 	QVERIFY(server.listen());
+	// Обработчик server.handler отвечает на request квитанцией точной Session и нового Output.
 	server.handler = [](const HttpServer::Request &request) {
 		HttpServer::reply(
 			request,
@@ -534,10 +521,11 @@ void ConfigurationApiTest::addOutputUsesSessionTargetAndInitialOutputIdentity()
 							QStringLiteral("command"), QStringLiteral("PENDING"))),
 			202);
 	};
-	// client/result фиксируют одну команду, без ожидания выдуманного runtime/PUBLISHING.
+	// client/result фиксируют одну команду без ожидания неподтверждённого состояния PUBLISHING.
 	APIClient client;
 	client.configure(server.origin(), {});
 	std::optional<Result<Receipt>> result;
+	// Обратный вызов сохраняет received в result для проверки принятия и идентичности команды.
 	client.addOutput(QStringLiteral("session/target"), QStringLiteral("destination"), QStringLiteral("request"),
 			 this, [&](RequestContext, Result<Receipt> received) { result = std::move(received); });
 	QTRY_VERIFY_WITH_TIMEOUT(result.has_value(), 2000);
@@ -554,7 +542,7 @@ void ConfigurationApiTest::addOutputUsesSessionTargetAndInitialOutputIdentity()
 
 void ConfigurationApiTest::changingTimeoutDoesNotExtendAnAcceptedJob()
 {
-	// server удерживает ответы: видимый результат должен определяться timeout каждого отправленного Job.
+	// server удерживает ответы: видимый результат должен определяться сроком ожидания каждого отправленного Job.
 	HttpServer server;
 	QVERIFY(server.listen());
 	// client получает короткий срок первого запроса; result фиксирует его завершение.
@@ -562,6 +550,7 @@ void ConfigurationApiTest::changingTimeoutDoesNotExtendAnAcceptedJob()
 	client.configure(server.origin(), {});
 	client.setHttpTimeoutMs(70);
 	std::optional<Result<Stream>> result;
+	// Обратный вызов сохраняет received в result после истечения исходного срока отправленного запроса.
 	client.createStream({QStringLiteral("Имя"), QStringLiteral("ключ")}, this,
 			    [&](RequestContext, Result<Stream> received) { result = std::move(received); });
 	QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 1, 1000);
@@ -571,6 +560,8 @@ void ConfigurationApiTest::changingTimeoutDoesNotExtendAnAcceptedJob()
 	QCOMPARE(result->error->kind, ErrorKind::Timeout);
 	QVERIFY(result->error->requestSent);
 }
+
+#include "profile-rules-cases.hpp"
 
 QTEST_GUILESS_MAIN(ConfigurationApiTest)
 #include "configuration-api-test.moc"
