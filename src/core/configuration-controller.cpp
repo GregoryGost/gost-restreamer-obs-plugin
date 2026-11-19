@@ -119,6 +119,18 @@ public:
 		  connection(connection),
 		  restream(restream)
 	{
+		// Этот первый direct-обработчик снимает свою queued mutation до отмены чтений Fallback.
+		// Иначе освобождённый ими слот pump мог бы отправить уже закрываемую запись старого контекста.
+		QObject::connect(
+			&owner, &ConfigurationController::channelClosing, &owner,
+			[this] {
+				// guard/sent защищают сохранение факта dispatch после возможного вложенного callback API.
+				const QPointer<ConfigurationController> guard = &this->owner;
+				const bool sent = mutationReceiver && this->api.cancelRequests(mutationReceiver);
+				if (guard)
+					closingMutationSent = sent;
+			},
+			Qt::DirectConnection);
 		// Обработчик отзывает callbacks лишь при смене логического контекста.
 		QObject::connect(&state, &StateStore::serverStateChanged, &owner, [this] { observe(); });
 		// Явное отключение отменяет config API независимо от жизненного цикла SSE.
@@ -157,6 +169,8 @@ public:
 	quint64 editorGeneration = 0;
 	// Каждый вид списка имеет независимый номер последнего чтения.
 	std::array<quint64, 4> reads{};
+	// Флаги отмечают незавершённые чтения каталогов, которым скрытая сверка не должна отзывать эпоху.
+	std::array<bool, 4> pendingReads{};
 	// Поколение карточки отделяет навигацию и позднее GET.
 	quint64 detailGeneration = 0;
 	// Поколение записи запрещает завершение отменённого намерения.
@@ -164,6 +178,38 @@ public:
 	// notifiedMutation и notifiedStep подавляют повтор события одного шага, не накапливая историю отказов.
 	quint64 notifiedMutation = 0;
 	QString notifiedStep;
+	// Уведомление закрытия защищено от вложенной смены контекста.
+	bool changingChannel = false;
+	// Внешний observe удерживает переход до configure/channelReady и объединяет вложенные уведомления.
+	bool contextTransition = false;
+	// Отмечает необходимость заново прочитать последний logical context после вложенного сигнала.
+	bool observeAgain = false;
+	// Признак разрешает Fallback заимствовать уже сконфигурированный канал.
+	bool channelReady = false;
+	// Первый channelClosing-handler сохраняет факт dispatch до отмены чужих чтений общего канала.
+	bool closingMutationSent = false;
+	// Receiver относится только к нынешней mutation либо целому пакету enabled.
+	QPointer<QObject> mutationReceiver;
+	// Адрес и token владения переживают изменение model при синхронном уведомлении.
+	QString writeOrigin;
+	quint64 writeToken = 0;
+	// Точное обязательство сверки сохраняется независимо от карточки и OBS Profile.
+	struct UnknownWrite {
+		// Сервер, на котором запись могла завершиться.
+		QString origin;
+		// Вид сущности выбирает адресный GET либо полный список неизвестного create.
+		ConfigurationKind kind = ConfigurationKind::Stream;
+		// Пустой ID означает create без достоверного ответа.
+		QString id;
+	};
+	// Конечный набор обязательств не очищается при смене origin/карточки.
+	QVector<UnknownWrite> unknownWrites;
+	// Отдельное поколение сверки не допускает старых чтений после нового Unknown.
+	quint64 reconciliationGeneration = 0;
+	// Receiver объединяет скрытую сверку в одну цепочку чтения и позволяет уступить её видимой форме.
+	QPointer<QObject> reconciliationReceiver;
+	// Один отложенный запуск ждёт завершения чтений формы; ошибка GET сама повтор не планирует.
+	bool reconciliationScheduled = false;
 	// shutdown необратимо запрещает новые действия.
 	bool stopped = false;
 	// Явное отключение запрещает новые CRUD до нового подключения.
@@ -181,7 +227,9 @@ public:
 	// Разрешает новое намерение лишь для подтверждённого UUID и подключённого сервера.
 	bool available() const
 	{
-		return !stopped && !disconnected && context.valid() && state.profileResolved() &&
+		return !stopped && !disconnected && !changingChannel && context.valid() && state.profileResolved() &&
+		       context == ConfigurationContext{state.serverOrigin(), state.dockContext().profileUuid,
+						       state.selectedStreamId()} &&
 		       state.connectionStatus() == ConnectionStatus::Connected;
 	}
 
@@ -267,78 +315,391 @@ public:
 		return false;
 	}
 
-	// Отменяет ожидание; уже отправленное намерение остаётся Unknown, а не объявляется отменённым на сервере.
+	// Регистрирует неопределённость до освобождения общего владения.
+	void rememberUnknown(ConfigurationKind kind, const QString &id)
+	{
+		// found исключает повтор одного адреса; полнота нужна лишь для create без ID.
+		const auto found =
+			std::find_if(unknownWrites.cbegin(), unknownWrites.cend(), [this, kind, &id](const auto &item) {
+				return item.origin == context.origin && item.kind == kind && item.id == id;
+			});
+		if (found == unknownWrites.cend())
+			unknownWrites.append({context.origin, kind, id});
+		++reconciliationGeneration;
+		state.setConfigurationUnknown(context.origin, QStringLiteral("Configuration"), true);
+	}
+
+	// Атомарно занимает общую mutation; новый receiver изолирует адресную отмену записи.
+	bool acquireWrite()
+	{
+		if (unknownWrites.size() >= 64 || !state.configurationSettled(context.origin))
+			return false;
+		writeOrigin = context.origin;
+		writeToken = ++mutationGeneration;
+		mutationReceiver = new QObject(&owner);
+		model.writing = true;
+		// guard обнаруживает удаление контроллера из уведомления общего барьера.
+		const QPointer<ConfigurationController> guard = &owner;
+		if (!state.beginConfigurationWrite(writeOrigin, QStringLiteral("Configuration"), writeToken)) {
+			delete mutationReceiver.data();
+			mutationReceiver = nullptr;
+			model.writing = false;
+			return false;
+		}
+		return guard && state.ownsConfigurationWrite(writeOrigin, QStringLiteral("Configuration"), writeToken);
+	}
+
+	// Освобождает намерение после регистрации Unknown; API не повторяет mutation.
+	void releaseWrite()
+	{
+		// origin/token фиксируются до сигнала, способного начать следующее намерение.
+		const auto origin = writeOrigin;
+		const auto token = writeToken;
+		// receiver и guard защищают освобождение от вложенного callback сетевой очереди.
+		const QPointer<QObject> receiver = mutationReceiver;
+		const QPointer<ConfigurationController> guard = &owner;
+		mutationReceiver = nullptr;
+		writeOrigin.clear();
+		delete receiver.data();
+		if (!guard)
+			return;
+		state.endConfigurationWrite(origin, QStringLiteral("Configuration"), token);
+	}
+
+	// Отменяет scopes до cancelAll; final необратимо запрещает новые действия, в том числе при вложенном вызове.
+	// Прежний контекст остаётся доступен обработчикам channelClosing.
 	void cancel(bool final)
 	{
-		stopped = final;
+		// Вложенный shutdown отзывает канал немедленно, даже если внешнее закрытие ещё выполняется.
+		stopped = stopped || final;
+		channelReady = false;
+		if (changingChannel)
+			return;
+		changingChannel = true;
+		// guard защищает дальнейшую отмену от удаления из синхронного channelClosing.
+		const QPointer<ConfigurationController> guard = &owner;
+		closingMutationSent = false;
+		emit owner.channelClosing();
+		if (!guard)
+			return;
+		// sent отражает фактический dispatch, включая отмену ещё ожидавшей mutation.
+		const bool sent = closingMutationSent;
+		if (!guard)
+			return;
 		++apiContext.connection;
 		++detailGeneration;
 		++mutationGeneration;
+		if (!stopReconciliation())
+			return;
+		pendingReads.fill(false);
 		api.cancelAll();
-		// wasWriting фиксирует необходимость отозвать эпоху после подготовки окончательной формы.
+		// wasWriting отличает активное намерение от длительного чтения.
 		const bool wasWriting = model.writing;
 		if (!destinationBusyId.isEmpty()) {
-			model.destinationOutcomes.insert(destinationBusyId, ConfigurationOutcome::Unknown);
-			model.destinationReconciliation.insert(destinationBusyId);
+			model.destinationOutcomes.insert(destinationBusyId, sent ? ConfigurationOutcome::Unknown
+										 : ConfigurationOutcome::Rejected);
+			if (sent) {
+				model.destinationReconciliation.insert(destinationBusyId);
+				rememberUnknown(ConfigurationKind::Destination, destinationBusyId);
+				if (!guard)
+					return;
+			}
 			destinationBusyId.clear();
 		}
 		destinationQueue.clear();
 		if (wasWriting && !destinationBatch) {
-			model.writing = false;
-			model.outcome = ConfigurationOutcome::Unknown;
-			model.reconciliationRequired = true;
-			model.messageKey = QStringLiteral("Configuration.Unknown");
+			model.outcome = sent ? ConfigurationOutcome::Unknown : ConfigurationOutcome::Rejected;
+			model.reconciliationRequired = sent;
+			model.messageKey = sent ? QStringLiteral("Configuration.Unknown")
+						: QStringLiteral("Configuration.Rejected");
+			if (sent) {
+				rememberUnknown(model.kind, model.id);
+				if (!guard)
+					return;
+			}
 		}
+		model.writing = false;
 		if (destinationBatch) {
-			model.writing = false;
 			model.destinationMessageKey = QStringLiteral("Configuration.DestinationsPartial");
 			destinationBatch = false;
 		}
 		model.loading = false;
 		if (model.context.valid())
 			parked.insert_or_assign(draftKey(model.context, model.kind, model.id), model);
-		// guard защищает последнюю публикацию от удаления контроллера обработчиком эпохи.
-		const QPointer<ConfigurationController> guard = &owner;
+		releaseWrite();
+		if (!guard)
+			return;
 		if (wasWriting)
 			state.invalidateConfiguration();
-		if (guard)
-			publish();
+		if (!guard)
+			return;
+		publish();
+		if (!guard)
+			return;
+		changingChannel = false;
+		// Глобальный shutdown ждёт всех обработчиков закрытия и их учёта отправленных записей.
+		if (stopped) {
+			api.shutdown();
+			return;
+		}
+		// Отложенный обработчик перечитывает последний контекст после объединённых уведомлений закрытия.
+		if (observeAgain && !contextTransition)
+			QTimer::singleShot(0, &owner, [this] { observe(); });
 	}
 
-	// Смена сервер/UUID/рабочий выбор отзывает право отправки старого draft в новый контекст.
+	// Закрывает старый канал до изменения context; обычное восстановление SSE configure не вызывает.
 	void observe()
 	{
 		if (stopped)
 			return;
-		// next построен по устойчивой идентичности, а не имени профиля OBS.
+		if (changingChannel || contextTransition) {
+			observeAgain = true;
+			return;
+		}
+		contextTransition = true;
+		observeAgain = false;
+		// next использует подтверждённый UUID, а не имя OBS Profile.
 		const ConfigurationContext next{state.serverOrigin(),
 						state.profileResolved() ? state.dockContext().profileUuid : QString{},
 						state.selectedStreamId()};
-		// reconnected допускает новые запросы после явного отключения только при новом Connected.
+		// reconnected отличает новое Connected от обычного сигнала кеша.
 		const bool reconnected = observedStatus != ConnectionStatus::Connected &&
 					 state.connectionStatus() == ConnectionStatus::Connected;
 		observedStatus = state.connectionStatus();
-		if (next != context) {
-			// guard защищает продолжение после синхронного уведомления формы.
-			const QPointer<ConfigurationController> guard = &owner;
-			context = next;
+		// guard защищает все продолжения после сигналов закрытия/готовности.
+		const QPointer<ConfigurationController> guard = &owner;
+		if (next != context || (reconnected && disconnected)) {
 			cancel(false);
-			if (!guard)
+			if (!guard || stopped)
 				return;
+			context = {state.serverOrigin(),
+				   state.profileResolved() ? state.dockContext().profileUuid : QString{},
+				   state.selectedStreamId()};
 			++apiContext.selection;
+			if (reconnected)
+				disconnected = false;
 			api.configure(QUrl(context.origin), apiContext);
-		}
-		if (reconnected) {
-			disconnected = false;
-			if (!model.requiresReconciliation())
+			if (!guard || stopped)
 				return;
-			// После восстановления используем одно адресное чтение нынешней спорной карточки.
-			// Callback не переносится в другой контекст и не повторяет потерянную запись.
-			QTimer::singleShot(0, &owner, [this, next] {
-				if (context == next && model.context == context && model.requiresReconciliation() &&
-				    !model.loading && !model.writing)
-					reload();
-			});
+			channelReady = context.valid() && !disconnected;
+			if (channelReady)
+				emit owner.channelReady();
+			if (!guard || stopped)
+				return;
+		}
+		if (reconnected)
+			disconnected = false;
+		contextTransition = false;
+		// Отложенный обработчик применит контекст, изменённый из синхронных уведомлений этого перехода.
+		if (observeAgain)
+			QTimer::singleShot(0, &owner, [this] { observe(); });
+		if (reconnected && !unknownWrites.isEmpty()) {
+			if (model.context == context && model.requiresReconciliation())
+				reload();
+			else
+				deferReconciliation();
+		}
+	}
+
+	// Уступает скрытое чтение явному обновлению формы; неизвестная запись при отмене GET сохраняется.
+	bool stopReconciliation()
+	{
+		// receiver снимается до удаления, чтобы вложенный callback не завершил прежнюю сверку.
+		const QPointer<QObject> receiver = reconciliationReceiver;
+		// guard учитывает синхронные callbacks сетевой очереди при уничтожении receiver.
+		const QPointer<ConfigurationController> guard = &owner;
+		reconciliationReceiver = nullptr;
+		delete receiver.data();
+		return guard;
+	}
+
+	// Объединяет продолжения сверки; активные чтения формы завершатся до следующего скрытого GET.
+	void deferReconciliation()
+	{
+		if (stopped || unknownWrites.isEmpty() || reconciliationScheduled)
+			return;
+		reconciliationScheduled = true;
+		// Обработчик продолжает скрытую сверку после чтений формы; ошибка GET сама новый запуск не планирует.
+		QTimer::singleShot(0, &owner, [this] {
+			reconciliationScheduled = false;
+			reconcileUnknown();
+		});
+	}
+
+	// Снимает точное обязательство после применения свежего DTO либо полного списка создания.
+	// Старый исход Unknown сохраняется; общий сигнал публикуется последним и требует проверки guard у вызывающего.
+	void settleUnknown(ConfigurationKind kind, const QString &id)
+	{
+		// origin фиксирует сервер прочитанного адреса до внешнего уведомления общего барьера.
+		const auto origin = context.origin;
+		unknownWrites.erase(std::remove_if(unknownWrites.begin(), unknownWrites.end(),
+						   [&origin, kind, &id](const auto &item) {
+							   return item.origin == origin && item.kind == kind &&
+								  item.id == id;
+						   }),
+				    unknownWrites.end());
+		if (model.context.origin == origin) {
+			if (model.kind == kind && model.id == id)
+				model.reconciliationRequired = false;
+			if (kind == ConfigurationKind::Destination)
+				model.destinationReconciliation.remove(id);
+		}
+		// entry адресует припаркованную форму; draft сохраняет её прежний исход и пользовательский ввод.
+		for (auto &entry : parked) {
+			auto &draft = entry.second;
+			if (draft.context.origin != origin)
+				continue;
+			if (draft.kind == kind && draft.id == id)
+				draft.reconciliationRequired = false;
+			if (kind == ConfigurationKind::Destination)
+				draft.destinationReconciliation.remove(id);
+		}
+		// remaining сохраняет блокировку всех остальных обязательств данного сервера.
+		const bool remaining = std::any_of(unknownWrites.cbegin(), unknownWrites.cend(),
+						   [&origin](const auto &item) { return item.origin == origin; });
+		state.setConfigurationUnknown(origin, QStringLiteral("Configuration"), remaining);
+	}
+
+	// Сверяет только скрытый адрес; видимая форма применяет DTO и снимает своё обязательство собственным GET.
+	// Один receiver исключает дубли; ошибка и неполный список сохраняют барьер без автоматического повтора.
+	void reconcileUnknown()
+	{
+		if (!available() || unknownWrites.isEmpty() || reconciliationReceiver || model.writing ||
+		    model.loading ||
+		    std::any_of(pendingReads.cbegin(), pendingReads.cend(), [](bool pending) { return pending; }) ||
+		    (model.context == context && model.requiresReconciliation()))
+			return;
+		// found выбирает обязательство нынешнего origin; остальные серверы сохраняют собственный запрет.
+		const auto found = std::find_if(unknownWrites.cbegin(), unknownWrites.cend(),
+						[this](const auto &item) { return item.origin == context.origin; });
+		if (found == unknownWrites.cend())
+			return;
+		// item, expected, token и epoch фиксируют адрес и свежесть единственного скрытого чтения.
+		const auto item = *found;
+		const auto expected = context;
+		const auto token = reconciliationGeneration;
+		const auto epoch = state.configurationGeneration();
+		// receiver адресует только эту сверку и не отменяет запросы другого владельца общего API.
+		const QPointer<QObject> receiver = new QObject(&owner);
+		reconciliationReceiver = receiver;
+		// valid проверяет receiver и поколение до применения результата или публикации сигналов.
+		const auto valid = [this, receiver, expected, token, epoch] {
+			return receiver && reconciliationReceiver == receiver && current(expected, epoch) &&
+			       token == reconciliationGeneration;
+		};
+		// finish освобождает receiver, отзывает прежние наблюдения и продолжает лишь успешную свежую сверку.
+		const auto finish = [this, item, expected, epoch, receiver, valid](bool complete) {
+			if (!valid()) {
+				if (reconciliationReceiver == receiver)
+					reconciliationReceiver = nullptr;
+				if (receiver)
+					receiver->deleteLater();
+				return;
+			}
+			reconciliationReceiver = nullptr;
+			receiver->deleteLater();
+			if (!complete)
+				return;
+			// guard защищает публикации кеша, барьера и эпохи от вложенного закрытия либо удаления.
+			const QPointer<ConfigurationController> guard = &owner;
+			settleUnknown(item.kind, item.id);
+			if (!guard || !current(expected, epoch))
+				return;
+			state.invalidateConfiguration();
+			if (!guard || !current(expected, epoch + 1))
+				return;
+			publish();
+			if (!guard || !current(expected, epoch + 1))
+				return;
+			restream.refreshFallbackAfterConfiguration();
+			if (guard && current(expected, epoch + 1))
+				deferReconciliation();
+		};
+		// read применяет ровно тот проверенный DTO/список, который затем снимает обязательство.
+		const auto read = [this, item, receiver, valid, finish]<class T>() {
+			if (item.id.isEmpty()) {
+				// callback обновляет полноту каталога; только полный список разрешает новое создание.
+				const auto callback = [this, valid, finish](auto,
+									    api::Result<api::Collection<T>> result) {
+					if (!valid()) {
+						finish(false);
+						return;
+					}
+					if (!result) {
+						finish(false);
+						return;
+					}
+					// next сохраняет другие семейства и элементы, отсутствие которых неполный список не доказывает.
+					auto next = state.configuration();
+					if (result.value->complete)
+						collection<T>(next).clear();
+					// value содержит подтверждённую запись прочитанного каталога.
+					for (const auto &value : result.value->items)
+						collection<T>(next).insert(value.id, value);
+					readStatus<T>(next) = {RuntimeAvailability::Fresh, result.value->complete, {}};
+					// guard запрещает вызов finish после удаления из уведомления кеша.
+					const QPointer<ConfigurationController> guard = &owner;
+					state.setConfiguration(std::move(next));
+					if (guard)
+						finish(result.value->complete);
+				};
+				if constexpr (std::is_same_v<T, api::Stream>)
+					api.getAllStreams(receiver, callback);
+				else if constexpr (std::is_same_v<T, api::Destination>)
+					api.getAllDestinations(receiver, callback);
+				else if constexpr (std::is_same_v<T, api::Group>)
+					api.getAllGroups(receiver, callback);
+				else
+					api.getAllProfiles(receiver, callback);
+			} else {
+				// callback применяет точный DTO либо подтверждённое отсутствие, не объявляя прежнюю запись успешной.
+				const auto callback = [this, item, valid, finish](auto, api::Result<T> result) {
+					if (!valid()) {
+						finish(false);
+						return;
+					}
+					// present/absent отличают адресное подтверждение от ошибки либо чужого ID.
+					const bool present = result && result.value->id == item.id;
+					const bool absent = !result && result.error && result.error->httpStatus == 404;
+					if (!present && !absent) {
+						finish(false);
+						return;
+					}
+					// next изменяет только прочитанный адрес, сохраняя прочие коллекции и их полноту.
+					auto next = state.configuration();
+					if (present)
+						collection<T>(next).insert(item.id, *result.value);
+					else
+						collection<T>(next).remove(item.id);
+					// guard защищает продолжение после сигнала кеша.
+					const QPointer<ConfigurationController> guard = &owner;
+					state.setConfiguration(std::move(next));
+					if (guard)
+						finish(true);
+				};
+				if constexpr (std::is_same_v<T, api::Stream>)
+					api.getStream(item.id, receiver, callback);
+				else if constexpr (std::is_same_v<T, api::Destination>)
+					api.getDestination(item.id, receiver, callback);
+				else if constexpr (std::is_same_v<T, api::Group>)
+					api.getGroup(item.id, receiver, callback);
+				else
+					api.getProfile(item.id, receiver, callback);
+			}
+		};
+		switch (item.kind) {
+		case ConfigurationKind::Stream:
+			read.template operator()<api::Stream>();
+			break;
+		case ConfigurationKind::Destination:
+			read.template operator()<api::Destination>();
+			break;
+		case ConfigurationKind::Group:
+			read.template operator()<api::Group>();
+			break;
+		case ConfigurationKind::Profile:
+			read.template operator()<api::Profile>();
+			break;
 		}
 	}
 
@@ -374,6 +735,7 @@ public:
 		// expected сохраняет контекст, detailSequence отличает исходную карточку при сверке создания.
 		const auto index = static_cast<size_t>(kind);
 		const auto sequence = ++reads[index];
+		pendingReads[index] = true;
 		const auto epoch = state.configurationGeneration();
 		const auto expected = context;
 		const auto detailSequence = detailGeneration;
@@ -381,7 +743,11 @@ public:
 		// отсутствие элемента не является удалением, а полный список может завершить сверку создания.
 		auto callback = [this, index, sequence, epoch, expected,
 				 detailSequence](auto, api::Result<api::Collection<T>> result) {
-			if (!current(expected, epoch) || reads[index] != sequence)
+			if (reads[index] != sequence)
+				return;
+			pendingReads[index] = false;
+			deferReconciliation();
+			if (!current(expected, epoch))
 				return;
 			// next всегда содержит последние результаты других коллекций.
 			auto next = state.configuration();
@@ -404,7 +770,10 @@ public:
 			if (result && result.value->complete && model.context == expected && model.creating &&
 			    model.reconciliationRequired && static_cast<size_t>(model.kind) == index &&
 			    detailGeneration == detailSequence) {
-				model.reconciliationRequired = false;
+				settleUnknown(static_cast<ConfigurationKind>(index), {});
+				if (!guard || !current(expected, epoch) || reads[index] != sequence ||
+				    detailGeneration != detailSequence)
+					return;
 				// completedEpoch учитывает собственный отзыв каталогового GET до завершения сверки создания.
 				const auto completedEpoch = epoch + 1;
 				state.invalidateConfiguration();
@@ -435,6 +804,8 @@ public:
 	void refresh(ConfigurationKind kind)
 	{
 		if (!available())
+			return;
+		if (!stopReconciliation() || !available())
 			return;
 		switch (kind) {
 		case ConfigurationKind::Stream:
@@ -475,6 +846,7 @@ public:
 			if (sequence != detailGeneration || stopped)
 				return;
 			model.loading = false;
+			deferReconciliation();
 			if (!current(expected, epoch)) {
 				publish();
 				return;
@@ -497,6 +869,9 @@ public:
 				state.setConfiguration(std::move(next));
 				if (!guard || sequence != detailGeneration || !current(expected, completedEpoch))
 					return;
+				settleUnknown(model.kind, id);
+				if (!guard || sequence != detailGeneration || !current(expected, completedEpoch))
+					return;
 				publish();
 				if (!guard || sequence != detailGeneration || !current(expected, completedEpoch))
 					return;
@@ -517,6 +892,11 @@ public:
 				model.serverConflict = ConfigurationEntity(value);
 				model.outcome = ConfigurationOutcome::Conflict;
 				model.messageKey = QStringLiteral("Configuration.Conflict");
+			} else if (model.reconciliationRequired) {
+				// Свежая база задаёт ревизию следующего явного сохранения; dirty-ввод и исторический Unknown остаются.
+				model.base = value;
+				if (model.dirtyFields.isEmpty())
+					model.draft = value;
 			} else if (model.dirtyFields.isEmpty() && model.outcome != ConfigurationOutcome::Unknown) {
 				model.base = value;
 				model.draft = value;
@@ -541,6 +921,11 @@ public:
 			cache(value);
 			if (!guard || sequence != detailGeneration || !current(expected, completedEpoch))
 				return;
+			if (reconciled) {
+				settleUnknown(model.kind, id);
+				if (!guard || sequence != detailGeneration || !current(expected, completedEpoch))
+					return;
+			}
 			publish();
 			if (!guard || !reconciled || sequence != detailGeneration || !current(expected, completedEpoch))
 				return;
@@ -562,6 +947,8 @@ public:
 	bool reload(bool conflict = false)
 	{
 		if (!available() || model.writing || model.context != context)
+			return false;
+		if (!stopReconciliation() || !available() || model.context != context)
 			return false;
 		if (model.kind == ConfigurationKind::Stream && !model.destinationReconciliation.isEmpty())
 			return reconcileDestinations();
@@ -738,11 +1125,16 @@ public:
 		return guard && !stopped && !disconnected && context == expected && mutationGeneration == sequence;
 	}
 
-	// Сохраняет отказ либо неопределённость без повтора CRUD; только revision_conflict запускает сравнение.
+	// Сначала фиксирует Unknown и барьер, затем освобождает mutation и уведомляет presenter.
+	// Только revision_conflict запускает сравнение; синхронный обработчик не может потерять обязательство.
 	void failed(const api::Error &error)
 	{
-		if (!notifyFailure(error, model.id))
-			return;
+		// expected/sequence/guard защищают исходное намерение после каждого внешнего сигнала.
+		// stepId сохраняет идентичность прежней карточки независимо от reentrant навигации.
+		const auto stepId = model.id;
+		const auto expected = context;
+		const auto sequence = mutationGeneration;
+		const QPointer<ConfigurationController> guard = &owner;
 		model.writing = false;
 		model.outcome = !error.requestSent || mutationRejected(error) ? ConfigurationOutcome::Rejected
 									      : ConfigurationOutcome::Unknown;
@@ -750,22 +1142,27 @@ public:
 		model.messageKey = model.reconciliationRequired ? QStringLiteral("Configuration.Unknown")
 								: QStringLiteral("Configuration.Rejected");
 		model.fieldIssues.clear();
-		// expected и sequence не позволяют публикациям эпохи перенести отказ в другой контекст.
-		const auto expected = context;
-		const auto sequence = mutationGeneration;
-		// guard запрещает продолжение при уничтожении контроллера из сигнала.
-		const QPointer<ConfigurationController> guard = &owner;
+		if (model.reconciliationRequired)
+			rememberUnknown(model.kind, model.id);
+		if (!guard || context != expected || mutationGeneration != sequence)
+			return;
+		releaseWrite();
+		if (!guard || context != expected || mutationGeneration != sequence)
+			return;
 		state.invalidateConfiguration();
-		if (!guard || context != expected || sequence != mutationGeneration)
+		if (!guard || context != expected || mutationGeneration != sequence)
 			return;
 		publish();
-		if (!guard || context != expected || sequence != mutationGeneration)
+		if (!guard || context != expected || mutationGeneration != sequence)
+			return;
+		if (!notifyFailure(error, stepId))
 			return;
 		if (revisionConflict(error))
 			reload(true);
 	}
 
-	// Подтверждает собственный DTO записи и обновляет лишь его коллекцию.
+	// Принимает value как подтверждённый DTO записи и обновляет лишь его коллекцию.
+	// Смена контекста или намерения из синхронных сигналов прекращает дальнейшие публикации.
 	template<class T> void saved(T value)
 	{
 		if (value.id.isEmpty() || (!model.creating && value.id != model.id)) {
@@ -786,25 +1183,30 @@ public:
 		model.serverConflict.reset();
 		model.outcome = ConfigurationOutcome::Saved;
 		model.messageKey = QStringLiteral("Configuration.Saved");
-		// expected/sequence запрещают публикацию в новый контекст, выбранный обработчиком сигнала.
+		// expected/sequence фиксируют исходную запись до сигнала освобождения общего канала.
 		const auto expected = context;
 		const auto sequence = mutationGeneration;
+		// writeGuard защищает продолжение после освобождения общей mutation.
+		const QPointer<ConfigurationController> writeGuard = &owner;
+		releaseWrite();
+		if (!writeGuard || stopped || context != expected || mutationGeneration != sequence)
+			return;
 		// guard защищает последовательность синхронных публикаций.
 		const QPointer<ConfigurationController> guard = &owner;
 		state.invalidateConfiguration();
-		if (!guard || context != expected || mutationGeneration != sequence)
+		if (!guard || stopped || context != expected || mutationGeneration != sequence)
 			return;
 		cache(value);
-		if (!guard || context != expected || mutationGeneration != sequence)
+		if (!guard || stopped || context != expected || mutationGeneration != sequence)
 			return;
 		publish();
-		if (!guard || context != expected || mutationGeneration != sequence)
+		if (!guard || stopped || context != expected || mutationGeneration != sequence)
 			return;
 		refresh(model.kind);
-		if (!guard || context != expected || mutationGeneration != sequence)
+		if (!guard || stopped || context != expected || mutationGeneration != sequence)
 			return;
 		connection.refreshState();
-		if (!guard || context != expected || mutationGeneration != sequence)
+		if (!guard || stopped || context != expected || mutationGeneration != sequence)
 			return;
 		restream.refreshFallbackAfterConfiguration();
 	}
@@ -823,12 +1225,14 @@ public:
 			publish();
 			return false;
 		}
+		if (!acquireWrite())
+			return false;
 		model.writing = true;
 		model.outcome = ConfigurationOutcome::None;
 		model.messageKey.clear();
 		model.fieldIssues.clear();
 		// sequence различает намерения, expected фиксирует сервер/UUID/рабочий Stream до HTTP.
-		const auto sequence = ++mutationGeneration;
+		const auto sequence = mutationGeneration;
 		const auto expected = context;
 		// guard обнаруживает уничтожение контроллера при синхронных сигналах.
 		const QPointer<ConfigurationController> guard = &owner;
@@ -837,6 +1241,9 @@ public:
 			return false;
 		publish();
 		if (!guard || sequence != mutationGeneration)
+			return false;
+		if (!available() || context != expected ||
+		    !state.ownsConfigurationWrite(writeOrigin, QStringLiteral("Configuration"), writeToken))
 			return false;
 		// callback принимает результат только пока существует исходное намерение.
 		send([this, sequence, expected](auto, api::Result<T> result) {
@@ -880,11 +1287,12 @@ public:
 			if (!model.destinationRevisions.contains(id))
 				return false;
 		}
+		if (!acquireWrite())
+			return false;
 		destinationQueue = model.destinationChanges.keys();
 		destinationBatch = true;
 		model.writing = true;
 		model.destinationMessageKey.clear();
-		++mutationGeneration;
 		// guard защищает продолжение при публикации занятой формы.
 		const QPointer<ConfigurationController> guard = &owner;
 		publish();
@@ -899,7 +1307,15 @@ public:
 	{
 		if (!destinationBatch || model.context != context)
 			return;
+		// expected и sequence связывают весь шаг с прежним пакетом до любых внешних уведомлений.
+		const auto expected = context;
+		const auto sequence = mutationGeneration;
 		if (!available()) {
+			// guard исключает завершение прежнего пакета в контексте, изменённом при освобождении канала.
+			const QPointer<ConfigurationController> guard = &owner;
+			releaseWrite();
+			if (!guard || stopped || context != expected || sequence != mutationGeneration)
+				return;
 			destinationBatch = false;
 			destinationQueue.clear();
 			model.writing = false;
@@ -907,7 +1323,16 @@ public:
 			publish();
 			return;
 		}
+		// Каждый следующий PATCH должен иметь место для возможного Unknown. Неотправленный ввод остаётся в форме.
+		// Предел совпадает с допуском новых намерений; уже сохранённые обязательства не удаляются ради продолжения.
+		if (!destinationQueue.isEmpty() && unknownWrites.size() >= 64)
+			destinationQueue.clear();
 		if (destinationQueue.isEmpty()) {
+			// writeGuard ограждает завершение пакета после синхронного освобождения канала.
+			const QPointer<ConfigurationController> writeGuard = &owner;
+			releaseWrite();
+			if (!writeGuard || stopped || context != expected || sequence != mutationGeneration)
+				return;
 			destinationBatch = false;
 			model.writing = false;
 			// hasFailure не позволяет снять ошибку с общей сводки после удаления устаревших намерений.
@@ -921,7 +1346,7 @@ public:
 			// guard защищает последующее сохранение обычных полей и обновление кеша.
 			const QPointer<ConfigurationController> guard = &owner;
 			publish();
-			if (!guard)
+			if (!guard || stopped || context != expected || sequence != mutationGeneration)
 				return;
 			if (model.requiresReconciliation())
 				return;
@@ -930,15 +1355,13 @@ public:
 				return;
 			}
 			connection.refreshState();
-			if (guard)
+			if (guard && !stopped && context == expected && sequence == mutationGeneration)
 				restream.refreshFallbackAfterConfiguration();
 			return;
 		}
-		// id, desired, expected и sequence фиксируют адрес и значение одного шага до уведомлений.
+		// id и desired фиксируют адрес и значение одного шага; expected и sequence сохранены до освобождения канала.
 		const auto id = destinationQueue.takeFirst();
 		const bool desired = model.destinationChanges.value(id);
-		const auto expected = context;
-		const auto sequence = mutationGeneration;
 		// found проверяет, что обновлённый кеш всё ещё связывает назначение с этим Stream.
 		const auto found = state.configuration().destinations.constFind(id);
 		if (found == state.configuration().destinations.cend() || found->streamId != model.id) {
@@ -975,11 +1398,12 @@ public:
 		// guard запрещает отправку после синхронной смены контекста из уведомления эпохи.
 		const QPointer<ConfigurationController> guard = &owner;
 		state.invalidateConfiguration();
-		if (!guard || sequence != mutationGeneration || context != expected || !destinationBatch)
+		if (!guard || sequence != mutationGeneration || context != expected || !destinationBatch ||
+		    !state.ownsConfigurationWrite(writeOrigin, QStringLiteral("Configuration"), writeToken))
 			return;
 		// Callback сохраняет индивидуальный итог; даже после отказа следующий шаг требует того же контекста.
 		api.patchDestination(
-			id, request, &owner,
+			id, request, mutationReceiver,
 			[this, id, desired, expected, sequence](auto, api::Result<api::Destination> result) {
 				if (stopped || disconnected || context != expected || sequence != mutationGeneration ||
 				    !destinationBatch)
@@ -1007,8 +1431,6 @@ public:
 						error.kind = api::ErrorKind::Contract;
 						error.requestSent = true;
 					}
-					if (!notifyFailure(error, id))
-						return;
 					// outcome относится только к этому назначению, не к соседним шагам пакета.
 					const auto outcome = result.error && revisionConflict(*result.error)
 								     ? ConfigurationOutcome::Conflict
@@ -1021,12 +1443,25 @@ public:
 					} else if (outcome == ConfigurationOutcome::Unknown ||
 						   outcome == ConfigurationOutcome::Conflict) {
 						model.destinationReconciliation.insert(id);
+						if (outcome == ConfigurationOutcome::Unknown) {
+							rememberUnknown(ConfigurationKind::Destination, id);
+							if (!alive)
+								return;
+							// Остальные шаги уже подтверждённого пакета сохраняют прежнее владение канала.
+						}
 						// GET, начатый до этого результата, ещё мог видеть прежнее enabled.
 						state.invalidateConfiguration();
 					}
+					if (!alive || context != expected || sequence != mutationGeneration)
+						return;
+					if (!notifyFailure(error, id))
+						return;
 				}
 				if (validSuccess)
 					cache(*result.value);
+				if (!alive || context != expected || sequence != mutationGeneration)
+					return;
+				state.invalidateConfiguration();
 				if (!alive || context != expected || sequence != mutationGeneration)
 					return;
 				publish();
@@ -1073,9 +1508,8 @@ public:
 			const QPointer<ConfigurationController> guard = &owner;
 			const auto expected = context;
 			const auto sequence = detailGeneration;
-			const auto epoch = state.configurationGeneration() + (model.requiresReconciliation() ? 0 : 1);
-			if (!model.requiresReconciliation())
-				state.invalidateConfiguration();
+			const auto epoch = state.configurationGeneration();
+			deferReconciliation();
 			if (!guard || sequence != detailGeneration || !current(expected, epoch))
 				return;
 			publish();
@@ -1106,6 +1540,9 @@ public:
 				}
 				// alive защищает продолжение после уведомления кеша; результат не меняет исход PATCH на Saved.
 				const QPointer<ConfigurationController> alive = &owner;
+				// reconciled требует точный DTO либо адресное подтверждение отсутствия; ошибка не снимает барьер.
+				const bool reconciled = (result && result.value->id == id) ||
+							(!result && result.error && result.error->httpStatus == 404);
 				if (!result && result.error && result.error->httpStatus == 404) {
 					retireDestinationIntent(id);
 					removeDestinationFromCache(id);
@@ -1131,6 +1568,15 @@ public:
 					publish();
 					return;
 				}
+				if (reconciled) {
+					settleUnknown(ConfigurationKind::Destination, id);
+					if (!alive || sequence != detailGeneration || !current(expected, epoch))
+						return;
+					state.invalidateConfiguration();
+					if (!alive || sequence != detailGeneration || !current(expected, epoch + 1))
+						return;
+				}
+				// Отложенный шаг проверяет прежнюю карточку; собственная инвалидация уже завершена.
 				QTimer::singleShot(0, &owner, [this, expected, sequence] {
 					if (context == expected && sequence == detailGeneration)
 						nextReconciliation();
@@ -1141,7 +1587,8 @@ public:
 	// Формирует PATCH только по явным полям; skipDestinations продолжает обычные поля после завершения пакета.
 	bool save(bool skipDestinations = false)
 	{
-		if (!available() || model.context != context || model.writing || model.loading || !model.draft ||
+		if (!available() || !state.configurationSettled(context.origin) || unknownWrites.size() >= 64 ||
+		    model.context != context || model.writing || model.loading || !model.draft ||
 		    model.requiresReconciliation() || model.serverConflict || (!model.creating && !model.base))
 			return false;
 		if (!skipDestinations && model.kind == ConfigurationKind::Stream && !model.creating &&
@@ -1163,7 +1610,7 @@ public:
 				// request содержит все обязательные поля создания, включая точный ключ.
 				const api::StreamCreate request{value.name, *value.publicationKey};
 				return submit<api::Stream>(request, [this, request](auto cb) {
-					api.createStream(request, &owner, cb);
+					api.createStream(request, mutationReceiver, cb);
 				});
 			}
 			// request не имеет publication_key: существующий ключ не может случайно попасть в PATCH.
@@ -1172,7 +1619,7 @@ public:
 			if (fields.contains(QStringLiteral("name")))
 				request.name = value.name;
 			return submit<api::Stream>(request, [this, request](auto cb) {
-				api.patchStream(model.id, request, &owner, cb);
+				api.patchStream(model.id, request, mutationReceiver, cb);
 			});
 		}
 		case ConfigurationKind::Destination: {
@@ -1186,7 +1633,7 @@ public:
 								     value.platform, *value.endpoint, *value.streamKey,
 								     false};
 				return submit<api::Destination>(request, [this, request](auto cb) {
-					api.createDestination(request, &owner, cb);
+					api.createDestination(request, mutationReceiver, cb);
 				});
 			}
 			// request оставляет неизменённые секретные поля отсутствующими.
@@ -1213,7 +1660,7 @@ public:
 				request.streamKey = *value.streamKey;
 			}
 			return submit<api::Destination>(request, [this, request](auto cb) {
-				api.patchDestination(model.id, request, &owner, cb);
+				api.patchDestination(model.id, request, mutationReceiver, cb);
 			});
 		}
 		case ConfigurationKind::Group: {
@@ -1223,7 +1670,7 @@ public:
 				// request фиксирует обязательные связи нового Group.
 				const api::GroupCreate request{value.streamId, value.profileId, value.name};
 				return submit<api::Group>(request, [this, request](auto cb) {
-					api.createGroup(request, &owner, cb);
+					api.createGroup(request, mutationReceiver, cb);
 				});
 			}
 			// request содержит лишь явно изменённые связи и имя.
@@ -1236,7 +1683,7 @@ public:
 			if (fields.contains(QStringLiteral("profile_id")))
 				request.profileId = value.profileId;
 			return submit<api::Group>(request, [this, request](auto cb) {
-				api.patchGroup(model.id, request, &owner, cb);
+				api.patchGroup(model.id, request, mutationReceiver, cb);
 			});
 		}
 		case ConfigurationKind::Profile: {
@@ -1259,7 +1706,7 @@ public:
 				// request создаёт полный именованный профиль.
 				const api::ProfileCreate request{value.name, value.profile};
 				return submit<api::Profile>(request, [this, request](auto cb) {
-					api.createProfile(request, &owner, cb);
+					api.createProfile(request, mutationReceiver, cb);
 				});
 			}
 			// request не отправляет profile при одном лишь переименовании.
@@ -1270,7 +1717,7 @@ public:
 			if (fields.contains(QStringLiteral("profile")))
 				request.profile = value.profile;
 			return submit<api::Profile>(request, [this, request](auto cb) {
-				api.patchProfile(model.id, request, &owner, cb);
+				api.patchProfile(model.id, request, mutationReceiver, cb);
 			});
 		}
 		}
@@ -1313,8 +1760,9 @@ public:
 	// Удаляет запись по точной исходной ревизии, без каскадных операций и автоматического выбора.
 	bool remove()
 	{
-		if (!available() || model.context != context || model.writing || model.loading || model.creating ||
-		    !model.base || model.serverConflict || model.requiresReconciliation())
+		if (!available() || !state.configurationSettled(context.origin) || unknownWrites.size() >= 64 ||
+		    model.context != context || model.writing || model.loading || model.creating || !model.base ||
+		    model.serverConflict || model.requiresReconciliation())
 			return false;
 		// revision задаёт серверное предусловие, id адресует запись, kind выбирает коллекцию удаления.
 		const auto revision = record(*model.base).revision;
@@ -1322,8 +1770,10 @@ public:
 		const auto kind = model.kind;
 		// expected ограждает результат от смены сервера/UUID/рабочего Stream.
 		const auto expected = context;
+		if (!acquireWrite())
+			return false;
 		// sequence отличает это удаление от следующего намерения.
-		const auto sequence = ++mutationGeneration;
+		const auto sequence = mutationGeneration;
 		model.writing = true;
 		model.outcome = ConfigurationOutcome::None;
 		model.messageKey.clear();
@@ -1366,6 +1816,11 @@ public:
 			model.dirtyFields.clear();
 			model.outcome = ConfigurationOutcome::Deleted;
 			model.messageKey = QStringLiteral("Configuration.Deleted");
+			// writeGuard защищает завершение после освобождения общего канала.
+			const QPointer<ConfigurationController> writeGuard = &owner;
+			releaseWrite();
+			if (!writeGuard)
+				return;
 			// guard отслеживает время жизни во время уведомлений кеша/выбора.
 			const QPointer<ConfigurationController> guard = &owner;
 			state.invalidateConfiguration();
@@ -1389,18 +1844,21 @@ public:
 				return;
 			restream.refreshFallbackAfterConfiguration();
 		};
+		if (!available() || context != expected ||
+		    !state.ownsConfigurationWrite(writeOrigin, QStringLiteral("Configuration"), writeToken))
+			return false;
 		switch (kind) {
 		case ConfigurationKind::Stream:
-			api.deleteStream(id, revision, &owner, callback);
+			api.deleteStream(id, revision, mutationReceiver, callback);
 			break;
 		case ConfigurationKind::Destination:
-			api.deleteDestination(id, revision, &owner, callback);
+			api.deleteDestination(id, revision, mutationReceiver, callback);
 			break;
 		case ConfigurationKind::Group:
-			api.deleteGroup(id, revision, &owner, callback);
+			api.deleteGroup(id, revision, mutationReceiver, callback);
 			break;
 		case ConfigurationKind::Profile:
-			api.deleteProfile(id, revision, &owner, callback);
+			api.deleteProfile(id, revision, mutationReceiver, callback);
 			break;
 		}
 		return true;
@@ -1419,6 +1877,21 @@ ConfigurationController::ConfigurationController(StateStore &state, api::APIClie
 ConfigurationController::~ConfigurationController()
 {
 	shutdown();
+}
+// Возвращает прежний адрес также во время channelClosing.
+ConfigurationContext ConfigurationController::channelContext() const
+{
+	return impl_->context;
+}
+// Возвращает копию текущего транспортного поколения.
+api::RequestContext ConfigurationController::channelRequestContext() const
+{
+	return impl_->apiContext;
+}
+// Указывает, что configure уже завершена и глобальная отмена не выполняется.
+bool ConfigurationController::channelIsReady() const
+{
+	return impl_->channelReady && !impl_->stopped && !impl_->changingChannel;
 }
 // Запускает типизированное чтение выбранной коллекции.
 void ConfigurationController::refresh(ConfigurationKind kind)
@@ -1488,12 +1961,7 @@ bool ConfigurationController::confirmConflict(ConfigurationEntity draft, QSet<QS
 // Необратимо завершает независимый канал конфигурации.
 void ConfigurationController::shutdown()
 {
-	if (!impl_->stopped) {
-		// guard обнаруживает удаление фасада обработчиком последнего результата формы.
-		const QPointer<ConfigurationController> guard = this;
+	if (!impl_->stopped)
 		impl_->cancel(true);
-		if (guard)
-			impl_->api.shutdown();
-	}
 }
 } // namespace gost

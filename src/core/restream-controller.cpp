@@ -85,6 +85,11 @@ public:
 		// Конфигурационная запись отзывает Ready, но не отменяет уже принятые команды.
 		QObject::connect(&state, &StateStore::configurationInvalidated, &owner,
 				 [this](quint64) { invalidateFallback(); });
+		// Освобождение общего барьера возобновляет одну ранее отложенную проверку.
+		QObject::connect(&state, &StateStore::configurationActivityChanged, &owner, [this] {
+			if (deferredPrecheck && configurationSettled())
+				refreshFallbackAfterConfiguration();
+		});
 		// Явный disconnect отменяет command API, в отличие от терминального HTTP 204 подписки.
 		QObject::connect(&connection, &ConnectionController::explicitlyDisconnected, &owner,
 				 [this] { disconnectExplicitly(); });
@@ -115,6 +120,8 @@ public:
 		QString destinationId;
 		// failureNotified запрещает повторный popup при повторном чтении той же терминальной квитанции.
 		bool failureNotified = false;
+		// Эпоха исходной конфигурации ограничивает только первое add-output, не повтор прежнего payload.
+		quint64 configurationGeneration = 0;
 	};
 
 	// Приватное доказательство пригодности ровно одного выбранного назначения; общий precheck не изменяется.
@@ -206,10 +213,7 @@ public:
 	bool deferredPrecheck = false;
 
 	// Не допускает проверку пригодности до завершения записи и сверки её неизвестного результата.
-	bool configurationSettled() const
-	{
-		return !state.configurationEditor().writing && !state.configurationEditor().requiresReconciliation();
-	}
+	bool configurationSettled() const { return state.configurationSettled(context.origin); }
 
 	// Снимает пригодность прежнего precheck немедленно, сохраняя текущий workflow.
 	void invalidateFallback()
@@ -662,6 +666,13 @@ public:
 			finish(OperationOutcome::NotSent, QStringLiteral("Operation.RemainingStopped"));
 			return;
 		}
+		// firstAdd ограничивает новый снимок назначения; явный повтор прежнего payload не получает этот запрет.
+		const bool firstAdd = live->action == OperationAction::AddOutput && !live->sent;
+		if (firstAdd &&
+		    (!configurationSettled() || live->configurationGeneration != state.configurationGeneration())) {
+			finish(OperationOutcome::Failed, QStringLiteral("Fallback.Incomplete"));
+			return;
+		}
 		// firstSelected отличает первый POST выбранного назначения от повтора уже отправленного payload.
 		const bool firstSelected = live->action == OperationAction::StartDestination && !live->sent;
 		if (firstSelected && !selectedStartAllowed()) {
@@ -682,6 +693,12 @@ public:
 		// Обработчик сигнала мог начать запись конфигурации до фактической передачи HTTP.
 		if (firstFallback && (!configurationSettled() ||
 				      model.fallback.configurationGeneration != state.configurationGeneration())) {
+			live->sent = false;
+			finish(OperationOutcome::Failed, QStringLiteral("Fallback.Incomplete"));
+			return;
+		}
+		if (firstAdd &&
+		    (!configurationSettled() || live->configurationGeneration != state.configurationGeneration())) {
 			live->sent = false;
 			finish(OperationOutcome::Failed, QStringLiteral("Fallback.Incomplete"));
 			return;
@@ -1221,6 +1238,7 @@ public:
 				index,
 				false,
 				batch->targets[index].destinationId};
+		live->configurationGeneration = batch->configurationGeneration;
 		if (action == OperationAction::StartDestination)
 			live->destinations = {live->destinationId};
 		exposeStep();
@@ -1618,10 +1636,12 @@ public:
 	// Фиксирует точную цель, request_id и payload прикрепления до каких-либо сетевых запросов.
 	bool addOutput(const DockContext &expected, const QString &sessionId, const QString &destinationId)
 	{
-		if (!available(expected) || !sessionTarget(sessionId, true) || !validId(destinationId))
+		if (!available(expected) || !configurationSettled() || !sessionTarget(sessionId, true) ||
+		    !validId(destinationId))
 			return false;
 		begin(OperationAction::AddOutput, sessionId);
 		prepareSessionStep(OperationAction::AddOutput);
+		live->configurationGeneration = state.configurationGeneration();
 		live->destinationId = destinationId;
 		model.current->destinationId = destinationId;
 		if (publish())

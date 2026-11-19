@@ -16,6 +16,7 @@ class SettingsStore;
 class ConnectionController;
 class RestreamController;
 class ConfigurationController;
+class FallbackController;
 
 // Параметры загрузки модуля, не содержащие состояния команд.
 struct PluginOptions {
@@ -69,6 +70,8 @@ public:
 	RestreamController *restreamController() const noexcept;
 	// Возвращает заимствованный контроллер редакторов либо nullptr после завершения Runtime.
 	ConfigurationController *configurationController() const noexcept;
+	// Возвращает заимствованный контроллер Asset/policy нынешнего Runtime.
+	FallbackController *fallbackController() const noexcept;
 
 private:
 	// Runtime создаёт и завершает общие сервисы независимо от видимости окон.

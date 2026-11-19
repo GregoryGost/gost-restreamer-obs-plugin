@@ -368,7 +368,7 @@ public:
 		 bool boolean = false);
 	// Добавляет локализованную группу формы к общему layout.
 	QFormLayout *section(QVBoxLayout *layout, const char *title);
-	// Регистрирует явное изменение path и уведомляет внешний виджет, кроме периода отражения DTO.
+	// Регистрирует изменение path и уведомляет внешний виджет, если разрешён ввод и не отражается DTO.
 	void touch(const QString &path);
 	// Пересчитывает конечные каталоги и применимость, сохраняя видимые несовместимые исходные значения.
 	void updateApplicability();
@@ -392,6 +392,8 @@ public:
 	QSet<QString> dirty_;
 	bool loading_ = false;
 	bool creating_ = false;
+	// readOnly_ блокирует изменение параметров, сохраняя доступ к раскрытию и справке.
+	bool readOnly_ = false;
 	// preset_ заполняет форму только по activated; resolution_ принимает размеры одной строкой, fps_ хранит точную дробь.
 	QComboBox *preset_ = nullptr;
 	QComboBox *resolution_ = nullptr;
@@ -503,7 +505,7 @@ ProfileEditor::Impl::Impl(ProfileEditor &owner, TextLookup text, QWidget *nameIn
 	basics->addRow(text_("Profile.BasePreset"), preset_);
 	// Явный выбор index заменяет полный редактируемый профиль, но ничего не отправляет на сервер.
 	QObject::connect(preset_, &QComboBox::activated, &owner_, [this](int index) {
-		if (index <= 0 || index > 3)
+		if (readOnly_ || index <= 0 || index > 3)
 			return;
 		owner_.setProfile(basePreset(index - 1), creating_);
 		preset_->setCurrentIndex(index);
@@ -693,10 +695,10 @@ void ProfileEditor::Impl::showBitrateHelp()
 	QToolTip::showText(point, bitrateHelp_->toolTip(), bitrateHelp_);
 }
 
-// Отмечает одно пользовательское изменение и обновляет зависимости без подстановки значений.
+// Отмечает изменение path и обновляет зависимости; отражение DTO и режим просмотра не вызывают changed.
 void ProfileEditor::Impl::touch(const QString &path)
 {
-	if (loading_)
+	if (loading_ || readOnly_)
 		return;
 	dirty_.insert(path);
 	updateApplicability();
@@ -785,7 +787,7 @@ void ProfileEditor::Impl::choices(const QString &path, const QStringList &option
 	}
 }
 
-// Получает актуальные каталоги из общей проекции, не исправляя пользовательский ввод.
+// Получает актуальные каталоги из общей проекции, не исправляя ввод; readOnly_ блокирует все параметры.
 void ProfileEditor::Impl::updateApplicability()
 {
 	// profile нужен только для зависимостей; ignored не превращает частичный черновик в допустимый профиль.
@@ -796,7 +798,7 @@ void ProfileEditor::Impl::updateApplicability()
 	for (const auto &field : fields_) {
 		if (field.finite)
 			choices(field.path, api::profileOptions(profile, wirePath(field.path)));
-		field.input->setEnabled(api::profileFieldApplicable(profile, wirePath(field.path)));
+		field.input->setEnabled(!readOnly_ && api::profileFieldApplicable(profile, wirePath(field.path)));
 		if (field.path == QStringLiteral("video.target"))
 			field.caption->setText(text_(profile.mode == QStringLiteral("copy") ? "Profile.VideoStubBitrate"
 											    : "Profile.TargetBitrate"));
@@ -822,8 +824,14 @@ void ProfileEditor::Impl::updateApplicability()
 		selectValue(item.value(), selected,
 			    selected.isEmpty() ? text_("Profile.OptionAbsent")
 					       : text_("Profile.UnknownValue").arg(selected));
-		item.value()->setEnabled(api::profileFieldApplicable(profile, path));
+		item.value()->setEnabled(!readOnly_ && api::profileFieldApplicable(profile, path));
 	}
+	preset_->setEnabled(!readOnly_);
+	resolution_->setEnabled(!readOnly_);
+	fps_->setEnabled(!readOnly_);
+	// item блокирует также удаление неподдерживаемых исходных опций в режиме просмотра.
+	for (auto item = sourceCustom_.cbegin(); item != sourceCustom_.cend(); ++item)
+		item.value()->setEnabled(!readOnly_);
 }
 
 // Создаёт редактор внутри родительской страницы и передаёт имя в общую колонку формы.
@@ -844,7 +852,8 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 	impl_->dirty_.clear();
 	clearUnknownValues(impl_->fps_);
 	impl_->preset_->setCurrentIndex(0);
-	impl_->advanced_->setChecked(false);
+	if (!impl_->readOnly_)
+		impl_->advanced_->setChecked(false);
 	impl_->resolution_->setEditText(
 		creating && profile.format.video.width == 0 && profile.format.video.height == 0
 			? QString{}
@@ -867,7 +876,7 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 		display.encoding.value.audioEncoder = QStringLiteral("aac");
 		display.encoding.value.rescaleOutput = profile.mode == QStringLiteral("transcode");
 	}
-	// field получает точное представление своего типа; обработчик visit не изменяет исходный DTO.
+	// field получает точное представление своего типа; обработчик visit читает поле display через value.
 	for (const auto &field : impl_->fields_) {
 		// combo удаляет только временный пункт другой карточки перед установкой нового исходного значения.
 		if (auto *combo = qobject_cast<QComboBox *>(field.input))
@@ -942,6 +951,15 @@ void ProfileEditor::setProfile(const api::GroupProfile &profile, bool creating)
 	impl_->updateApplicability();
 	impl_->updateBitrateHelp();
 	impl_->loading_ = false;
+}
+
+// Переключает readOnly без изменения DTO и черновика; просмотр разделов и справки остаётся доступным.
+void ProfileEditor::setReadOnly(bool readOnly)
+{
+	if (impl_->readOnly_ == readOnly)
+		return;
+	impl_->readOnly_ = readOnly;
+	impl_->updateApplicability();
 }
 
 // Возвращает RAM-снимок известных привязок, исходного DTO и пользовательского ввода без валидации.

@@ -78,6 +78,12 @@ class ConfigurationControllerTest final : public QObject {
 private slots:
 	// UUID и origin достаточны для создания первого потока без рабочего выбора.
 	void firstStreamCanBeCreatedWithoutWorkingSelection();
+	// Вложенный shutdown при закрытии канала необратим: внешний переход не публикует готовность.
+	void channelClosingShutdownCannotReopenChannel();
+	// Задаёт успешный PATCH, create и завершение пакета, после которых получатель сигнала меняет origin.
+	void releasedWriteCannotPublishIntoNewOrigin_data();
+	// Ответ прежнего origin не попадает в кеш и не становится Saved нового контекста.
+	void releasedWriteCannotPublishIntoNewOrigin();
 	// Refresh меняет серверный кеш, сохраняя dirty форму, её базу и рабочий выбор.
 	void rereadCannotOverwriteDirtyDraftOrWorkingStream();
 	// Два редактора одной ревизии требуют явного сравнения и подтверждения нового PATCH.
@@ -88,6 +94,10 @@ private slots:
 	void failedMutationsKeepIntentAndRequireReconciliation_data();
 	// Никакой неоднозначный исход не повторяется автоматически; сверка не превращает его в успех.
 	void failedMutationsKeepIntentAndRequireReconciliation();
+	// Один слот не позволяет фоновой сверке поглотить свежий DTO явного reload после неизвестного PATCH.
+	void singleSlotReloadAppliesFreshRevisionAndClearsBothBarriers();
+	// Пакет не отправляет 65-е намерение, если 64 прежних адреса уже требуют сверки.
+	void destinationBatchStopsBeforeUnknownCapacityIsExceeded();
 	// Задаёт позднее изменение, удаление и создание после неопределённого результата CRUD.
 	void unknownReconciliationRejectsLateDockCatalog_data();
 	// Настоящая сверка отзывает старый каталог; новое чтение не ждёт медленный fallback.
@@ -1014,8 +1024,11 @@ void ConfigurationControllerTest::streamSelectionReconcilesUncertainAndConflicti
 	// status задаёт транспортный/ревизионный отказ; committed означает реальное применение до потери ответа.
 	QFETCH(int, status);
 	QFETCH(bool, committed);
+	// limits закрепляет реальный одиночный слот общего конфигурационного канала.
+	Limits limits;
+	limits.maxActiveRequests = 1;
 	// rig/documents независимы от формы, firstFailure разрешает только один управляемый отказ.
-	ConfigurationRig rig;
+	ConfigurationRig rig(limits);
 	QVERIFY(rig.initialize());
 	auto documents = destinationDocuments(rig);
 	bool firstFailure = true;
@@ -1296,6 +1309,273 @@ void ConfigurationControllerTest::streamSelectionUnavailableItemsDoNotBlockOther
 	QCOMPARE(rig.stream.value(QStringLiteral("name")).toString(), draft.name);
 	QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("b")),
 		 ConfigurationOutcome::Rejected);
+}
+
+void ConfigurationControllerTest::singleSlotReloadAppliesFreshRevisionAndClearsBothBarriers()
+{
+	// limits и rig используют один активный слот с настоящими контроллером, API и loopback-сервером.
+	Limits limits;
+	limits.maxActiveRequests = 1;
+	ConfigurationRig rig(limits);
+	QVERIFY(rig.initialize());
+	// firstName — записанное сервером имя до потери ответа; secondName — новый несохранённый ввод.
+	const auto firstName = QStringLiteral("Первое принятое имя");
+	const auto secondName = QStringLiteral("Следующее явное имя");
+	// lostResponse ограничивает потерю ответа первым PATCH, allowReconciliation удерживает последующие GET недостоверными.
+	bool lostResponse = false;
+	bool allowReconciliation = false;
+	// reconciliationFailures подтверждает фактические 503 адресного GET, а не одно лишь состояние формы.
+	int reconciliationFailures = 0;
+	// Перехватчик независимо применяет первую запись revision2 и отказывает чтениям до явного reload.
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.method == "PATCH" && request.target == "/api/v1/destinations/destination") {
+			// payload содержит реально переданное намерение; серверная revision не вычисляется клиентским writer.
+			const auto payload = fixture::object(request.body);
+			rig.destination.insert(QStringLiteral("name"), payload.value(QStringLiteral("name")));
+			rig.destination.insert(QStringLiteral("revision"), lostResponse ? qint64(3) : qint64(2));
+			if (!lostResponse) {
+				lostResponse = true;
+				if (request.socket)
+					request.socket->abort();
+			} else {
+				HttpServer::reply(request, fixture::bytes(rig.destination));
+			}
+			return true;
+		}
+		if (lostResponse && !allowReconciliation && request.method == "GET" &&
+		    request.target == "/api/v1/destinations/destination") {
+			++reconciliationFailures;
+			HttpServer::reply(request, "{}", 503);
+			return true;
+		}
+		return false;
+	};
+	QVERIFY(rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("destination")));
+	QTRY_VERIFY(rig.state.configurationEditor().base.has_value() && !rig.state.configurationEditor().loading);
+	// draft сначала фиксирует отправленное намерение, затем хранит отличающийся ввод во время сверки.
+	auto draft = std::get<Destination>(*rig.state.configurationEditor().draft);
+	draft.name = firstName;
+	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("name")}));
+	QVERIFY(rig.configuration.save());
+	QTRY_VERIFY(!rig.state.configurationEditor().writing &&
+		    rig.state.configurationEditor().outcome == ConfigurationOutcome::Unknown);
+	QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+	QVERIFY(!rig.state.configurationSettled(rig.state.serverOrigin()));
+	QVERIFY(!rig.configuration.save());
+	QCOMPARE(rig.mutations().size(), 1);
+	draft = std::get<Destination>(*rig.state.configurationEditor().draft);
+	draft.name = secondName;
+	QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("name")}));
+	// failuresBeforeReload отделяет явный 503 reload от возможного прежнего фонового чтения.
+	const int failuresBeforeReload = reconciliationFailures;
+	QVERIFY(rig.configuration.reload());
+	QTRY_VERIFY(reconciliationFailures > failuresBeforeReload && !rig.state.configurationEditor().loading);
+	QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+	QVERIFY(!rig.state.configurationSettled(rig.state.serverOrigin()));
+	QCOMPARE(std::get<Destination>(*rig.state.configurationEditor().draft).name, secondName);
+	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown);
+	QCOMPARE(rig.mutations().size(), 1);
+	allowReconciliation = true;
+	QVERIFY(rig.configuration.reload());
+	QTRY_VERIFY(!rig.state.configurationEditor().loading &&
+		    !rig.state.configurationEditor().requiresReconciliation() &&
+		    rig.state.configurationSettled(rig.state.serverOrigin()));
+	QCOMPARE(std::get<Destination>(*rig.state.configurationEditor().base).revision, quint64(2));
+	QCOMPARE(std::get<Destination>(*rig.state.configurationEditor().draft).name, secondName);
+	QCOMPARE(rig.state.configuration().destinations.value(QStringLiteral("destination")).revision, quint64(2));
+	QCOMPARE(rig.state.configuration().destinations.value(QStringLiteral("destination")).name, firstName);
+	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown);
+	QCOMPARE(rig.mutations().size(), 1);
+	// Только новое явное сохранение отправляет второй PATCH со свежей серверной revision2.
+	QVERIFY(rig.configuration.save());
+	QTRY_VERIFY(!rig.state.configurationEditor().writing &&
+		    rig.state.configurationEditor().outcome == ConfigurationOutcome::Saved);
+	QCOMPARE(rig.mutations().size(), 2);
+	QCOMPARE(fixture::object(rig.mutations()[1].body).value(QStringLiteral("expected_revision")).toInteger(),
+		 qint64(2));
+	QCOMPARE(fixture::object(rig.mutations()[1].body).value(QStringLiteral("name")).toString(), secondName);
+	QCOMPARE(rig.state.configuration().destinations.value(QStringLiteral("destination")).revision, quint64(3));
+}
+
+void ConfigurationControllerTest::destinationBatchStopsBeforeUnknownCapacityIsExceeded()
+{
+	// limits и rig закрепляют один транспортный слот, поэтому ни один PATCH не опережает учёт Unknown.
+	Limits limits;
+	limits.maxActiveRequests = 1;
+	ConfigurationRig rig(limits);
+	QVERIFY(rig.initialize());
+	// documents задаёт 65 независимых адресов, config — их подтверждённые DTO до изменения enabled.
+	QMap<QString, QJsonObject> documents;
+	auto config = rig.state.configuration();
+	config.destinations.clear();
+	// index строит исходный порядок из 65 адресов, каждый из которых отдельно требует сверки после потери ответа.
+	for (int index = 0; index < 65; ++index) {
+		// id имеет одинаковую ширину, чтобы порядок QMap совпадал с показанным пользователю порядком.
+		const auto id = QStringLiteral("d%1").arg(index, 3, 10, QLatin1Char('0'));
+		// document и decoded представляют серверную запись и независимо декодированный начальный DTO.
+		auto document = fixture::destination();
+		document.insert(QStringLiteral("id"), id);
+		document.insert(QStringLiteral("name"), QStringLiteral("Назначение ") + id);
+		document.insert(QStringLiteral("enabled"), true);
+		const auto decoded = decode<Destination>(fixture::bytes(document));
+		QVERIFY(decoded);
+		documents.insert(id, document);
+		config.destinations.insert(id, *decoded.value);
+	}
+	config.destinationsStatus = {RuntimeAvailability::Fresh, true, {}};
+	rig.state.setConfiguration(config);
+	// writesStarted запрещает последующим GET снять Unknown до проверки заполненного набора обязательств.
+	bool writesStarted = false;
+	// Перехватчик теряет каждый ответ PATCH; последующая адресная сверка получает 503 и не освобождает барьер.
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.method == "PATCH" && documents.contains(destinationRequestId(request))) {
+			writesStarted = true;
+			if (request.socket)
+				request.socket->abort();
+			return true;
+		}
+		if (writesStarted && request.method == "GET" && documents.contains(destinationRequestId(request))) {
+			HttpServer::reply(request, "{}", 503);
+			return true;
+		}
+		return serveDestinations(request, documents);
+	};
+	QVERIFY(rig.configuration.open(ConfigurationKind::Stream, QStringLiteral("stream")));
+	QTRY_VERIFY(rig.state.configurationEditor().base.has_value() &&
+		    rig.state.configuration().destinationsStatus.complete && !rig.state.configurationEditor().loading);
+	// id добавляет каждое показанное намерение, не создавая новых целей во время выполнения пакета.
+	for (const auto &id : documents.keys())
+		QVERIFY(rig.configuration.setDestinationEnabled(id, false));
+	QVERIFY(rig.configuration.save());
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 10000);
+	QCOMPARE(rig.mutations().size(), 64);
+	QCOMPARE(rig.state.configurationEditor().destinationReconciliation.size(), 64);
+	QCOMPARE(rig.state.configurationEditor().destinationChanges.size(), 65);
+	// index проверяет сохранение каждого из 64 Unknown вместо вытеснения прежних обязательств.
+	for (int index = 0; index < 64; ++index) {
+		// id адресует один действительно отправленный шаг с потерянным ответом.
+		const auto id = QStringLiteral("d%1").arg(index, 3, 10, QLatin1Char('0'));
+		QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(id), ConfigurationOutcome::Unknown);
+		QVERIFY(rig.state.configurationEditor().destinationReconciliation.contains(id));
+		QVERIFY(rig.state.configurationEditor().destinationChanges.contains(id));
+	}
+	QVERIFY(rig.state.configurationEditor().destinationChanges.contains(QStringLiteral("d064")));
+	QVERIFY(!rig.state.configurationEditor().destinationReconciliation.contains(QStringLiteral("d064")));
+	QVERIFY(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("d064")) !=
+		ConfigurationOutcome::Unknown);
+	QCOMPARE(rig.state.configurationEditor().destinationMessageKey,
+		 QStringLiteral("Configuration.DestinationsPartial"));
+	QVERIFY(!rig.state.configurationSettled(rig.state.serverOrigin()));
+	QVERIFY(!rig.configuration.save());
+	QCOMPARE(rig.mutations().size(), 64);
+}
+
+void ConfigurationControllerTest::channelClosingShutdownCannotReopenChannel()
+{
+	// rig начинает с готовым каналом, не выполняя настоящих OBS или backend операций.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	QVERIFY(rig.configuration.channelIsReady());
+	// ready фиксирует только публикации после подключения обработчика закрытия.
+	QSignalSpy ready(&rig.configuration, &ConfigurationController::channelReady);
+	QVERIFY(ready.isValid());
+	// stopped ограничивает вложенный shutdown одним вызовом и подтверждает вход в DirectConnection.
+	bool stopped = false;
+	connect(
+		&rig.configuration, &ConfigurationController::channelClosing, this,
+		[&] {
+			if (!stopped) {
+				stopped = true;
+				rig.configuration.shutdown();
+			}
+		},
+		Qt::DirectConnection);
+	rig.state.setSelection(QStringLiteral("stream"), true, {}, {}, QStringLiteral("next-profile"));
+	QVERIFY(stopped);
+	QVERIFY(!rig.configuration.channelIsReady());
+	QCoreApplication::processEvents();
+	QVERIFY(!rig.configuration.channelIsReady());
+	QCOMPARE(ready.size(), 0);
+	QVERIFY(!rig.configuration.beginCreate(ConfigurationKind::Stream, true));
+	QVERIFY(!rig.configuration.save());
+	QVERIFY(rig.mutations().isEmpty());
+}
+
+void ConfigurationControllerTest::releasedWriteCannotPublishIntoNewOrigin_data()
+{
+	QTest::addColumn<bool>("creating");
+	QTest::addColumn<bool>("batch");
+	QTest::newRow("patch") << false << false;
+	QTest::newRow("create") << true << false;
+	QTest::newRow("batch-complete") << false << true;
+}
+
+void ConfigurationControllerTest::releasedWriteCannotPublishIntoNewOrigin()
+{
+	// creating выбирает create, batch — завершение пакета enabled; остальные строки сохраняют имя Group.
+	QFETCH(bool, creating);
+	QFETCH(bool, batch);
+	// rig содержит старый origin; nextServer задаёт отдельную локальную идентичность без общих сущностей.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	HttpServer nextServer;
+	QVERIFY(nextServer.listen());
+	if (batch) {
+		QVERIFY(rig.configuration.open(ConfigurationKind::Stream, QStringLiteral("stream")));
+		QTRY_VERIFY(rig.state.configurationEditor().base.has_value() &&
+			    rig.state.configuration().destinationsStatus.complete &&
+			    rig.state.configuration().destinations.contains(QStringLiteral("destination")));
+		QVERIFY(rig.configuration.setDestinationEnabled(QStringLiteral("destination"), false));
+	} else {
+		if (creating)
+			QVERIFY(rig.configuration.beginCreate(ConfigurationKind::Group, true));
+		else {
+			QVERIFY(rig.configuration.open(ConfigurationKind::Group, QStringLiteral("group")));
+			QTRY_VERIFY(rig.state.configurationEditor().base.has_value());
+		}
+		// draft несёт уникальное имя, по которому обнаруживается перенос старого ответа в новый кеш.
+		auto draft = std::get<Group>(*rig.state.configurationEditor().draft);
+		draft.name = QStringLiteral("Запись прежнего сервера");
+		draft.streamId = QStringLiteral("stream");
+		draft.profileId = QStringLiteral("profile");
+		QVERIFY(rig.configuration.setDraft(draft, creating ? QSet<QString>{QStringLiteral("name"),
+										   QStringLiteral("stream_id"),
+										   QStringLiteral("profile_id")}
+								   : QSet<QString>{QStringLiteral("name")}));
+	}
+	// moved подтверждает смену origin из уведомления освобождения, а acquired отличает его от занятия канала.
+	bool moved = false;
+	bool acquired = false;
+	// newFormCreated подтверждает создание формы нового origin внутри того же синхронного уведомления.
+	bool newFormCreated = false;
+	// activityReceiver снимает подписку до разрушения захваченных флагов и контроллера.
+	QObject activityReceiver;
+	// Первое уведомление принадлежит beginConfigurationWrite, второе — endConfigurationWrite успешного ответа.
+	connect(&rig.state, &StateStore::configurationActivityChanged, &activityReceiver, [&] {
+		if (!acquired) {
+			acquired = true;
+			return;
+		}
+		if (!moved) {
+			moved = true;
+			rig.state.setConnection(nextServer.origin().toString(), ConnectionStatus::Connected);
+			rig.state.setSelection(QStringLiteral("stream"), true, {}, {}, QStringLiteral("next-profile"));
+			// Новая серверная модель независима от кеша прежнего origin.
+			rig.state.setConfiguration({});
+			newFormCreated = rig.configuration.beginCreate(ConfigurationKind::Group, true);
+		}
+	});
+	QVERIFY(rig.configuration.save());
+	QTRY_VERIFY(moved);
+	QCoreApplication::processEvents();
+	QCOMPARE(rig.mutations().size(), 1);
+	QCOMPARE(rig.state.serverOrigin(), nextServer.origin().toString());
+	QVERIFY(rig.state.configuration().groups.isEmpty());
+	QVERIFY(rig.state.configuration().destinations.isEmpty());
+	QVERIFY(newFormCreated);
+	QCOMPARE(rig.state.configurationEditor().context.origin, nextServer.origin().toString());
+	QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::None);
+	QVERIFY(rig.state.configurationEditor().creating);
 }
 
 QTEST_MAIN(ConfigurationControllerTest)

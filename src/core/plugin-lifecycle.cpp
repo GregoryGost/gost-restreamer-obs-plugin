@@ -7,6 +7,7 @@
 #include "core/state-store.hpp"
 #include "core/restream-controller.hpp"
 #include "core/configuration-controller.hpp"
+#include "core/fallback-controller.hpp"
 #include "obs/frontend.hpp"
 #include "obs/obs-controller.hpp"
 #include "ui/management-window.hpp"
@@ -60,10 +61,14 @@ public:
 		restream = std::make_unique<RestreamController>(*stateStore, *commandApi, *connection, *controller);
 		configuration = std::make_unique<ConfigurationController>(*stateStore, *configurationApi, *connection,
 									  *restream);
-		// Оба контроллера публикуют отказ после проверки владельца шага; наблюдение StateStore окна не создаёт.
+		fallback =
+			std::make_unique<FallbackController>(*stateStore, *configurationApi, *configuration, *restream);
+		// Три владельца намерений публикуют отказ после проверки владельца шага; наблюдение StateStore окна не создаёт.
 		connect(restream.get(), &RestreamController::operationFailed, this,
 			[this](const OperationFailure &failure) { presentOperationFailure(failure); });
 		connect(configuration.get(), &ConfigurationController::operationFailed, this,
+			[this](const OperationFailure &failure) { presentOperationFailure(failure); });
+		connect(fallback.get(), &FallbackController::operationFailed, this,
 			[this](const OperationFailure &failure) { presentOperationFailure(failure); });
 		connect(controller.get(), &OBSController::profileObserved, connection.get(),
 			&ConnectionController::observeProfile);
@@ -90,6 +95,7 @@ public:
 	~Runtime() override
 	{
 		shutdownPresenter();
+		fallback->shutdown();
 		configuration->shutdown();
 		restream->shutdown();
 		connection->shutdown();
@@ -188,6 +194,8 @@ public:
 			return QStringLiteral("GET");
 		case api::HttpMethod::Post:
 			return QStringLiteral("POST");
+		case api::HttpMethod::Put:
+			return QStringLiteral("PUT");
 		case api::HttpMethod::Patch:
 			return QStringLiteral("PATCH");
 		case api::HttpMethod::Delete:
@@ -339,6 +347,8 @@ public:
 	std::unique_ptr<RestreamController> restream;
 	// configuration управляет серверными редакторами и завершается до заимствованных сервисов.
 	std::unique_ptr<ConfigurationController> configuration;
+	// fallback заимствует configurationApi и ConfigurationController и уничтожается раньше обоих.
+	std::unique_ptr<FallbackController> fallback;
 	// dock отслеживает переданный OBS виджет; managementWindow отслеживает скрываемое расширенное окно.
 	// Оба окна могут быть удалены родителем OBS; QPointer не продлевает их жизнь.
 	QPointer<RestreamDock> dock;
@@ -436,6 +446,7 @@ void PluginLifecycle::shutdown() noexcept
 		// Окно и доставка отказов завершаются до сервисов и любых callbacks отмены.
 		runtime_->shutdownPresenter();
 		// Останавливаем чтение OBS и сетевые обновления, пока общее состояние ещё существует.
+		runtime_->fallback->shutdown();
 		runtime_->configuration->shutdown();
 		runtime_->restream->shutdown();
 		runtime_->controller->shutdown();
@@ -481,7 +492,7 @@ void PluginLifecycle::openManagementWindow()
 		if (!runtime_->managementWindow) {
 			runtime_->managementWindow = new ManagementWindow(
 				*runtime_->stateStore, text_, frontend_.mainWindow(), runtime_->connection.get(),
-				runtime_->restream.get(), runtime_->configuration.get());
+				runtime_->restream.get(), runtime_->configuration.get(), runtime_->fallback.get());
 		}
 		// window замечает удаление родителем OBS или shutdown во вложенном подтверждении showEvent.
 		const QPointer<ManagementWindow> window = runtime_->managementWindow;
@@ -525,6 +536,12 @@ RestreamController *PluginLifecycle::restreamController() const noexcept
 ConfigurationController *PluginLifecycle::configurationController() const noexcept
 {
 	return runtime_ ? runtime_->configuration.get() : nullptr;
+}
+
+// Возвращает контроллер подготовки без передачи владения; окно не управляет его временем жизни.
+FallbackController *PluginLifecycle::fallbackController() const noexcept
+{
+	return runtime_ ? runtime_->fallback.get() : nullptr;
 }
 
 void PluginLifecycle::frontendEvent(FrontendEvent event, void *cookie) noexcept

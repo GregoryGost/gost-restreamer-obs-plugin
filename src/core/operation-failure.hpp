@@ -6,8 +6,15 @@
 
 namespace gost {
 
-// Различает независимые поколения runtime-команд и конфигурационных записей.
-enum class OperationFailureSource { Runtime, Configuration };
+// Различает независимые поколения runtime-команд, прежнего CRUD и подготовки/назначения заглушек.
+enum class OperationFailureSource {
+	// Явные команды Session/Output используют поколения RestreamController.
+	Runtime,
+	// Прежний CRUD использует независимые поколения ConfigurationController.
+	Configuration,
+	// Asset, policy и собственная Generation используют поколения FallbackController.
+	Fallback
+};
 
 // Однократное уведомление об отказе или отсутствии подтверждения явной записи. Диагностика передаётся
 // presenter синхронно и не сохраняется в StateStore или истории строк операций.

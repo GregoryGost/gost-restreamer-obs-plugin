@@ -46,6 +46,9 @@ target_sources(
     src/core/configuration-state.hpp
     src/core/configuration-controller.cpp
     src/core/configuration-controller.hpp
+    src/core/fallback-state.hpp
+    src/core/fallback-controller.cpp
+    src/core/fallback-controller.hpp
     src/core/connection-controller.cpp
     src/core/connection-controller.hpp
     src/core/operations-state.hpp
@@ -86,6 +89,10 @@ target_sources(
     src/ui/management-window.hpp
     src/ui/configuration-editor.cpp
     src/ui/configuration-editor.hpp
+    src/ui/fallback-editor.cpp
+    src/ui/fallback-editor.hpp
+    src/ui/fallback-policy-editor.cpp
+    src/ui/fallback-policy-editor.hpp
     src/ui/profile-editor.cpp
     src/ui/profile-editor.hpp
     src/ui/secret-field.cpp

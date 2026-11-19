@@ -168,6 +168,71 @@ void StateStore::setConfigurationEditor(ConfigurationEditorState editor)
 	emit configurationEditorChanged();
 }
 
+// Возвращает отдельную модель, которую контроллер копирует перед изменением.
+const FallbackState &StateStore::fallback() const noexcept
+{
+	return fallback_;
+}
+
+// Сначала заменяет значение; подписчики видят целиком завершённую модель.
+void StateStore::setFallback(FallbackState fallback)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	fallback_ = std::move(fallback);
+	emit fallbackChanged();
+}
+
+// Проверяет серверный барьер и сохраняет совместимость с вручную заданной editor fixture.
+bool StateStore::configurationSettled(const QString &origin) const
+{
+	return (!configurationWrite_ || configurationWrite_->origin != origin) &&
+	       configurationUnknown_.value(origin).isEmpty() &&
+	       ((configurationEditor_.context.valid() && configurationEditor_.context.origin != origin) ||
+		(!configurationEditor_.writing && !configurationEditor_.requiresReconciliation()));
+}
+
+// Занимает канал до уведомлений, чтобы reentrant потребитель не начал вторую mutation.
+bool StateStore::beginConfigurationWrite(const QString &origin, const QString &owner, quint64 token)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (origin.isEmpty() || owner.isEmpty() || configurationWrite_ || !configurationSettled(origin))
+		return false;
+	configurationWrite_ = ConfigurationWrite{origin, owner, token};
+	emit configurationActivityChanged();
+	return true;
+}
+
+// Сравнивает все части владения без публикаций и побочных эффектов.
+bool StateStore::ownsConfigurationWrite(const QString &origin, const QString &owner, quint64 token) const
+{
+	return configurationWrite_ && configurationWrite_->origin == origin && configurationWrite_->owner == owner &&
+	       configurationWrite_->token == token;
+}
+
+// Чужое или уже отменённое намерение не может освободить нынешний канал.
+void StateStore::endConfigurationWrite(const QString &origin, const QString &owner, quint64 token)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (!ownsConfigurationWrite(origin, owner, token))
+		return;
+	configurationWrite_.reset();
+	emit configurationActivityChanged();
+}
+
+// Сохраняет запрет между сменами Stream/профиля/origin; отсутствие записи снимает только её владелец.
+void StateStore::setConfigurationUnknown(const QString &origin, const QString &owner, bool unknown)
+{
+	Q_ASSERT(QThread::currentThread() == thread());
+	if (unknown)
+		configurationUnknown_[origin].insert(owner);
+	else {
+		configurationUnknown_[origin].remove(owner);
+		if (configurationUnknown_[origin].isEmpty())
+			configurationUnknown_.remove(origin);
+	}
+	emit configurationActivityChanged();
+}
+
 // Возвращает текущую эпоху конфигурационных чтений.
 quint64 StateStore::configurationGeneration() const noexcept
 {

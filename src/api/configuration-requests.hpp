@@ -4,6 +4,18 @@
 namespace gost::api {
 // Успешный DELETE не содержит JSON-документа.
 struct Empty {};
+// Имя нового Asset; загрузка оригинала выполняется отдельным намерением.
+struct AssetCreate {
+	// Отображаемое имя без нормализации.
+	QString name;
+};
+// Полная замена политики Stream с контролем ревизии самой записи Stream.
+struct PolicyPut {
+	// Положительная ревизия Stream, полученная из подтверждённой серверной базы.
+	quint64 expectedRevision = 0;
+	// Отсутствие означает явную очистку fallback:null; значение содержит все четыре интервала watchdog.
+	std::optional<Policy> fallback;
+};
 // Поля нового потока; ключ задаётся только при создании.
 struct StreamCreate {
 	// Отображаемое имя потока.

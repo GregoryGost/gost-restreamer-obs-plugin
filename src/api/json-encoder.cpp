@@ -1,6 +1,7 @@
 #include "api/json-encoder.hpp"
 #include "api/json-decoder.hpp"
 #include "api/profile-rules.hpp"
+#include <limits>
 
 namespace gost::api {
 namespace {
@@ -130,6 +131,46 @@ Result<JsonValue> encodeProfile(const GroupProfile &profile)
 		{QStringLiteral("audio_encoding"),
 		 JsonValue::Object{{QStringLiteral("bitrate_bps"), profile.audioEncoding.bitrateBps}}},
 		{QStringLiteral("encoding"), encoding(profile.encoding.value)}};
+	return Result<JsonValue>::success(JsonValue(std::move(object)));
+}
+/** Кодирует отображаемое имя нового Asset; пустая строка не отправляется. */
+Result<JsonValue> encodeRequest(const AssetCreate &request)
+{
+	if (request.name.isEmpty())
+		return invalid(QStringLiteral("name"));
+	return Result<JsonValue>::success(JsonValue::Object{{QStringLiteral("name"), request.name}});
+}
+/** Кодирует полную политику либо явную очистку с точной положительной ревизией Stream.
+ * Все интервалы сохраняются без double в положительном диапазоне серверного time.Duration.
+ */
+Result<JsonValue> encodeRequest(const PolicyPut &request)
+{
+	if (!request.expectedRevision)
+		return invalid(QStringLiteral("expected_revision"));
+	// object всегда содержит fallback, даже когда назначение намеренно очищается.
+	auto object = patch(request.expectedRevision);
+	object.insert(QStringLiteral("fallback"), JsonValue(nullptr));
+	if (request.fallback) {
+		if (request.fallback->assetId.isEmpty())
+			return invalid(QStringLiteral("fallback.asset_id"));
+		// watchdog сохраняет исходные четыре интервала, а duration связывает каждое значение с публичным полем.
+		const auto &watchdog = request.fallback->watchdog;
+		for (const auto &duration : {std::pair{"video_timeout_ns", watchdog.videoTimeoutNs},
+					     std::pair{"audio_timeout_ns", watchdog.audioTimeoutNs},
+					     std::pair{"recovery_window_ns", watchdog.recoveryWindowNs},
+					     std::pair{"keyframe_timeout_ns", watchdog.keyframeTimeoutNs}})
+			if (!duration.second || duration.second > quint64(std::numeric_limits<qint64>::max()))
+				return invalid(QStringLiteral("fallback.watchdog.") + QLatin1String(duration.first));
+		object.insert(QStringLiteral("fallback"),
+			      JsonValue::Object{
+				      {QStringLiteral("asset_id"), request.fallback->assetId},
+				      {QStringLiteral("watchdog"),
+				       JsonValue::Object{
+					       {QStringLiteral("video_timeout_ns"), watchdog.videoTimeoutNs},
+					       {QStringLiteral("audio_timeout_ns"), watchdog.audioTimeoutNs},
+					       {QStringLiteral("recovery_window_ns"), watchdog.recoveryWindowNs},
+					       {QStringLiteral("keyframe_timeout_ns"), watchdog.keyframeTimeoutNs}}}});
+	}
 	return Result<JsonValue>::success(JsonValue(std::move(object)));
 }
 /** Кодирует обязательные поля нового Stream без изменения ключа публикации. */

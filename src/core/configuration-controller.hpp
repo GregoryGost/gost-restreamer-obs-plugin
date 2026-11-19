@@ -26,6 +26,12 @@ public:
 				RestreamController &restream, QObject *parent = nullptr);
 	// Завершает принадлежащие запросы до освобождения реализации.
 	~ConfigurationController() override;
+	// Возвращает копию логического контекста, включая ещё закрываемый прежний адрес.
+	ConfigurationContext channelContext() const;
+	// Возвращает транспортное поколение заимствованного канала.
+	api::RequestContext channelRequestContext() const;
+	// Подтверждает завершённую configure; доступность записи дополнительно требует Connected.
+	bool channelIsReady() const;
 	// Читает коллекцию; частичный список не доказывает отсутствие пропущенных записей.
 	void refresh(ConfigurationKind kind);
 	// Открывает точный ID; dirty-форма требует явного discardDirty=true, запись не прерывается.
@@ -57,6 +63,10 @@ public:
 	void shutdown();
 
 signals:
+	// Синхронно отзывает заимствованные scopes до cancelAll и изменения прежнего контекста.
+	void channelClosing();
+	// Публикуется только после завершённой configure нового контекста.
+	void channelReady();
 	// Передаёт отказ текущего CRUD-намерения после проверки его контекста и поколения.
 	void operationFailed(const gost::OperationFailure &failure);
 

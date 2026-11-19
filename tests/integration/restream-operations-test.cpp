@@ -878,6 +878,8 @@ private slots:
 	void addOutputRequiresExactReceiptAndDurableSnapshot();
 	// Дублирующее attached назначение отклоняется до отправки команды.
 	void addOutputRejectsAlreadyAttachedDestination();
+	// Изменение эпохи из синхронного Sending отзывает первый add-output до HTTP.
+	void addOutputRechecksConfigurationAfterSendingPublication();
 	// Ручной повтор потерянного AddOutput сохраняет Session, Destination, request_id и payload.
 	void lostAddOutputRetryKeepsExactIntent();
 	// Смена Session не переносит явный дедуплицированный повтор старого прикрепления на новый эфир.
@@ -986,6 +988,8 @@ void RestreamOperationsTest::lostAddOutputRetryKeepsExactIntent()
 	QCOMPARE(rig.posts().size(), 1);
 	// original фиксирует реальные байты первого намерения, а не заново собранный ожидаемый payload.
 	const auto original = rig.posts().first();
+	// Изменение будущей конфигурации не запрещает повтор уже отправленного исторического намерения.
+	rig.state.invalidateConfiguration();
 	QVERIFY(rig.operations.retryUnknown(rig.context()));
 	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1000);
 	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Completed);
@@ -1607,6 +1611,29 @@ void RestreamOperationsTest::contextChangeAndRestartDoNotReplay()
 	QCOMPARE(rig.posts().size(), 1);
 	QVERIFY(!newRuntime.retryUnknown(originalContext));
 	newRuntime.shutdown();
+}
+
+void RestreamOperationsTest::addOutputRechecksConfigurationAfterSendingPublication()
+{
+	// rig/scenario предоставляют пригодный профиль и действующую Session без прикреплённого назначения.
+	OperationRig rig({500, 5, 20});
+	QVERIFY(rig.initialize());
+	AddOutputScenario scenario(rig);
+	// invalidated подтверждает точное окно: Sending уже опубликован, первый POST ещё не отправлен.
+	bool invalidated = false;
+	connect(&rig.state, &StateStore::operationsChanged, this, [&] {
+		if (!invalidated && rig.state.operations().current &&
+		    rig.state.operations().current->phase == OperationPhase::Sending) {
+			invalidated = true;
+			rig.state.invalidateConfiguration();
+		}
+	});
+	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished() || rig.state.operations().lastInterrupted.has_value(), 2000);
+	QVERIFY(invalidated);
+	QVERIFY(rig.state.configurationSettled(rig.state.serverOrigin()));
+	QVERIFY(rig.posts().isEmpty());
+	QVERIFY(!rig.frontend.streaming);
 }
 
 QTEST_MAIN(RestreamOperationsTest)

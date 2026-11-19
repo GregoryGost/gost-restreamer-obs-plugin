@@ -1,5 +1,6 @@
 #include "configuration-editor.hpp"
 #include "profile-editor.hpp"
+#include "fallback-policy-editor.hpp"
 #include "status-label.hpp"
 #include "secret-field.hpp"
 #include "confirmation-dialog.hpp"
@@ -186,7 +187,7 @@ class ConfigurationEditor::Impl {
 public:
 	// Создаёт дочерние элементы и подписки; общие сервисы заимствуются в GUI-потоке.
 	Impl(ConfigurationEditor &owner, StateStore &state, ConfigurationController &controller, TextLookup text,
-	     ConfigurationKind kind);
+	     ConfigurationKind kind, FallbackController *fallback);
 	// Обновляет списки и сообщения, снимая прежнюю локальную ошибку при начале записи;
 	// форму заменяет только при реальной смене базы/карточки.
 	void refresh();
@@ -227,6 +228,9 @@ public:
 	StateStore &state_;
 	ConfigurationController &controller_;
 	TextLookup text_;
+	// policy_ редактирует назначение существующего Stream; active_ исключает чтения скрытой копии.
+	FallbackPolicyEditor *policy_ = nullptr;
+	bool active_ = false;
 	// kind_ фиксирует вид страницы; selectedId_ хранит просмотр без изменения рабочего Stream.
 	ConfigurationKind kind_;
 	QString selectedId_;
@@ -286,7 +290,7 @@ public:
 };
 
 ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, ConfigurationController &controller,
-				TextLookup text, ConfigurationKind kind)
+				TextLookup text, ConfigurationKind kind, FallbackController *fallback)
 	: owner_(owner),
 	  state_(state),
 	  controller_(controller),
@@ -429,6 +433,15 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 						 controller_.setDestinationEnabled(item->data(Qt::UserRole).toString(),
 										   item->checkState() == Qt::Checked);
 				 });
+	}
+	if (kind_ == ConfigurationKind::Stream && fallback) {
+		// policyBox содержит отдельную конфигурацию заглушки, не смешивая её CAS с черновиком имени Stream.
+		auto *policyBox = new QGroupBox(text_("Fallback.PolicyTitle"), form_);
+		// policyLayout размещает переиспользуемую карточку в существующем редакторе.
+		auto *policyLayout = new QVBoxLayout(policyBox);
+		policy_ = new FallbackPolicyEditor(state_, *fallback, text_, policyBox);
+		policyLayout->addWidget(policy_);
+		cardLayout->addWidget(policyBox);
 	}
 	relationships_ = new QLabel(form_);
 	if (kind_ == ConfigurationKind::Stream)
@@ -958,6 +971,16 @@ void ConfigurationEditor::Impl::refresh()
 	reload_->setEnabled(hasCard && !editor.loading && !editor.writing &&
 			    (!editor.creating || editor.reconciliationRequired));
 	conflict();
+	if (policy_) {
+		// alive защищает продолжение после синхронной публикации новой явно адресованной policy.
+		const QPointer<ConfigurationEditor> alive(&owner_);
+		policy_->setStreamId(hasCard && !editor.creating ? editor.id : QString{});
+		if (!alive)
+			return;
+		policy_->setActive(active_);
+		if (!alive)
+			return;
+	}
 	updating_ = false;
 }
 
@@ -1316,9 +1339,9 @@ void ConfigurationEditor::Impl::resolveConflict()
 
 // Создаёт представление данного вида конфигурации, заимствуя общий контроллер и StateStore.
 ConfigurationEditor::ConfigurationEditor(StateStore &state, ConfigurationController &controller, TextLookup text,
-					 ConfigurationKind kind, QWidget *parent)
+					 ConfigurationKind kind, QWidget *parent, FallbackController *fallback)
 	: QWidget(parent),
-	  impl_(std::make_unique<Impl>(*this, state, controller, std::move(text), kind))
+	  impl_(std::make_unique<Impl>(*this, state, controller, std::move(text), kind, fallback))
 {
 	impl_->refresh();
 }
@@ -1328,6 +1351,7 @@ ConfigurationEditor::~ConfigurationEditor() = default;
 // Открывает последнюю карточку данной страницы из RAM либо серверного GET без потери оставленного ввода.
 void ConfigurationEditor::activate()
 {
+	impl_->active_ = true;
 	// alive замечает удаление страницы при подтверждении или синхронном уведомлении общего состояния.
 	const QPointer<ConfigurationEditor> alive(this);
 	hideSecrets();
@@ -1371,6 +1395,14 @@ void ConfigurationEditor::activate()
 		return;
 	impl_->refresh();
 }
+// Выключение не отменяет политику и не закрывает её target: другая активная страница выберет свой адрес.
+void ConfigurationEditor::setActive(bool active)
+{
+	impl_->active_ = active;
+	if (impl_->policy_)
+		impl_->policy_->setActive(active);
+}
+
 // Разрешает переход после RAM-парковки или явного отказа от ввода; занятая форма не переключается.
 bool ConfigurationEditor::canLeave(bool preserveDraft)
 {

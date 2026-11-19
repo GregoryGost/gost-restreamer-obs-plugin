@@ -18,9 +18,10 @@
 // Все HTTP-запросы замыкаются на петлевую фикстуру; нужен QApplication для FakeFrontend.
 class ConfigurationRig final {
 public:
-	// Создаёт независимые каналы с коротким ограниченным сроком сетевых ожиданий.
-	ConfigurationRig()
+	// Создаёт независимые каналы с коротким сроком; configLimits ограничивает только конфигурационный API.
+	explicit ConfigurationRig(gost::api::Limits configLimits = {})
 		: settings(temp.filePath(QStringLiteral("settings.json"))),
+		  configApi(configLimits),
 		  connection(state, settings, observer, events),
 		  obs(frontend, state),
 		  operations(state, command, connection, obs, {250, 5, 30}),

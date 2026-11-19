@@ -4,6 +4,7 @@
 #include "core/dock-server-state.hpp"
 #include "core/operations-state.hpp"
 #include "core/configuration-state.hpp"
+#include "core/fallback-state.hpp"
 #include "obs/obs-statistics.hpp"
 
 #include <QObject>
@@ -135,6 +136,20 @@ public:
 	const ConfigurationEditorState &configurationEditor() const noexcept;
 	// Публикует новое значение формы до синхронного сигнала интерфейсу.
 	void setConfigurationEditor(ConfigurationEditorState editor);
+	// Возвращает отдельную RAM-модель подготовки и назначения заглушек.
+	const FallbackState &fallback() const noexcept;
+	// Публикует готовое значение заглушек перед синхронным уведомлением.
+	void setFallback(FallbackState fallback);
+	// Проверяет барьер origin и прежние editor fixtures, не связывая запрет с текущей карточкой.
+	bool configurationSettled(const QString &origin) const;
+	// Атомарно занимает канал до сигналов; owner/token адресуют только одно намерение.
+	bool beginConfigurationWrite(const QString &origin, const QString &owner, quint64 token);
+	// Проверяет исходное владение непосредственно перед передачей HTTP.
+	bool ownsConfigurationWrite(const QString &origin, const QString &owner, quint64 token) const;
+	// Освобождает только указанное намерение; Unknown регистрируется вызывающим кодом раньше.
+	void endConfigurationWrite(const QString &origin, const QString &owner, quint64 token);
+	// Устанавливает признак несверенных обязательств владельца независимо от видимой карточки.
+	void setConfigurationUnknown(const QString &origin, const QString &owner, bool unknown);
 	// Возвращает эпоху конфигурации для защиты чтений и предварительной проверки.
 	quint64 configurationGeneration() const noexcept;
 	// Отзывает пригодность прежних чтений перед записью и после её завершения.
@@ -215,6 +230,10 @@ public:
 	void clearRuntime();
 
 signals:
+	// Сообщает об изменении каталога, передачи, поколения или policy заглушки.
+	void fallbackChanged();
+	// Сообщает о занятии или освобождении общего конфигурационного барьера.
+	void configurationActivityChanged();
 	// Сообщает о новом вводе, конфликте или результате конфигурационной записи.
 	void configurationEditorChanged();
 	// Отзывает старую предварительную проверку и адресные чтения указанной эпохи.
@@ -235,6 +254,21 @@ signals:
 	void runtimeStateChanged();
 
 private:
+	// Содержит адрес одного активного намерения двух конфигурационных контроллеров.
+	struct ConfigurationWrite {
+		// Канонический сервер ограничивает действие блокировки.
+		QString origin;
+		// Владелец Configuration либо Fallback; не является QObject ресурсом.
+		QString owner;
+		// Поколение намерения защищает снятие чужой блокировки.
+		quint64 token = 0;
+	};
+	// Одно GUI-намерение занимает канал до завершения всей записи/пакета.
+	std::optional<ConfigurationWrite> configurationWrite_;
+	// Наличие owner в origin означает несверенную запись; точные обязательства хранят контроллеры.
+	QMap<QString, QSet<QString>> configurationUnknown_;
+	// RAM-модель заглушек не смешивается с runtime и редактором остальных сущностей.
+	FallbackState fallback_;
 	// Последнее отображаемое имя OBS Profile; не используется как устойчивая идентичность.
 	std::optional<QString> profileName_;
 	// Последний флаг активности OBS; пуст до первого наблюдения.

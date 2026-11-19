@@ -18,6 +18,9 @@ public:
 	~ProfileEditor() override;
 	// Отражает полный исходный DTO; creating требует явного заполнения нового медиаформата.
 	void setProfile(const api::GroupProfile &profile, bool creating = false);
+	// readOnly запрещает ввод параметров и changed; раскрытие раздела и справка остаются доступны.
+	// По умолчанию редактирование разрешено; внешний nameInput управляется вызывающей карточкой.
+	void setReadOnly(bool readOnly);
 	// Возвращает полный профиль с изменёнными полями; error содержит безопасное пояснение валидации.
 	bool readProfile(api::GroupProfile &profile, QString &error) const;
 	// Сохраняет в RAM точный ввод, включая невалидные строки и состояние раскрытия раздела.

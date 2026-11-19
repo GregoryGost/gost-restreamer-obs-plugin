@@ -7,18 +7,21 @@
 namespace gost {
 class StateStore;
 class ConfigurationController;
+class FallbackController;
 /** Представляет список и одну конфигурационную карточку внутри существующего окна.
  * Серверный кеш и RAM-черновик читает из StateStore; все намерения передаёт контроллеру. */
 class ConfigurationEditor final : public QWidget {
 	Q_OBJECT
 public:
-	// Создаёт страницу kind; state и controller заимствованы и должны пережить виджет.
+	// Создаёт страницу kind; state, controller и необязательный fallback заимствованы и переживают виджет.
 	ConfigurationEditor(StateStore &state, ConfigurationController &controller, TextLookup text,
-			    ConfigurationKind kind, QWidget *parent = nullptr);
+			    ConfigurationKind kind, QWidget *parent = nullptr, FallbackController *fallback = nullptr);
 	// Освобождает привязки формы; дочерние элементы удаляет QObject.
 	~ConfigurationEditor() override;
 	// Открывает собственный вид сущности и обновляет коллекции, сохраняя текущий несохранённый черновик.
 	void activate();
+	// Разрешает адресацию policy только активной карточке Stream; выключение сохраняет RAM-ввод.
+	void setActive(bool active);
 	// При preserveDraft сохраняет ввод в RAM; иначе явно подтверждает его потерю перед созданием новой формы.
 	bool canLeave(bool preserveDraft = false);
 	// Сбрасывает раскрытие всех секретов при смене страницы и закрытии/открытии окна.

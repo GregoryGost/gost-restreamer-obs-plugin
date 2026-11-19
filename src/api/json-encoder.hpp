@@ -5,6 +5,10 @@
 namespace gost::api {
 // Проверяет документированный рецепт и кодирует полный профиль, сохраняя точные числа и явные настройки.
 Result<JsonValue> encodeProfile(const GroupProfile &profile);
+// Кодирует только обязательное имя нового Asset.
+Result<JsonValue> encodeRequest(const AssetCreate &request);
+// Кодирует числовую ревизию Stream и полный fallback либо явный null.
+Result<JsonValue> encodeRequest(const PolicyPut &request);
 // Кодирует обязательные поля создания Stream; неверные параметры дают локальную Contract-ошибку.
 Result<JsonValue> encodeRequest(const StreamCreate &request);
 // Кодирует только явно изменённое имя Stream и точную десятичную ревизию.

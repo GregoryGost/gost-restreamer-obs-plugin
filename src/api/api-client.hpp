@@ -8,7 +8,7 @@
 
 namespace gost::api {
 // Закрытый набор методов диагностики исключает произвольные строки и payload.
-enum class HttpMethod { Get, Post, Patch, Delete };
+enum class HttpMethod { Get, Post, Put, Patch, Delete };
 // Тип маршрута не содержит origin, идентификаторов, пути или query.
 enum class RouteType {
 	Health,
@@ -44,6 +44,9 @@ struct HttpDiagnostic {
 };
 // Обработчик диагностики выполняется в потоке клиента и не должен уничтожать клиент.
 using DiagnosticCallback = std::function<void(const HttpDiagnostic &)>;
+// Сообщает переданные байты текущего upload; totalBytes — захваченный размер, а не готовность Generation.
+// Обработчик выполняется в потоке клиента и может отменить запрос, сменить контекст или удалить клиент.
+using UploadProgressCallback = std::function<void(RequestContext, qint64 bytesSent, qint64 totalBytes)>;
 /**
  * Асинхронно читает REST API, изменяет конфигурацию и отправляет типизированные команды выбранного сервера.
  * Проверяет ответы перед выдачей DTO.
@@ -84,9 +87,15 @@ public:
 	 * поэтому клиент может принимать новые запросы. Вызывать требуется в потоке клиента.
 	 */
 	void cancelAll();
+	/** Отменяет только задания receiver, включая отложенные продолжения списков.
+	 * Возвращает true, если хотя бы одно отменённое задание уже передано транспорту.
+	 * Callback отменённых заданий подавляется; ответ backend после отправки остаётся неизвестным.
+	 * null receiver ничего не отменяет. Вызывать требуется в потоке клиента.
+	 */
+	bool cancelRequests(QObject *receiver);
 	// Необратимо закрывает клиент и отменяет задания. Повторный вызов безопасен; новые запросы игнорируются.
 	void shutdown();
-	// Меняет сроки только новых заданий: absolute=timeoutMs, idle=min(10000, timeoutMs).
+	// Меняет сроки только новых обычных REST-заданий: absolute=timeoutMs, idle=min(10000, timeoutMs).
 	// Диапазон пользовательской настройки проверяет SettingsStore; положительные короткие сроки допустимы тестам.
 	void setHttpTimeoutMs(int timeoutMs);
 	// Устанавливает безопасный sink без зависимости API от OBS и без глобального Qt-handler.
@@ -115,6 +124,22 @@ public:
 	void patchProfile(QString id, ProfilePatch request, QObject *receiver, Callback<Profile> callback);
 	// Удаляет Profile по ревизии без скрытого изменения связанных групп.
 	void deleteProfile(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback);
+	// Создаёт именованный Asset; callback получает проверенный DTO ответа 201.
+	void createAsset(AssetCreate request, QObject *receiver, Callback<Asset> callback);
+	// Удаляет точный Asset по положительной ревизии; успешен только пустой 204.
+	void deleteAsset(QString id, quint64 expectedRevision, QObject *receiver, Callback<Empty> callback);
+	/** Открывает обычный читаемый файл filePath и передаёт его один раз как image либо video.
+	 * Размер фиксируется до постановки в очередь; положительный файл ограничен uploadMaxBytes.
+	 * Job удерживает файл до завершения транспорта. Загрузка имеет собственные сроки Limits:
+	 * общий срок включает очередь, простой продлевается только реальным обменом байтами.
+	 * Проверенный 202/Location даёт только принятую пару Asset/Generation, не готовность медиа.
+	 */
+	void uploadAsset(QString assetId, quint64 expectedRevision, QString kind, QString filePath, QObject *receiver,
+			 Callback<Preparation> callback, UploadProgressCallback progress = {});
+	// Просит подготовить сохранённый оригинал; числовая ревизия отправляется JSON, ответ — Preparation202.
+	void rebuildAsset(QString assetId, quint64 expectedRevision, QObject *receiver, Callback<Preparation> callback);
+	// Полностью заменяет политику точного Stream либо отправляет явный null; revision результата относится к Stream.
+	void setFallbackPolicy(QString streamId, PolicyPut request, QObject *receiver, Callback<PolicyResult> callback);
 	// Прикрепляет destinationId к точной Session; ответ 202 означает лишь принятие команды.
 	void addOutput(QString sessionId, QString destinationId, QString requestId, QObject *receiver,
 		       Callback<Receipt> callback);

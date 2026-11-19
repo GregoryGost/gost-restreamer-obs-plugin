@@ -474,7 +474,7 @@ bool fromJson(const JsonValue &json, Asset &value, Error &error)
 	r.field("size_bytes", value.sizeBytes);
 	return r.good();
 }
-/** Читает поля Generation из типизированного JSON; нарушение формы прекращает разбор с Error. */
+/** Читает точное поколение и временно прикладывает исходное failure для однократного уведомления. */
 bool fromJson(const JsonValue &json, Generation &value, Error &error)
 {
 	if (!fromJson(json, static_cast<Record &>(value), error))
@@ -486,6 +486,8 @@ bool fromJson(const JsonValue &json, Generation &value, Error &error)
 	r.field("status", value.status);
 	r.field("size_bytes", value.sizeBytes);
 	r.field("failure", value.failure);
+	if (r.good() && value.failure.hasValue())
+		value.failure.value.diagnosticBody = serializeJson(json.toObject().value(QStringLiteral("failure")));
 	return r.good();
 }
 /** Читает поля Rate из типизированного JSON; нарушение формы прекращает разбор с Error. */
@@ -974,7 +976,8 @@ bool fromJson(const JsonValue &json, PolicyResult &value, Error &error)
 	Reader r(json, error);
 	r.field("revision", value.revision);
 	r.field("fallback", value.fallback);
-	if (r.good() && !value.revision) {
+	if (r.good() && (!value.revision || value.fallback.isMissing() ||
+			 (value.fallback.hasValue() && value.fallback.value.assetId.isEmpty()))) {
 		error = makeError(ErrorKind::Decode);
 		return false;
 	}
@@ -1043,6 +1046,10 @@ bool fromJson(const JsonValue &json, Preparation &value, Error &error)
 	Reader r(json, error);
 	r.field("asset_id", value.assetId);
 	r.field("generation_id", value.generationId);
+	if (r.good() && (value.assetId.isEmpty() || value.generationId.isEmpty())) {
+		error = makeError(ErrorKind::Contract);
+		return false;
+	}
 	return r.good();
 }
 /** Проверяет согласованность оболочки события до его применения к дереву состояния. */

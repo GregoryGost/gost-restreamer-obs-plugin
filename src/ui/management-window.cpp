@@ -5,6 +5,7 @@
 #include "core/settings-store.hpp"
 #include "core/configuration-controller.hpp"
 #include "ui/configuration-editor.hpp"
+#include "ui/fallback-editor.hpp"
 #include "ui/status-label.hpp"
 
 #include <QApplication>
@@ -117,13 +118,13 @@ QWidget *makePage(const QString &title, const QString &message, QWidget *parent)
 } // namespace
 
 // Создаёт страницы для stateStore с переводами text, связывая окно с parent и заимствованными
-// connection/configuration. Неименованный RestreamController не используется этим представлением.
+// connection/configuration/fallback. Неименованный RestreamController не используется этим представлением.
 // Каждая страница настроек применяет свой черновик только явным сохранением;
 // отмена восстанавливает её текущие рабочие значения без записи и сетевых действий.
 // Соединения Qt привязаны к этому окну и прекращаются при его удалении; закрытие только скрывает окно.
 ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent,
 				   ConnectionController *connection, RestreamController *,
-				   ConfigurationController *configuration)
+				   ConfigurationController *configuration, FallbackController *fallback)
 	: QWidget(parent, Qt::Window),
 	  stateStore_(stateStore),
 	  text_(std::move(text)),
@@ -165,7 +166,7 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	addPageHeading(*streamLayout, text_("Page.Streams"));
 	if (configuration_) {
 		streamEditor_ = new ConfigurationEditor(stateStore_, *configuration_, text_, ConfigurationKind::Stream,
-							streamPage);
+							streamPage, fallback);
 		streamLayout->addWidget(streamEditor_, 1);
 	}
 	// streamScroll сохраняет размер окна при длинном списке назначений и сообщениях редактора.
@@ -214,8 +215,15 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	}
 	addPage("Page.Groups", groups, "sources/group.svg", QStyle::SP_DirIcon);
 	addPage("Page.Profiles", profiles, "settings/advanced.svg", QStyle::SP_FileDialogContentsView);
-	addPage("Page.Fallback", makePage(text_("Page.Fallback"), text_("Page.Fallback.NotAvailable"), pages),
-		"sources/image.svg", QStyle::SP_FileIcon);
+	// fallbackPage содержит подготовку и назначение без кнопок управления текущим эфиром.
+	QWidget *fallbackPage = nullptr;
+	if (fallback) {
+		fallbackEditor_ = new FallbackEditor(stateStore_, *fallback, text_, pages);
+		fallbackPage = fallbackEditor_;
+	} else {
+		fallbackPage = makePage(text_("Page.Fallback"), text_("Page.Fallback.NotAvailable"), pages);
+	}
+	addPage("Page.Fallback", fallbackPage, "sources/image.svg", QStyle::SP_FileIcon);
 
 	// diagnostics содержит локальные наблюдения OBS и сообщение о границах диагностики.
 	auto *diagnostics = new QWidget(pages);
@@ -439,9 +447,25 @@ ConfigurationEditor *ManagementWindow::currentEditor() const
 // Обновляет текущую карточку; контроллер сохраняет её несохранённый ввод в общей RAM-модели.
 void ManagementWindow::activateCurrentEditor()
 {
+	deactivateEditors();
+	if (currentPage_ == 4 && fallbackEditor_) {
+		fallbackEditor_->activate();
+		return;
+	}
 	// editor принадлежит окну и получает данные только через общий контроллер.
 	if (auto *editor = currentEditor())
 		editor->activate();
+}
+
+// Только активная страница может адресовать общую policy; выключение не отменяет workflow.
+void ManagementWindow::deactivateEditors()
+{
+	// editor перебирает созданные карточки; каждая сохраняет RAM-ввод при выключении.
+	for (auto *editor : {streamEditor_, destinationEditor_, groupEditor_, profileEditor_})
+		if (editor)
+			editor->setActive(false);
+	if (fallbackEditor_)
+		fallbackEditor_->setActive(false);
 }
 
 // Маскирует также невидимые карточки, чтобы переключение страницы не раскрыла старое значение.
@@ -469,6 +493,7 @@ void ManagementWindow::showEvent(QShowEvent *event)
 // Скрытие не уничтожает окно, черновик или принадлежащую Runtime операцию.
 void ManagementWindow::hideEvent(QHideEvent *event)
 {
+	deactivateEditors();
 	hideSecrets();
 	QWidget::hideEvent(event);
 }
@@ -618,6 +643,7 @@ void ManagementWindow::selectDestination(const DockContext &context, const QStri
 			    configuration_->open(ConfigurationKind::Destination, sourceDestination, true);
 	if (!guard || !opened || stateStore_.dockContext() != sourceContext)
 		return;
+	deactivateEditors();
 	// blocked исключает повторную активацию, которая могла бы заменить уже выбранную карточку.
 	const QSignalBlocker blocked(navigation_);
 	currentPage_ = 1;

@@ -51,8 +51,11 @@ gost_add_offline_test(configuration-api contract/configuration-api-test.cpp)
 gost_add_offline_test(configuration integration/configuration-controller-test.cpp)
 gost_add_offline_test(configuration-ui unit/configuration-ui-test.cpp)
 gost_add_offline_test(settings-preferences unit/settings-preferences-test.cpp)
+gost_add_offline_test(fallback-api contract/fallback-api-test.cpp)
+gost_add_offline_test(fallback integration/fallback-controller-test.cpp)
+gost_add_offline_test(fallback-ui unit/fallback-ui-test.cpp)
 
-foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection stats-baseline obs-stop operations configuration-api configuration configuration-ui settings-preferences)
+foreach(name IN ITEMS lifecycle backend-readonly dto sse state settings network connection stats-baseline obs-stop operations configuration-api configuration configuration-ui settings-preferences fallback-api fallback fallback-ui)
   # Определения компилятора закрепляют пути фикстур/локализаций и явных временных файлов.
   # ENVIRONMENT задаётся целиком для каждого теста, включая lifecycle: TEMP/TMP не наследуют AppData.
   target_compile_definitions(
@@ -79,6 +82,6 @@ set_tests_properties(
   gost-restreamer.network gost-restreamer.connection gost-restreamer.stats-baseline
   gost-restreamer.obs-stop gost-restreamer.operations
   gost-restreamer.configuration-api gost-restreamer.configuration gost-restreamer.configuration-ui
-  gost-restreamer.settings-preferences
+  gost-restreamer.settings-preferences gost-restreamer.fallback-api gost-restreamer.fallback gost-restreamer.fallback-ui
   PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GOST_QT_TEST_ROOT}/bin"
 )

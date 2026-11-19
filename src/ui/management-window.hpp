@@ -25,6 +25,8 @@ class StatusLabel;
 class RestreamController;
 class ConfigurationController;
 class ConfigurationEditor;
+class FallbackController;
+class FallbackEditor;
 
 /**
  * Предоставляет единственное расширенное окно с внутренней навигацией и формами конфигурации.
@@ -42,11 +44,11 @@ class ManagementWindow final : public QWidget {
 
 public:
 	// Создаёт страницы из stateStore с переводами text; parent связывает окно с OBS.
-	// Заимствованные connection/configuration переживают окно; restream сохранён в интерфейсе конструктора.
+	// Заимствованные connection/configuration/fallback переживают окно; restream сохранён в интерфейсе конструктора.
 	// Закрытие скрывает окно, а черновики настроек сохраняются до Save/Cancel или уничтожения окна.
 	ManagementWindow(StateStore &stateStore, TextLookup text, QWidget *parent = nullptr,
 			 ConnectionController *connection = nullptr, RestreamController *restream = nullptr,
-			 ConfigurationController *configuration = nullptr);
+			 ConfigurationController *configuration = nullptr, FallbackController *fallback = nullptr);
 	// Открывает точный Destination исходного контекста, сохраняя черновики и возвращая маски секретов.
 	void selectDestination(const DockContext &context, const QString &destinationId);
 	// Преобразует прежний маршрут Output/Session в прямой адрес сохранённого назначения.
@@ -63,6 +65,8 @@ private:
 	ConfigurationEditor *currentEditor() const;
 	// Активирует только текущий вид карточки, не меняя рабочий Stream.
 	void activateCurrentEditor();
+	// Отключает адресацию политики у всех страниц перед передачей активности текущей странице.
+	void deactivateEditors();
 	// Возвращает маску всем секретным полям, в том числе на невидимых страницах.
 	void hideSecrets();
 	// Согласует переход row с изменённым черновиком и сохраняет прежний выбор при отказе.
@@ -84,6 +88,8 @@ private:
 	// groupEditor_ редактирует связи групп, profileEditor_ — параметры кодирования на отдельной странице.
 	ConfigurationEditor *groupEditor_ = nullptr;
 	ConfigurationEditor *profileEditor_ = nullptr;
+	// fallbackEditor_ показывает каталог и подготовку; общий контроллер переживает эту страницу.
+	FallbackEditor *fallbackEditor_ = nullptr;
 	// pages_ переключает существующие страницы без дополнительных окон.
 	QStackedWidget *pages_ = nullptr;
 	// currentPage_ сохраняет прежний раздел до парковки несохранённого ввода.

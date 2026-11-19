@@ -739,15 +739,19 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers_data()
 		QTest::newRow(qPrintable(QString::number(index))) << index << paths[index];
 }
 
+// Проверяет адресацию непрозрачных ID и независимо заданные значения всех детальных DTO.
 void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 {
 	// Один ID содержит пробел, косую черту, разделители параметров и фрагмента URL, '%' и кириллицу. Сравнивается
 	// исходный адрес в строке запроса, включая оба сегмента вложенных маршрутов; иначе QUrl мог бы скрыть
 	// ошибку нормализации при чтении уже разобранного пути. Значения DTO проверяются независимо.
+	// family выбирает тип DTO, path задаёт независимый ожидаемый префикс маршрута.
 	QFETCH(int, family);
 	QFETCH(QByteArray, path);
+	// server возвращает независимый документ body на единственный локальный запрос.
 	HttpServer server;
 	QVERIFY(server.listen());
+	// body начинается с корректного Stream и заменяется документом выбранного семейства.
 	auto body = fixture::stream();
 	switch (family) {
 	case 1:
@@ -764,6 +768,7 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 		break;
 	case 5:
 		body = fixture::record(QStringLiteral("receipt"));
+		// key перечисляет обязательные строковые идентичности синтетической квитанции.
 		for (const auto *key : {"request_id", "kind", "target_id", "session_id", "output_id"})
 			body.insert(QLatin1String(key), QStringLiteral("identity"));
 		body.insert(QStringLiteral("status"), QStringLiteral("PENDING"));
@@ -776,7 +781,7 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 		body = fixture::record(QStringLiteral("generation"));
 		body.insert(QStringLiteral("asset_id"), QStringLiteral("asset"));
 		body.insert(QStringLiteral("kind"), QStringLiteral("image"));
-		body.insert(QStringLiteral("status"), QStringLiteral("READY"));
+		body.insert(QStringLiteral("status"), QStringLiteral("ready"));
 		body.insert(QStringLiteral("size_bytes"), QJsonValue(qint64(9007199254740993)));
 		body.insert(QStringLiteral("failure"), QJsonValue::Null);
 		break;
@@ -793,17 +798,22 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 		body.insert(QStringLiteral("runtime_reason"), QStringLiteral("not_observed"));
 		break;
 	}
+	// Обработчик request возвращает body без преобразования проверяемых значений.
 	server.handler = [&](const auto &request) {
 		HttpServer::reply(request, fixture::bytes(body));
 	};
+	// api выполняет настоящий QtNetwork с узнаваемым контекстом запроса.
 	APIClient api;
 	api.configure(server.origin(), {1, 1});
+	// done отмечает callback, success — декодирование, accurate — сохранение предметных значений.
 	bool done = false;
 	bool success = false;
 	bool accurate = true;
+	// callback сохраняет результат и проверяет поля конкретного DTO до завершения ожидания.
 	auto callback = [&](auto, auto result) {
 		success = bool(result);
 		if (result.value) {
+			// Value обозначает тип полученного DTO для независимого выбора проверяемых полей.
 			using Value = typename decltype(result.value)::value_type;
 			if constexpr (std::is_same_v<Value, Stream>)
 				accurate = result.value->publicationKey.value == QStringLiteral("publish+%2F/ключ");
@@ -812,7 +822,10 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 			if constexpr (std::is_same_v<Value, Receipt>)
 				accurate = result.value->status == QStringLiteral("PENDING");
 			if constexpr (std::is_same_v<Value, Generation>)
-				accurate = result.value->sizeBytes == quint64(9007199254740993ULL);
+				accurate = result.value->sizeBytes == quint64(9007199254740993ULL) &&
+					   result.value->status == QStringLiteral("ready") &&
+					   result.value->assetId == QStringLiteral("asset") &&
+					   result.value->id == QStringLiteral("generation");
 			if constexpr (std::is_same_v<Value, PolicyResult>)
 				accurate = result.value->revision == quint64(9007199254740993ULL) &&
 					   result.value->fallback.isNull();
@@ -824,6 +837,7 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 		}
 		done = true;
 	};
+	// id содержит разделители пути/query/fragment, которые должны остаться одним непрозрачным сегментом.
 	const QString id = QStringLiteral("entity /?%#ключ");
 	switch (family) {
 	case 0:
@@ -864,7 +878,9 @@ void ApiNetworkTest::detailRoutesKeepValuesAndEscapeOpaqueIdentifiers()
 	QVERIFY(success);
 	QVERIFY(accurate);
 	QCOMPARE(server.requests.size(), 1);
+	// segment — независимая ожидаемая UTF8 percent-encoding исходного ID.
 	const auto segment = QByteArray("entity%20%2F%3F%25%23%D0%BA%D0%BB%D1%8E%D1%87");
+	// expected собирает исходную строку HTTP, не скрывая ошибки нормализации внутри QUrl.
 	auto expected = QByteArray("/api/v1") + path + segment;
 	if (family == 7)
 		expected += "/generations/" + segment;
