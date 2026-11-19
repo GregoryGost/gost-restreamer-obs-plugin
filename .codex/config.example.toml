@@ -14,3 +14,4 @@ default_subagent_reasoning_effort = "high"
 # При необходимости аутентификацию Context7 настраивать локально, не в этом файле.
 [mcp_servers.context7]
 url = "https://mcp.context7.com/mcp"
+http_headers = { "Authorization" = "Bearer <<<TOKEN>>>" }

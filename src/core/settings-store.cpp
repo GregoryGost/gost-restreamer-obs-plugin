@@ -455,6 +455,8 @@ void SettingsStore::retireAbsent(const QStringList &inventory)
 	}
 }
 
+// Разрешает снимок descriptor для события event по лексически нормализованному каталогу.
+// Эквивалентные разделители не создают UUID; несколько подходящих UUID оставляют выбор неподтверждённым.
 ProfileResolution SettingsStore::observeProfile(FrontendEvent event, const ProfileDescriptor &descriptor)
 {
 	// Событие ProfileChanging означает явное переключение, поэтому последующую смену пути нельзя
@@ -470,18 +472,35 @@ ProfileResolution SettingsStore::observeProfile(FrontendEvent event, const Profi
 		transitionUncertain_ = true;
 		return {{}, false, true, false};
 	}
+	// path содержит каталог с едиными разделителями и без избыточных сегментов «.» и «..».
+	// Нормализация не читает файловую систему, не меняет регистр, не разрешает символические ссылки
+	// и не превращает относительный путь в абсолютный.
+	const auto path = QDir::cleanPath(descriptor.path);
+	// previous и previousRecord сохраняют подтверждённую до события идентичность и её атрибуты.
 	const auto previous = currentUuid_;
 	const auto previousRecord = profiles_.value(previous);
+	// located получает UUID только единственного совпадения; profile содержит одну сохранённую
+	// запись реестра, в том числе со старым ненормализованным locator.
 	QString located;
-	for (const auto &profile : profiles_)
-		if (profile.locator == descriptor.path)
-			located = profile.uuid;
+	for (const auto &profile : profiles_) {
+		if (QDir::cleanPath(profile.locator) != path)
+			continue;
+		if (!located.isEmpty()) {
+			// Старый файл может содержать разные UUID одного каталога. Ни порядок записей,
+			// ни точное написание одного пути не разрешают выбрать или удалить чужие привязки.
+			currentUuid_.clear();
+			transitionUncertain_ = true;
+			return {{}, false, true, false};
+		}
+		located = profile.uuid;
+	}
+	// renamed разрешает потребителям сохранить подписку только при распознанном переименовании.
 	bool renamed = false;
 	// OBS при переименовании меняет каталог и посылает ProfileChanged раньше ProfileRenamed без ProfileChanging.
 	// Перенос UUID разрешён только при исчезновении старого имени и отсутствии неоднозначного перехода.
-	if (!previous.isEmpty() && !changing_ && !transitionUncertain_ && previousRecord.locator != descriptor.path &&
-	    !descriptor.inventory.contains(previousRecord.name) && located.isEmpty() &&
-	    (event == FrontendEvent::ProfileChanged || event == FrontendEvent::ProfileRenamed)) {
+	if (!previous.isEmpty() && !changing_ && !transitionUncertain_ &&
+	    QDir::cleanPath(previousRecord.locator) != path && !descriptor.inventory.contains(previousRecord.name) &&
+	    located.isEmpty() && (event == FrontendEvent::ProfileChanged || event == FrontendEvent::ProfileRenamed)) {
 		located = previous;
 		renamed = true;
 	}
@@ -492,14 +511,17 @@ ProfileResolution SettingsStore::observeProfile(FrontendEvent event, const Profi
 			return {{}, false, true, false};
 		located = QUuid::createUuid().toString(QUuid::WithoutBraces);
 	}
-	auto record = ProfileRecord{located, descriptor.name, descriptor.path};
+	// record содержит обновлённые атрибуты того же UUID; old сохраняет их прежнее значение.
+	auto record = ProfileRecord{located, descriptor.name, path};
 	const auto old = profiles_.value(located);
+	// registryChanged включает одноразовую нормализацию старого locator при наблюдении, но не при load.
 	const bool registryChanged = old.name != record.name || old.locator != record.locator;
 	profiles_.insert(located, std::move(record));
 	currentUuid_ = located;
 	if (event != FrontendEvent::ProfileListChanged)
 		changing_ = false;
 	transitionUncertain_ = false;
+	// oldSize позволяет сохранить удаление отсутствующих профилей даже при неизменном текущем record.
 	const auto oldSize = profiles_.size();
 	retireAbsent(descriptor.inventory);
 	if (registryChanged || profiles_.size() != oldSize)

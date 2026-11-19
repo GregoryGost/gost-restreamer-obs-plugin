@@ -524,8 +524,16 @@ ConfigurationEditor::Impl::Impl(ConfigurationEditor &owner, StateStore &state, C
 			emit owner_.selectionChanged();
 		}
 	});
-	// Обновление списка не заменяет редактируемую форму.
-	QObject::connect(refreshButton, &QPushButton::clicked, &owner_, [this] { controller_.refresh(kind_); });
+	// Обновление списка также сверяет спорную карточку этой страницы без повторной отправки записи.
+	QObject::connect(refreshButton, &QPushButton::clicked, &owner_, [this] {
+		// alive защищает обращение к странице после синхронного уведомления перечитывания карточки.
+		const QPointer<ConfigurationEditor> alive(&owner_);
+		if (ownsCard() && state_.configurationEditor().requiresReconciliation() &&
+		    !state_.configurationEditor().loading && !state_.configurationEditor().writing)
+			controller_.reload();
+		if (alive)
+			controller_.refresh(kind_);
+	});
 	// Подписки привязаны к owner_, поэтому уничтожение виджета отключает обработчики.
 	QObject::connect(&state_, &StateStore::configurationEditorChanged, &owner_, [this] { refresh(); });
 	QObject::connect(&state_, &StateStore::serverStateChanged, &owner_, [this] { refresh(); });
@@ -943,11 +951,10 @@ void ConfigurationEditor::Impl::refresh()
 		message_->setStatus({}, StatusLabel::Tone::Neutral);
 	}
 
-	save_->setEnabled(editable && !editor.reconciliationRequired && !editor.serverConflict &&
-			  editor.destinationReconciliation.isEmpty() && profileCanSave() &&
+	save_->setEnabled(editable && !editor.requiresReconciliation() && !editor.serverConflict && profileCanSave() &&
 			  (editor.creating || !editor.dirtyFields.isEmpty() || !editor.destinationChanges.isEmpty()));
-	remove_->setEnabled(editable && !editor.creating && editor.base.has_value() && !editor.reconciliationRequired &&
-			    !editor.serverConflict);
+	remove_->setEnabled(editable && !editor.creating && editor.base.has_value() &&
+			    !editor.requiresReconciliation() && !editor.serverConflict);
 	reload_->setEnabled(hasCard && !editor.loading && !editor.writing &&
 			    (!editor.creating || editor.reconciliationRequired));
 	conflict();
@@ -1029,8 +1036,7 @@ void ConfigurationEditor::Impl::edited(const QString &field)
 	const auto updatedEditor = state_.configurationEditor();
 	updateEndpointRequiredError(updatedEditor);
 	// Доступность действий меняется без populate, сохраняя невалидный текст в форме.
-	save_->setEnabled(!editor.reconciliationRequired && !editor.serverConflict &&
-			  editor.destinationReconciliation.isEmpty() && profileCanSave());
+	save_->setEnabled(!editor.requiresReconciliation() && !editor.serverConflict && profileCanSave());
 	if (editor.serverConflict) {
 		conflictIdentity_.clear();
 		conflict();
@@ -1337,6 +1343,12 @@ void ConfigurationEditor::activate()
 		if (!alive)
 			return;
 	}
+	// Повторное открытие использует существующее чтение для сверки, сохраняя RAM-ввод и прежний Unknown.
+	if (impl_->ownsCard() && impl_->state_.configurationEditor().requiresReconciliation() &&
+	    !impl_->state_.configurationEditor().loading && !impl_->state_.configurationEditor().writing)
+		impl_->controller_.reload();
+	if (!alive)
+		return;
 	impl_->controller_.refresh(impl_->kind_);
 	if (!alive)
 		return;
@@ -1364,11 +1376,12 @@ bool ConfigurationEditor::canLeave(bool preserveDraft)
 {
 	// editor фиксирует текущий глобальный draft: входящая страница тоже не может молча его потерять.
 	const auto editor = impl_->state_.configurationEditor();
-	if (editor.loading || editor.writing)
+	// current ограничивает запрет спорной карточкой нынешнего сервера, профиля и рабочего выбора.
+	const ConfigurationContext current{impl_->state_.serverOrigin(), impl_->state_.dockContext().profileUuid,
+					   impl_->state_.selectedStreamId()};
+	if (editor.loading || editor.writing || (editor.context == current && editor.requiresReconciliation()))
 		return false;
 	if (preserveDraft) {
-		if (editor.reconciliationRequired && impl_->ownsCard())
-			return false;
 		if (impl_->profileEditor_ && impl_->ownsEditor())
 			impl_->profileDrafts_.insert_or_assign(impl_->rawDraftKey(editor),
 							       impl_->profileEditor_->captureDraft());

@@ -71,12 +71,17 @@ struct ConfigurationEditorState {
 	bool loading = false;
 	// Уже принято локальное намерение записи, которое переживает скрытие окна.
 	bool writing = false;
-	// После Unknown требуется явное перечитывание перед новым намерением.
+	// После Unknown требуется корректное новое чтение сервера перед следующим намерением.
 	bool reconciliationRequired = false;
 	// Результат предыдущей записи не выводится из одного лишь последующего GET.
 	ConfigurationOutcome outcome = ConfigurationOutcome::None;
 	// Ключ локализованного безопасного сообщения, без серверных значений и секретов.
 	QString messageKey;
+	// Возвращает необходимость сверки карточки или назначений до новой записи и предварительной проверки.
+	bool requiresReconciliation() const noexcept
+	{
+		return reconciliationRequired || !destinationReconciliation.isEmpty();
+	}
 };
 
 } // namespace gost

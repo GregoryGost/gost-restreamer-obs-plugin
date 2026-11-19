@@ -214,7 +214,210 @@ private slots:
 	void deletingRecordReplacesStaleValidationWhilePending_data();
 	// Проверяет отменённое и принятое удаление после локального отказа сохранения.
 	void deletingRecordReplacesStaleValidationWhilePending();
+	// Задаёт обычный PATCH и пакет enabled с ручным обновлением либо повторной активацией страницы.
+	void confirmationTimeoutDisablesSaveUntilVerifiedRefresh_data();
+	// Ошибка GET сохраняет заблокированную кнопку; новое корректное чтение разрешает только явный повтор.
+	void confirmationTimeoutDisablesSaveUntilVerifiedRefresh();
+	// Задаёт обе локализации пользовательской причины отсутствующего подтверждения.
+	void confirmationTimeoutShowsOneLocalizedPopup_data();
+	// Настоящий Runtime показывает единственный PlainText popup с таймаутом и действием обновления.
+	void confirmationTimeoutShowsOneLocalizedPopup();
 };
+
+// Проверяет оба способа получения актуальных данных без автоматического повторения записи.
+void ConfigurationUiTest::confirmationTimeoutDisablesSaveUntilVerifiedRefresh_data()
+{
+	QTest::addColumn<bool>("batch");
+	QTest::addColumn<bool>("reopen");
+	QTest::newRow("single-manual-refresh") << false << false;
+	QTest::newRow("single-page-reopen") << false << true;
+	QTest::newRow("batch-manual-refresh") << true << false;
+	QTest::newRow("batch-page-reopen") << true << true;
+}
+
+// Наблюдает реальную кнопку и пользовательский ввод, пока HTTP-сервер удерживает подтверждение PATCH.
+void ConfigurationUiTest::confirmationTimeoutDisablesSaveUntilVerifiedRefresh()
+{
+	// batch выбирает участие назначения; reopen заменяет явную кнопку обновления активацией страницы.
+	QFETCH(bool, batch);
+	QFETCH(bool, reopen);
+	// rig и page используют настоящие контроллеры и виджеты с полностью локальным сервером.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	ConfigurationEditor page(rig.state, rig.configuration, translatedKey,
+				 batch ? ConfigurationKind::Stream : ConfigurationKind::Group);
+	page.show();
+	QVERIFY(rig.configuration.open(batch ? ConfigurationKind::Stream : ConfigurationKind::Group,
+				       batch ? QStringLiteral("stream") : QStringLiteral("group")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	if (batch)
+		QTRY_VERIFY_WITH_TIMEOUT(rig.state.configuration().destinationsStatus.complete, 1000);
+	// name/save адресуют редактируемое имя и сохранение; refresh — явное чтение сервера из страницы.
+	auto *name = page.findChild<QLineEdit *>(QStringLiteral("configurationName"));
+	auto *save = page.findChild<QPushButton *>(QStringLiteral("configurationSave"));
+	QPushButton *refresh = nullptr;
+	// button перебирает действия формы и выбирает обновление по неизменённому ключу тестового переводчика.
+	for (auto *button : page.findChildren<QPushButton *>())
+		if (button->text() == QStringLiteral("Editor.Reload"))
+			refresh = button;
+	QVERIFY(name && save && refresh);
+	// failRead включает HTTP503 только после таймаута; acceptWrite разрешает второе явное намерение.
+	bool failRead = false;
+	bool acceptWrite = false;
+	// Перехватчик request удерживает исходную запись и затем избирательно отклоняет адресную сверку.
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.method == "PATCH")
+			return !acceptWrite;
+		if (failRead && request.method == "GET" &&
+		    request.target == (batch ? QByteArray("/api/v1/destinations/destination")
+					     : QByteArray("/api/v1/transcode-groups/group"))) {
+			HttpServer::reply(request, "{}", 503);
+			return true;
+		}
+		return false;
+	};
+	if (batch) {
+		QVERIFY(rig.configuration.setDestinationEnabled(QStringLiteral("destination"), false));
+	} else {
+		name->selectAll();
+		QTest::keyClicks(name, "Retained group");
+	}
+	QVERIFY(save->isEnabled());
+	save->click();
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 1000);
+	QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+	QVERIFY(!save->isEnabled());
+	QVERIFY(!page.canLeave());
+	QVERIFY(refresh->isEnabled());
+	QCOMPARE(rig.mutations().size(), 1);
+	failRead = true;
+	refresh->click();
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading, 1000);
+	QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+	QVERIFY(!save->isEnabled());
+	QCOMPARE(rig.mutations().size(), 1);
+	failRead = false;
+	if (reopen) {
+		page.hide();
+		page.show();
+		page.activate();
+	} else {
+		refresh->click();
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading && save->isEnabled(), 2000);
+	QVERIFY(!rig.state.configurationEditor().requiresReconciliation());
+	QCOMPARE(rig.mutations().size(), 1);
+	if (batch) {
+		QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("destination")),
+			 ConfigurationOutcome::Unknown);
+		QVERIFY(rig.state.configurationEditor().destinationChanges.contains(QStringLiteral("destination")));
+	} else {
+		QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown);
+		QCOMPARE(name->text(), QStringLiteral("Retained group"));
+	}
+	acceptWrite = true;
+	save->click();
+	QTRY_VERIFY_WITH_TIMEOUT(rig.mutations().size() == 2 && !rig.state.configurationEditor().writing, 1000);
+	if (batch)
+		QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("destination")),
+			 ConfigurationOutcome::Saved);
+	else
+		QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Saved);
+}
+
+// Проверяет смысл сообщения на русском и английском, а не только наличие ключа перевода.
+void ConfigurationUiTest::confirmationTimeoutShowsOneLocalizedPopup_data()
+{
+	QTest::addColumn<QString>("locale");
+	QTest::newRow("russian") << QStringLiteral("ru-RU");
+	QTest::newRow("english") << QStringLiteral("en-US");
+}
+
+// Повторная публикация того же отказа не открывает новый диалог и не пишет ещё одну запись журнала.
+void ConfigurationUiTest::confirmationTimeoutShowsOneLocalizedPopup()
+{
+	// locale выбирает поставляемый словарь; translations сохраняет его до уничтожения Runtime.
+	QFETCH(QString, locale);
+	QSettings translations(QStringLiteral(GOST_TEST_LOCALE_DIR) + QLatin1Char('/') + locale +
+				       QStringLiteral(".ini"),
+			       QSettings::IniFormat);
+	// temp/file изолируют preferences; logs принимает только сообщения созданного этим тестом Runtime.
+	WorkspaceTemp temp(QStringLiteral("confirmation-timeout"));
+	QVERIFY(temp.isValid());
+	const auto file = temp.filePath(QStringLiteral("settings.json"));
+	QStringList logs;
+	{
+		// preferences задаёт минимальный продуктовый срок REST без тестового доступа к приватному API.
+		SettingsStore preferences(file);
+		preferences.setHttpTimeoutSeconds(5);
+		QVERIFY(preferences.save());
+	}
+	// server принимает PATCH и не отвечает; другие обращения возвращают независимую карточку назначения.
+	HttpServer server;
+	QVERIFY(server.listen());
+	server.handler = [](const HttpServer::Request &request) {
+		if (request.method != "PATCH")
+			HttpServer::reply(request, fixture::bytes(fixture::destination()));
+	};
+	// frontend/lifecycle создают presenter; переводчик читает key из настоящего словаря,
+	// обработчик журнала добавляет подготовленное message в logs без вызовов OBS.
+	FakeFrontend frontend;
+	PluginLifecycle lifecycle(
+		frontend,
+		[&translations](const char *key) {
+			return translations.value(QString::fromUtf8(key), QString::fromUtf8(key)).toString();
+		},
+		{QStringLiteral("test"), file, [&](LogSeverity, const QString &message) {
+			 logs.append(message);
+		 }});
+	QVERIFY(lifecycle.load());
+	// state/controller предоставляют публичную границу операции; failures наблюдает её событие.
+	auto *state = lifecycle.stateStore();
+	auto *controller = lifecycle.configurationController();
+	QVERIFY(state && controller);
+	state->setConnection(server.origin().toString(), ConnectionStatus::Connected);
+	state->setSelection({}, true, {}, {}, QStringLiteral("profile-uuid"));
+	QSignalSpy failures(controller, &ConfigurationController::operationFailed);
+	QVERIFY(failures.isValid());
+	QVERIFY(controller->open(ConfigurationKind::Destination, QStringLiteral("destination")));
+	QTRY_VERIFY_WITH_TIMEOUT(state->configurationEditor().base.has_value(), 1000);
+	// draft содержит единственное явное изменение имени, чей серверный результат останется неизвестным.
+	auto draft = std::get<Destination>(*state->configurationEditor().draft);
+	draft.name = QStringLiteral("Unconfirmed name");
+	QVERIFY(controller->setDraft(draft, {QStringLiteral("name")}));
+	QVERIFY(controller->save());
+	QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, 7000);
+	// dialog/reason/action адресуют единственное окно и два обычных текстовых блока.
+	QPointer<OperationErrorDialog> dialog = frontend.host->findChild<OperationErrorDialog *>();
+	QVERIFY(dialog);
+	auto *reason = dialog->findChild<QLabel *>(QStringLiteral("operationErrorReason"));
+	auto *action = dialog->findChild<QLabel *>(QStringLiteral("operationErrorAction"));
+	QVERIFY(reason && action);
+	QCOMPARE(reason->textFormat(), Qt::PlainText);
+	QCOMPARE(action->textFormat(), Qt::PlainText);
+	QVERIFY(!reason->text().startsWith(QStringLiteral("Configuration.")));
+	QVERIFY(!action->text().startsWith(QStringLiteral("Configuration.")));
+	QVERIFY(reason->text().contains(locale == QStringLiteral("ru-RU") ? QStringLiteral("подтверд")
+									  : QStringLiteral("confirm"),
+					Qt::CaseInsensitive));
+	QVERIFY(reason->text().contains(locale == QStringLiteral("ru-RU") ? QStringLiteral("ожидан")
+									  : QStringLiteral("time"),
+					Qt::CaseInsensitive));
+	QVERIFY(action->text().contains(locale == QStringLiteral("ru-RU") ? QStringLiteral("Обновить")
+									  : QStringLiteral("Refresh"),
+					Qt::CaseInsensitive));
+	QCOMPARE(frontend.host->findChildren<OperationErrorDialog *>().size(), 1);
+	QCOMPARE(logs.filter(QStringLiteral("Отказ операции:")).size(), 1);
+	// notification повторно проходит presenter без создания новой операции или дополнительного журнала.
+	const auto notification = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	controller->operationFailed(notification);
+	QCOMPARE(frontend.host->findChildren<OperationErrorDialog *>().size(), 1);
+	QCOMPARE(logs.filter(QStringLiteral("Отказ операции:")).size(), 1);
+	QCOMPARE(state->configurationEditor().outcome, ConfigurationOutcome::Unknown);
+	QVERIFY(state->configurationEditor().requiresReconciliation());
+	lifecycle.shutdown();
+	QVERIFY(dialog.isNull());
+}
 
 // Использует независимые серверные документы для проверки общего механизма выбора карточек.
 void ConfigurationUiTest::existingRecordCanBeSelectedAfterCreate_data()

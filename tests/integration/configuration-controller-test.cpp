@@ -130,7 +130,140 @@ private slots:
 	void streamSelectionUnavailableItemsDoNotBlockOtherChanges_data();
 	// Недоступный шаг получает окончательный отказ без повтора и освобождает сохранение остальных полей.
 	void streamSelectionUnavailableItemsDoNotBlockOtherChanges();
+	// Задаёт обычное сохранение и пакет enabled с недостоверными адресными чтениями после таймаута.
+	void confirmationTimeoutKeepsBarrierUntilFreshExactRead_data();
+	// Таймаут не позволяет сбросить ввод, сменить карточку или выполнить precheck до корректной сверки.
+	void confirmationTimeoutKeepsBarrierUntilFreshExactRead();
 };
+
+// Задаёт ошибки сверки независимо от способа сохранения пользовательского намерения.
+void ConfigurationControllerTest::confirmationTimeoutKeepsBarrierUntilFreshExactRead_data()
+{
+	QTest::addColumn<bool>("batch");
+	QTest::addColumn<int>("readFailure");
+	QTest::addColumn<bool>("automaticReconnect");
+	QTest::newRow("single-failed-read") << false << 503 << false;
+	QTest::newRow("single-wrong-id") << false << 200 << false;
+	QTest::newRow("single-old-epoch") << false << 0 << false;
+	QTest::newRow("batch-failed-read") << true << 503 << false;
+	QTest::newRow("batch-wrong-id") << true << 200 << false;
+	QTest::newRow("batch-old-epoch") << true << 0 << false;
+	QTest::newRow("single-reconnected") << false << 503 << true;
+	QTest::newRow("batch-reconnected") << true << 503 << true;
+}
+
+// Наблюдение нового состояния разрешает новое намерение, но не доказывает успех потерянного PATCH.
+void ConfigurationControllerTest::confirmationTimeoutKeepsBarrierUntilFreshExactRead()
+{
+	// batch выбирает пакет; readFailure — ошибочную сверку; automaticReconnect восстанавливает связь без reload().
+	QFETCH(bool, batch);
+	QFETCH(int, readFailure);
+	QFETCH(bool, automaticReconnect);
+	// rig предоставляет независимые HTTP и RAM; documents моделируют сервер до потерянного ответа.
+	ConfigurationRig rig;
+	QVERIFY(rig.initialize());
+	auto documents = destinationDocuments(rig);
+	// reconciling включает управляемый отказ только после завершения исходной записи.
+	bool reconciling = false;
+	// heldRead удерживает точный GET, чтобы отозвать его конфигурационную эпоху перед ответом.
+	std::optional<HttpServer::Request> heldRead;
+	// exactReads доказывает получение адресной сверки, независимо от публикации статуса Connected.
+	int exactReads = 0;
+	// Перехватчик request принимает PATCH без ответа и возвращает ошибочные данные только при сверке.
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.method == "PATCH")
+			return true;
+		if (request.method == "GET" && request.target == (batch ? QByteArray("/api/v1/destinations/a")
+									: QByteArray("/api/v1/transcode-groups/group")))
+			++exactReads;
+		if (reconciling && request.method == "GET" &&
+		    request.target == (batch ? QByteArray("/api/v1/destinations/a")
+					     : QByteArray("/api/v1/transcode-groups/group"))) {
+			if (readFailure == 0) {
+				heldRead = request;
+			} else if (readFailure == 503) {
+				HttpServer::reply(request, "{}", 503);
+			} else {
+				// wrongDocument имеет корректную структуру, но не подтверждает запрошенную идентичность.
+				auto wrongDocument = batch ? documents.value(QStringLiteral("a")) : rig.group;
+				wrongDocument.insert(QStringLiteral("id"), QStringLiteral("another-record"));
+				HttpServer::reply(request, fixture::bytes(wrongDocument));
+			}
+			return true;
+		}
+		return serveDestinations(request, documents);
+	};
+	QVERIFY(rig.configuration.open(batch ? ConfigurationKind::Stream : ConfigurationKind::Group,
+				       batch ? QStringLiteral("stream") : QStringLiteral("group")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configurationEditor().base.has_value(), 1000);
+	if (batch) {
+		QVERIFY(rig.configuration.setDestinationEnabled(QStringLiteral("a"), false));
+	} else {
+		// draft содержит имя, которое остаётся в RAM после неопределённого результата записи.
+		auto draft = std::get<Group>(*rig.state.configurationEditor().draft);
+		draft.name = QStringLiteral("Retained group");
+		QVERIFY(rig.configuration.setDraft(draft, {QStringLiteral("name")}));
+	}
+	// failures наблюдает настоящую границу пользовательского уведомления, включая payload контекста.
+	QSignalSpy failures(&rig.configuration, &ConfigurationController::operationFailed);
+	QVERIFY(failures.isValid());
+	QVERIFY(rig.configuration.save());
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().writing, 1000);
+	QCOMPARE(rig.mutations().size(), 1);
+	QCOMPARE(failures.size(), 1);
+	// failure принадлежит единственной отправленной записи и содержит локализуемую причину таймаута.
+	const auto failure = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	QCOMPARE(failure.source, OperationFailureSource::Configuration);
+	QCOMPARE(failure.context.origin, rig.server.origin().toString());
+	QCOMPARE(failure.context.profileUuid, QStringLiteral("profile-uuid"));
+	QCOMPARE(failure.context.streamId, QStringLiteral("stream"));
+	QCOMPARE(failure.stepIdentity, batch ? QStringLiteral("a") : QStringLiteral("group"));
+	QCOMPARE(failure.reasonKey, QStringLiteral("Configuration.ConfirmationTimeout"));
+	QCOMPARE(failure.actionKey, QStringLiteral("Configuration.RefreshBeforeSaving"));
+	QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+	QVERIFY(!rig.configuration.save());
+	QVERIFY(!rig.configuration.discardDraft(rig.configuration.editorGeneration()));
+	QVERIFY(!rig.configuration.beginCreate(ConfigurationKind::Group, true));
+	QVERIFY(!rig.configuration.open(ConfigurationKind::Destination, QStringLiteral("b"), true));
+	QVERIFY(!rig.operations.checkFallback(rig.state.dockContext()));
+	reconciling = true;
+	QVERIFY(rig.configuration.reload());
+	if (readFailure == 0) {
+		QTRY_VERIFY_WITH_TIMEOUT(heldRead.has_value(), 1000);
+		rig.state.invalidateConfiguration();
+		HttpServer::reply(*heldRead, fixture::bytes(batch ? documents.value(QStringLiteral("a")) : rig.group));
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading, 1000);
+	QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+	QVERIFY(!rig.configuration.save());
+	QCOMPARE(failures.size(), 1);
+	QCOMPARE(rig.mutations().size(), 1);
+	reconciling = false;
+	// readsBeforeRecovery отделяет корректное новое чтение от исходной загрузки и неуспешной сверки.
+	const auto readsBeforeRecovery = exactReads;
+	if (automaticReconnect) {
+		rig.state.setConnection(rig.server.origin().toString(), ConnectionStatus::Reconnecting);
+		QVERIFY(rig.state.configurationEditor().requiresReconciliation());
+		rig.state.setConnection(rig.server.origin().toString(), ConnectionStatus::Connected);
+	} else {
+		QVERIFY(rig.configuration.reload());
+	}
+	QTRY_VERIFY_WITH_TIMEOUT(!rig.state.configurationEditor().loading &&
+					 !rig.state.configurationEditor().requiresReconciliation(),
+				 1000);
+	QVERIFY(exactReads > readsBeforeRecovery);
+	if (batch) {
+		QCOMPARE(rig.state.configurationEditor().destinationOutcomes.value(QStringLiteral("a")),
+			 ConfigurationOutcome::Unknown);
+		QCOMPARE(rig.state.configurationEditor().destinationChanges.value(QStringLiteral("a")), false);
+	} else {
+		QCOMPARE(rig.state.configurationEditor().outcome, ConfigurationOutcome::Unknown);
+		QCOMPARE(std::get<Group>(*rig.state.configurationEditor().draft).name,
+			 QStringLiteral("Retained group"));
+	}
+	QCOMPARE(failures.size(), 1);
+	QCOMPARE(rig.mutations().size(), 1);
+}
 
 void ConfigurationControllerTest::firstStreamCanBeCreatedWithoutWorkingSelection()
 {

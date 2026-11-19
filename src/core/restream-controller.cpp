@@ -208,7 +208,7 @@ public:
 	// Не допускает проверку пригодности до завершения записи и сверки её неизвестного результата.
 	bool configurationSettled() const
 	{
-		return !state.configurationEditor().writing && !state.configurationEditor().reconciliationRequired;
+		return !state.configurationEditor().writing && !state.configurationEditor().requiresReconciliation();
 	}
 
 	// Снимает пригодность прежнего precheck немедленно, сохраняя текущий workflow.

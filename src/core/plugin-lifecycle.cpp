@@ -120,11 +120,16 @@ public:
 		lastFailureGeneration = failure.generation;
 		lastFailureStep = failure.stepIdentity;
 		lastFailureContext = failure.context;
-		// reason и action копируются до вызова внешнего адаптера журнала и событий показа окна.
-		const auto reason = failure.reason.isEmpty() ? notificationText("Operation.ErrorUnknownReason")
-							     : failure.reason;
-		const auto action = failure.action;
-		// message содержит только полученную диагностику отказа, без запроса, конфигурации или успешного тела.
+		// reason и action содержат серверный текст либо перевод доверенных локальных ключей.
+		// Копии переживают вызов внешнего адаптера журнала и события показа окна.
+		const auto reason = !failure.reasonKey.isEmpty()
+					    ? notificationText(failure.reasonKey.toUtf8().constData())
+				    : failure.reason.isEmpty() ? notificationText("Operation.ErrorUnknownReason")
+							       : failure.reason;
+		const auto action = failure.actionKey.isEmpty()
+					    ? failure.action
+					    : notificationText(failure.actionKey.toUtf8().constData());
+		// message содержит причину отказа и полученную диагностику, без запроса, конфигурации или успешного тела.
 		QString message = QStringLiteral("Отказ операции: ") + failure.code + QLatin1Char('\n') + reason;
 		if (!action.isEmpty())
 			message += QStringLiteral("\nДействие: ") + action;

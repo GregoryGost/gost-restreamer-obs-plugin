@@ -205,7 +205,7 @@ public:
 	bool restoreDraft(ConfigurationKind kind, const QString &id)
 	{
 		if (!available() ||
-		    (model.context == context && model.reconciliationRequired &&
+		    (model.context == context && model.requiresReconciliation() &&
 		     (model.kind != kind || model.id != id)) ||
 		    !parkDraft())
 			return false;
@@ -328,8 +328,18 @@ public:
 			++apiContext.selection;
 			api.configure(QUrl(context.origin), apiContext);
 		}
-		if (reconnected)
+		if (reconnected) {
 			disconnected = false;
+			if (!model.requiresReconciliation())
+				return;
+			// После восстановления используем одно адресное чтение нынешней спорной карточки.
+			// Callback не переносится в другой контекст и не повторяет потерянную запись.
+			QTimer::singleShot(0, &owner, [this, next] {
+				if (context == next && model.context == context && model.requiresReconciliation() &&
+				    !model.loading && !model.writing)
+					reload();
+			});
+		}
 	}
 
 	// Проверяет контекст и эпоху, захваченные перед GET.
@@ -443,7 +453,7 @@ public:
 	}
 
 	// Читает точную сущность, сохраняя несохранённый ввод; conflict сравнивает версию после revision_conflict.
-	// Явная сверка Unknown отзывает старые чтения конфигурации до публикации результата и обновляет Dock.
+	// Сверка Unknown отзывает старые чтения конфигурации до публикации результата и обновляет Dock.
 	// Успех GET и 404 подтверждают только нынешнее состояние, не успех потерянной записи.
 	template<class T> void readTyped(bool conflict)
 	{
@@ -589,7 +599,7 @@ public:
 	// Открывает новую карточку лишь после явного решения о несохранённом вводе.
 	bool open(ConfigurationKind kind, QString id, bool discard)
 	{
-		if (!available() || model.writing || (model.context == context && model.reconciliationRequired) ||
+		if (!available() || model.writing || (model.context == context && model.requiresReconciliation()) ||
 		    ((!model.dirtyFields.isEmpty() || !model.destinationChanges.isEmpty()) && !discard) || id.isEmpty())
 			return false;
 		++detailGeneration;
@@ -603,7 +613,7 @@ public:
 	// Создаёт типизированный ввод; обязательные параметры пользователь заполняет до отправки.
 	bool beginCreate(ConfigurationKind kind, bool discard)
 	{
-		if (!available() || model.writing || (model.context == context && model.reconciliationRequired) ||
+		if (!available() || model.writing || (model.context == context && model.requiresReconciliation()) ||
 		    ((!model.dirtyFields.isEmpty() || !model.destinationChanges.isEmpty()) && !discard))
 			return false;
 		++detailGeneration;
@@ -676,7 +686,7 @@ public:
 	{
 		if (stopped || model.writing || model.loading || !model.draft ||
 		    expectedGeneration != editorGeneration ||
-		    (model.context == context && model.reconciliationRequired))
+		    (model.context == context && model.requiresReconciliation()))
 			return false;
 		model.draft = model.base.value_or(*model.draft);
 		model.dirtyFields.clear();
@@ -695,11 +705,12 @@ public:
 		return guard && editorGeneration == acceptedGeneration;
 	}
 
-	// Передаёт HTTP-отказ текущего CRUD-шага. Сигнал не меняет модель формы и не хранит тело ответа.
+	// Передаёт отказ либо отсутствие подтверждения отправленного CRUD-шага один раз.
+	// Сигнал не меняет модель формы и не хранит тело ответа; локальные причины переводит presenter.
 	// Возвращает false, если обработчик завершил сервис либо сменил исходный контекст/намерение.
 	bool notifyFailure(const api::Error &error, const QString &stepIdentity)
 	{
-		if (!mutationRejected(error))
+		if (!mutationRejected(error) && !error.requestSent)
 			return true;
 		if (stopped || disconnected || model.context != context)
 			return false;
@@ -707,8 +718,14 @@ public:
 			return true;
 		notifiedMutation = mutationGeneration;
 		notifiedStep = stepIdentity;
-		// failure содержит краткоживущую диагностику только исходного серверного отказа.
+		// failure передаёт полученную диагностику либо доверенные ключи отсутствующего подтверждения.
 		auto failure = operationFailure(error);
+		if (!mutationRejected(error)) {
+			failure.reasonKey = error.kind == api::ErrorKind::Timeout
+						    ? QStringLiteral("Configuration.ConfirmationTimeout")
+						    : QStringLiteral("Configuration.ConfirmationUnavailable");
+			failure.actionKey = QStringLiteral("Configuration.RefreshBeforeSaving");
+		}
 		failure.source = OperationFailureSource::Configuration;
 		failure.context = {context.origin, context.profileUuid, context.workingStreamId};
 		failure.generation = mutationGeneration;
@@ -906,6 +923,8 @@ public:
 			publish();
 			if (!guard)
 				return;
+			if (model.requiresReconciliation())
+				return;
 			if (!model.dirtyFields.isEmpty()) {
 				save(true);
 				return;
@@ -980,7 +999,15 @@ public:
 					// rejected отделяет известный серверный отказ от возможной уже выполненной записи.
 					const bool rejected = result.error && (!result.error->requestSent ||
 									       mutationRejected(*result.error));
-					if (result.error && !notifyFailure(*result.error, id))
+					// error сохраняет исходную причину либо отмечает недостоверный успешный DTO.
+					api::Error error;
+					if (result.error)
+						error = *result.error;
+					else {
+						error.kind = api::ErrorKind::Contract;
+						error.requestSent = true;
+					}
+					if (!notifyFailure(error, id))
 						return;
 					// outcome относится только к этому назначению, не к соседним шагам пакета.
 					const auto outcome = result.error && revisionConflict(*result.error)
@@ -992,8 +1019,11 @@ public:
 						retireDestinationIntent(id);
 						removeDestinationFromCache(id);
 					} else if (outcome == ConfigurationOutcome::Unknown ||
-						   outcome == ConfigurationOutcome::Conflict)
+						   outcome == ConfigurationOutcome::Conflict) {
 						model.destinationReconciliation.insert(id);
+						// GET, начатый до этого результата, ещё мог видеть прежнее enabled.
+						state.invalidateConfiguration();
+					}
 				}
 				if (validSuccess)
 					cache(*result.value);
@@ -1022,7 +1052,8 @@ public:
 		return true;
 	}
 
-	// Сверяет очередной точный ID; ошибка GET сохраняет запрет записи и не означает успех прежнего PATCH.
+	// Сверяет очередной точный ID только новым GET текущей эпохи конфигурации.
+	// Ошибка чтения сохраняет запрет записи; успешная сверка не подтверждает прежний PATCH.
 	void nextReconciliation()
 	{
 		if (model.context != context)
@@ -1038,19 +1069,42 @@ public:
 			model.destinationMessageKey = model.destinationReconciliation.isEmpty()
 							      ? QStringLiteral("Configuration.DestinationsPartial")
 							      : QStringLiteral("Configuration.DestinationsReconcile");
+			// guard защищает уведомления; expected, sequence и epoch фиксируют завершённую сверку.
+			const QPointer<ConfigurationController> guard = &owner;
+			const auto expected = context;
+			const auto sequence = detailGeneration;
+			const auto epoch = state.configurationGeneration() + (model.requiresReconciliation() ? 0 : 1);
+			if (!model.requiresReconciliation())
+				state.invalidateConfiguration();
+			if (!guard || sequence != detailGeneration || !current(expected, epoch))
+				return;
 			publish();
+			if (!guard || model.requiresReconciliation() || sequence != detailGeneration ||
+			    !current(expected, epoch))
+				return;
+			connection.refreshState();
+			if (guard && sequence == detailGeneration && current(expected, epoch))
+				restream.refreshFallbackAfterConfiguration();
 			return;
 		}
-		// id, expected и sequence ограждают чтение от перехода на другую карточку или сервер.
+		// id адресует назначение, expected и sequence ограждают карточку, epoch исключает старые чтения.
 		const auto id = destinationQueue.takeFirst();
 		const auto expected = context;
 		const auto sequence = detailGeneration;
-		// Callback обновляет лишь ревизию намерения и собственный DTO; остальные поля PATCH не расширяются.
+		const auto epoch = state.configurationGeneration();
+		// Callback обновляет ревизию и DTO доступного назначения, не меняя прежний исход PATCH.
+		// Подтверждённое удаление либо перенос в другой Stream снимает намерение как Rejected.
 		api.getDestination(
-			id, &owner, [this, id, expected, sequence](auto, api::Result<api::Destination> result) {
+			id, &owner, [this, id, expected, sequence, epoch](auto, api::Result<api::Destination> result) {
 				if (stopped || disconnected || context != expected || sequence != detailGeneration)
 					return;
-				// alive проверяется после возможного уведомления кеша.
+				if (!current(expected, epoch)) {
+					destinationQueue.clear();
+					model.loading = false;
+					publish();
+					return;
+				}
+				// alive защищает продолжение после уведомления кеша; результат не меняет исход PATCH на Saved.
 				const QPointer<ConfigurationController> alive = &owner;
 				if (!result && result.error && result.error->httpStatus == 404) {
 					retireDestinationIntent(id);
@@ -1068,11 +1122,19 @@ public:
 					retireDestinationIntent(id);
 					cache(*result.value);
 				}
-				if (alive && context == expected && sequence == detailGeneration)
-					QTimer::singleShot(0, &owner, [this, expected, sequence] {
-						if (context == expected && sequence == detailGeneration)
-							nextReconciliation();
-					});
+				// Следующий GET не запускается после смены карточки, контекста либо эпохи из сигнала кеша.
+				if (!alive || context != expected || sequence != detailGeneration)
+					return;
+				if (!current(expected, epoch)) {
+					destinationQueue.clear();
+					model.loading = false;
+					publish();
+					return;
+				}
+				QTimer::singleShot(0, &owner, [this, expected, sequence] {
+					if (context == expected && sequence == detailGeneration)
+						nextReconciliation();
+				});
 			});
 	}
 
@@ -1080,7 +1142,7 @@ public:
 	bool save(bool skipDestinations = false)
 	{
 		if (!available() || model.context != context || model.writing || model.loading || !model.draft ||
-		    model.reconciliationRequired || model.serverConflict || (!model.creating && !model.base))
+		    model.requiresReconciliation() || model.serverConflict || (!model.creating && !model.base))
 			return false;
 		if (!skipDestinations && model.kind == ConfigurationKind::Stream && !model.creating &&
 		    !model.destinationChanges.isEmpty())
@@ -1252,7 +1314,7 @@ public:
 	bool remove()
 	{
 		if (!available() || model.context != context || model.writing || model.loading || model.creating ||
-		    !model.base || model.serverConflict || model.reconciliationRequired)
+		    !model.base || model.serverConflict || model.requiresReconciliation())
 			return false;
 		// revision задаёт серверное предусловие, id адресует запись, kind выбирает коллекцию удаления.
 		const auto revision = record(*model.base).revision;
