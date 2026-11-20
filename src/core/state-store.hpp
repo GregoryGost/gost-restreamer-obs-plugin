@@ -176,6 +176,8 @@ public:
 	void setOperations(OperationsState operations);
 	// Возвращает независимые признаки подтверждения состояния, входа и метрик instanceId.
 	RuntimeEvidence runtimeEvidence(const QString &instanceId) const;
+	// Возвращает подтверждение GPU независимо от других событий; ожидающий SSE снимок ещё не подтверждён.
+	RuntimeAvailability gpuAvailability() const noexcept;
 	// Возвращает последнюю проверку ready; до первого успешного чтения значение отсутствует.
 	const std::optional<api::Health> &ready() const noexcept;
 	// Возвращает последние объявленные возможности сервера либо отсутствие чтения.
@@ -335,6 +337,8 @@ private:
 	QString gpuInstanceId_;
 	// Последняя принятая ревизия GPU; независима от ревизий Session/Output.
 	std::optional<quint64> gpuRevision_;
+	// Свежесть последнего принятого GPU-снимка; восстановление транспорта само её не возвращает.
+	RuntimeAvailability gpuAvailability_ = RuntimeAvailability::Unknown;
 	// Последний успешный ответ проверки ready.
 	std::optional<api::Health> ready_;
 	// Последний успешный ответ capabilities.

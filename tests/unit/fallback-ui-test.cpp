@@ -36,6 +36,8 @@ private slots:
 	void stagesAndDigitalSilenceRemainDistinct();
 	// Невидимая копия policy не перенаправляет общий контроллер и рабочий выбор Dock.
 	void onlyActivePolicyEditorControlsTarget();
+	// Обновление сразу отзывает допуск подготовки, пока адресный GET не подтвердит свежую карточку.
+	void refreshRevokesPreparationUntilAssetReply();
 	// Закрытие и переходы сохраняют RAM-файл/ввод и не прерывают принятую подготовку.
 	void navigationAndClosePreserveWorkflow();
 	// Задаёт локали полного структурного просмотра рецепта опубликованного варианта.
@@ -229,6 +231,63 @@ void FallbackUiTest::onlyActivePolicyEditorControlsTarget()
 	QCOMPARE(test.rig.state.fallback().policy.streamId, QStringLiteral("other-stream"));
 	QCOMPARE(test.rig.state.selectedStreamId(), QStringLiteral("stream"));
 	QVERIFY(test.rig.mutations().isEmpty());
+}
+
+// Проверяет согласованность публичной свежести, допуска контроллера и кнопки до ответа Asset и после него.
+void FallbackUiTest::refreshRevokesPreparationUntilAssetReply()
+{
+	// held сохраняет точный запрос без ответа и живёт дольше перехватчика внутри test.
+	std::optional<HttpServer::Request> held;
+	// test соединяет настоящий контроллер и StateStore с собственным петлевым сервером.
+	FallbackRig test;
+	QVERIFY(test.initialize());
+	QTRY_VERIFY_WITH_TIMEOUT(test.rig.state.fallback().assetsStatus.complete && !test.rig.state.fallback().loading,
+				 1500);
+	QVERIFY(test.fallback.selectAsset(QStringLiteral("asset")));
+	QTRY_VERIFY_WITH_TIMEOUT(test.fallback.canPrepare() && !test.rig.state.fallback().loading &&
+					 test.rig.state.fallback().current.variantsStatus.complete,
+				 1500);
+	QVERIFY(test.rig.state.fallback().assetFresh);
+	QVERIFY(test.rig.state.fallback().policy.streamId.isEmpty());
+	// text возвращает ключ key без перевода: тест адресует кнопку по objectName, а не по её подписи.
+	const auto text = [](const char *key) {
+		return QString::fromUtf8(key);
+	};
+	// editor остаётся пассивным и не открывает policy target, чья публикация могла бы скрыть пропуск уведомления.
+	FallbackEditor editor(test.rig.state, test.fallback, text);
+	// rebuild показывает реальный доступ к подготовке, установленный последним уведомлением StateStore.
+	auto *rebuild = editor.findChild<QPushButton *>(QStringLiteral("fallbackRebuild"));
+	QVERIFY(rebuild);
+	QVERIFY(rebuild->isEnabled());
+	// Перехватчик удерживает только следующий точный GET Asset; request содержит пришедший HTTP-запрос.
+	test.intercept = [&held](const HttpServer::Request &request) {
+		if (!held && request.method == "GET" && request.target == "/api/v1/fallback-assets/asset") {
+			held = request;
+			return true;
+		}
+		return false;
+	};
+	test.fallback.refresh();
+	// Здесь нет обработки событий: ни ответ GET, ни другая публикация не успеют исправить устаревшую кнопку.
+	QVERIFY(!test.rig.state.fallback().assetFresh);
+	QVERIFY(!test.fallback.canPrepare());
+	QVERIFY(!rebuild->isEnabled());
+	QVERIFY(!test.fallback.rebuild());
+	QTRY_VERIFY_WITH_TIMEOUT(held.has_value(), 1500);
+	QVERIFY(held->socket);
+	QVERIFY(!test.rig.state.fallback().assetFresh);
+	QVERIFY(!rebuild->isEnabled());
+	QVERIFY(test.rig.mutations().isEmpty());
+	// Новая серверная revision отличает завершившийся GET от случайного возврата прежнего допуска.
+	test.asset.insert(QStringLiteral("revision"), 2);
+	HttpServer::reply(*held, fixture::bytes(test.asset));
+	QTRY_VERIFY_WITH_TIMEOUT(
+		test.rig.state.fallback().assetFresh && test.fallback.canPrepare() && rebuild->isEnabled(), 1500);
+	QVERIFY(test.rig.state.fallback().asset.has_value());
+	QCOMPARE(test.rig.state.fallback().asset->revision, quint64(2));
+	QVERIFY(test.rig.state.fallback().policy.streamId.isEmpty());
+	QVERIFY(test.rig.mutations().isEmpty());
+	QCOMPARE(test.rig.frontend.stopRequests, 0);
 }
 
 void FallbackUiTest::navigationAndClosePreserveWorkflow()

@@ -99,15 +99,20 @@ runs:
     - name: Run Windows Packaging
       if: runner.os == 'Windows'
       shell: pwsh
+      working-directory: ${{ inputs.workingDirectory }}
       run: |
-        # Run Windows Packaging
+        # Упаковывает только staging выбранной конфигурации после offline-проверки.
         if ( $Env:RUNNER_DEBUG -ne $null ) {
           Set-PSDebug -Trace 1
         }
 
+        # PackageArgs явно связывает ZIP с staging и каталогом сборки той же конфигурации.
         $PackageArgs = @{
           Target = '${{ inputs.target }}'
           Configuration = '${{ inputs.config }}'
+          StageDirectory = 'release/${{ inputs.config }}'
+          BuildDirectory = 'build_x64'
+          OutputDirectory = 'release'
         }
 
         .github/scripts/Package-Windows.ps1 @PackageArgs

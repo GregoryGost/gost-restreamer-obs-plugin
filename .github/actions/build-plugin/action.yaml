@@ -76,12 +76,14 @@ runs:
     - name: Run Windows Build
       if: runner.os == 'Windows'
       shell: pwsh
+      working-directory: ${{ inputs.workingDirectory }}
       run: |
-        # Run Windows Build
+        # Собирает и проверяет одну конфигурацию перед установкой в staging.
         if ( $Env:RUNNER_DEBUG -ne $null ) {
           Set-PSDebug -Trace 1
         }
 
+        # BuildArgs сохраняет архитектуру и конфигурацию одинаковыми для build/test/install.
         $BuildArgs = @{
           Target = '${{ inputs.target }}'
           Configuration = '${{ inputs.config }}'

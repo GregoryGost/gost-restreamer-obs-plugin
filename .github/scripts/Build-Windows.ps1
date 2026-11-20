@@ -1,86 +1,50 @@
+<#
+Собирает Windows, выполняет offline-тесты и устанавливает плагин только после
+их успеха. Target задаёт архитектуру, Configuration — общую конфигурацию
+сборки, тестов и установки в release/<Configuration> внутри workspace.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet('x64')]
     [string] $Target = 'x64',
-    [ValidateSet('Debug', 'RelWithDebInfo', 'Release', 'MinSizeRel')]
+    [ValidateSet('RelWithDebInfo', 'Release')]
     [string] $Configuration = 'RelWithDebInfo'
 )
 
+# ErrorActionPreference прекращает цепочку при первой ошибке PowerShell.
 $ErrorActionPreference = 'Stop'
-
-if ( $DebugPreference -eq 'Continue' ) {
-    $VerbosePreference = 'Continue'
-    $InformationPreference = 'Continue'
-}
-
 if ( $env:CI -eq $null ) {
-    throw "Build-Windows.ps1 requires CI environment"
+    throw 'Сценарий сборки предназначен для CI.'
+}
+if ( ![Environment]::Is64BitOperatingSystem -or $PSVersionTable.PSVersion -lt '7.2.0' ) {
+    throw 'Требуются Windows x64 и PowerShell 7.2 или новее.'
 }
 
-if ( ! ( [System.Environment]::Is64BitOperatingSystem ) ) {
-    throw "A 64-bit system is required to build the project."
+# ProjectRoot закрепляет рабочий каталог независимо от места вызова сценария.
+$ProjectRoot = (Resolve-Path -LiteralPath "$PSScriptRoot/../..").Path
+. "$PSScriptRoot/utils.pwsh/Invoke-External.ps1"
+
+Push-Location -LiteralPath $ProjectRoot
+try {
+    # BuildDirectory содержит сборку; TestLogDirectory — отчёты текущего запуска CI.
+    $BuildDirectory = Join-Path $ProjectRoot "build_${Target}"
+    $TestLogDirectory = Join-Path $BuildDirectory 'test-results'
+    # TEMP/TMP configure и тестовых дочерних процессов остаются внутри workspace.
+    $env:TEMP = Join-Path $ProjectRoot 'build/tmp'
+    $env:TMP = $env:TEMP
+    New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+
+    Invoke-External cmake --preset "windows-ci-${Target}"
+    Invoke-External cmake --build --preset "windows-ci-${Target}" --config $Configuration --parallel -- /consoleLoggerParameters:Summary /noLogo
+
+    New-Item -ItemType Directory -Path $TestLogDirectory -Force | Out-Null
+    # Offline preset исключает backend; -C выбирает также Release вместо значения preset.
+    # Пустой URL дополнительно исключает наследование адреса настоящего сервера.
+    $env:GOST_TEST_BACKEND_URL = ''
+    Invoke-External ctest --preset windows-x64-offline -C $Configuration --output-on-failure --no-tests=error --output-junit "$TestLogDirectory/offline.xml" --output-log "$TestLogDirectory/offline.log"
+
+    Invoke-External cmake --install $BuildDirectory --prefix "$ProjectRoot/release/$Configuration" --config $Configuration
 }
-
-if ( $PSVersionTable.PSVersion -lt '7.2.0' ) {
-    Write-Warning 'The obs-studio PowerShell build script requires PowerShell Core 7. Install or upgrade your PowerShell version: https://aka.ms/pscore6'
-    exit 2
+finally {
+    Pop-Location
 }
-
-function Build {
-    trap {
-        Pop-Location -Stack BuildTemp -ErrorAction 'SilentlyContinue'
-        Write-Error $_
-        Log-Group
-        exit 2
-    }
-
-    $ScriptHome = $PSScriptRoot
-    $ProjectRoot = Resolve-Path -Path "$PSScriptRoot/../.."
-
-    $UtilityFunctions = Get-ChildItem -Path $PSScriptRoot/utils.pwsh/*.ps1 -Recurse
-
-    foreach($Utility in $UtilityFunctions) {
-        Write-Debug "Loading $($Utility.FullName)"
-        . $Utility.FullName
-    }
-
-    Push-Location -Stack BuildTemp
-    Ensure-Location $ProjectRoot
-
-    $CmakeArgs = @('--preset', "windows-ci-${Target}")
-    $CmakeBuildArgs = @('--build')
-    $CmakeInstallArgs = @()
-
-    if ( $DebugPreference -eq 'Continue' ) {
-        $CmakeArgs += ('--debug-output')
-        $CmakeBuildArgs += ('--verbose')
-        $CmakeInstallArgs += ('--verbose')
-    }
-
-    $CmakeBuildArgs += @(
-        '--preset', "windows-${Target}"
-        '--config', $Configuration
-        '--parallel'
-        '--', '/consoleLoggerParameters:Summary', '/noLogo'
-    )
-
-    $CmakeInstallArgs += @(
-        '--install', "build_${Target}"
-        '--prefix', "${ProjectRoot}/release/${Configuration}"
-        '--config', $Configuration
-    )
-
-    Log-Group "Configuring ${ProductName}..."
-    Invoke-External cmake @CmakeArgs
-
-    Log-Group "Building ${ProductName}..."
-    Invoke-External cmake @CmakeBuildArgs
-
-    Log-Group "Installing ${ProductName}..."
-    Invoke-External cmake @CmakeInstallArgs
-
-    Pop-Location -Stack BuildTemp
-    Log-Group
-}
-
-Build

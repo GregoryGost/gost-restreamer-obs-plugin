@@ -258,6 +258,7 @@ void FallbackControllerTest::observationBudgetIncludesTerminalReads_data()
 	QTest::newRow("ready-held-final-asset") << true;
 }
 
+// Проверяет общий срок наблюдения на зависших чтениях вариантов и итогового Asset после ready.
 void FallbackControllerTest::observationBudgetIncludesTerminalReads()
 {
 	// holdFinalAsset выбирает шаг после достоверного ready, который не ответит до истечения общего срока.
@@ -267,6 +268,9 @@ void FallbackControllerTest::observationBudgetIncludesTerminalReads()
 	limits.maxActiveRequests = 1;
 	FallbackRig test({500, 5}, limits);
 	QVERIFY(test.initialize());
+	// Независимый precheck командного контроллера читает тот же Asset и мог бы занять перехват
+	// вместо проверяемой цепочки FallbackController; в этом сценарии управление эфиром не используется.
+	test.rig.operations.shutdown();
 	test.rig.configApi.setHttpTimeoutMs(5000);
 	QVERIFY(test.fallback.selectAsset(QStringLiteral("asset")));
 	QTRY_VERIFY(test.rig.state.fallback().assetFresh && test.rig.state.fallback().current.variantsStatus.complete &&

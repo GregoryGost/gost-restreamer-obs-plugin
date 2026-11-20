@@ -1674,6 +1674,21 @@ public:
 			[this, expectedGeneration](bool confirmed) {
 				if (!current(expectedGeneration) || !busy)
 					return;
+				if (!confirmed) {
+					// failure описывает только неподтверждённую часть OBS; серверный результат ещё неизвестен.
+					OperationFailure failure;
+					failure.source = OperationFailureSource::Runtime;
+					failure.context = context;
+					failure.generation = generation;
+					failure.stepIdentity = QStringLiteral("obs-stop/%1").arg(expectedGeneration);
+					failure.reasonKey = QStringLiteral("Operation.ObsStopUnconfirmed");
+					failure.actionKey = QStringLiteral("Operation.ObsStopUnconfirmedAction");
+					// guard защищает продолжение, если синхронный обработчик удалит контроллер или заменит операцию.
+					const QPointer<RestreamController> guard = &owner;
+					emit owner.operationFailed(failure);
+					if (!guard || !current(expectedGeneration) || !busy)
+						return;
+				}
 				model.current->obsOutcome = confirmed ? OperationOutcome::Completed
 								      : OperationOutcome::Unknown;
 				model.current->serverOutcome = OperationOutcome::Pending;

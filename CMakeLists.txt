@@ -87,6 +87,8 @@ target_sources(
     src/ui/restream-dock.hpp
     src/ui/management-window.cpp
     src/ui/management-window.hpp
+    src/ui/diagnostics-page.cpp
+    src/ui/diagnostics-page.hpp
     src/ui/configuration-editor.cpp
     src/ui/configuration-editor.hpp
     src/ui/fallback-editor.cpp

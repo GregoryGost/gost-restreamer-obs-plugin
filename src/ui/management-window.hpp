@@ -73,7 +73,7 @@ private:
 	void changePage(int row);
 	// Отмечает пользовательский ввод дополнительных предпочтений, включая ещё не разобранный текст spinbox.
 	void editAdvancedSettings();
-	// Обновляет диагностику, доступность действий и сообщения форм, сохраняя изменённые черновики.
+	// Обновляет доступность действий и сообщения форм, сохраняя изменённые черновики.
 	void refresh();
 	// stateStore_ предоставляет состояние GUI-потока, text_ переводит подписи.
 	StateStore &stateStore_;
@@ -121,9 +121,6 @@ private:
 	QLabel *settingsMessage_ = nullptr;
 	// advancedSettingsMessage_ показывает подтверждение записи или отказ смысловым цветом текущей темы.
 	StatusLabel *advancedSettingsMessage_ = nullptr;
-	// profile_ показывает имя профиля OBS, streaming_ — наблюдаемое состояние его штатной трансляции в диагностике.
-	QLabel *profile_ = nullptr;
-	StatusLabel *streaming_ = nullptr;
 };
 
 } // namespace gost

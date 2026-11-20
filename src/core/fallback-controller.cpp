@@ -676,6 +676,11 @@ public:
 		const auto expected = context;
 		const auto id = model.selectedAssetId;
 		model.assetFresh = false;
+		// UI должен отозвать подготовку до HTTP. Синхронный обработчик публикации может сменить
+		// карточку, эпоху или удалить владельца; в таком случае прежнее чтение больше не отправляется.
+		if (!publish() || !alive || !receiver || !current(token, epoch, expected, requestContext) ||
+		    model.selectedAssetId != id)
+			return;
 		// Callback не принимает другое ID и не позволяет старому current доказать новую публикацию.
 		api.getAsset(
 			id, receiver,

@@ -306,6 +306,11 @@ RuntimeEvidence StateStore::runtimeEvidence(const QString &instanceId) const
 	const auto found = watermarks_.constFind(instanceId);
 	return pendingAnchor_ || found == watermarks_.cend() ? RuntimeEvidence{} : found->evidence;
 }
+// Скрывает свежесть нового снимка до подтверждения SSE, как runtimeEvidence для остальных осей.
+RuntimeAvailability StateStore::gpuAvailability() const noexcept
+{
+	return pendingAnchor_ ? RuntimeAvailability::Unknown : gpuAvailability_;
+}
 const std::optional<api::Health> &StateStore::ready() const noexcept
 {
 	return ready_;
@@ -431,19 +436,22 @@ void StateStore::setDetails(DetailState details)
 }
 
 // Сохраняет последние значения, отзывая свежесть runtime и независимо прочитанных REST-частей.
+// Отзывает подтверждения после потери связи, сохраняя значения для отображения последней выборки.
 void StateStore::markRuntimeStale()
 {
 	// Сначала даём Dock сохранить последние принятые значения. Если пометить их устаревшими раньше
 	// уведомления, отложенное обновление виджета уже не сможет принять их как последнее свежее измерение.
 	emit runtimeAboutToBecomeStale();
 	markStale(runtime_.availability);
-	if (!pendingAnchor_)
+	if (!pendingAnchor_) {
+		markStale(gpuAvailability_);
 		// lanes содержит независимые подтверждения состояния, входа и метрик одного исполнения.
 		for (auto &lanes : watermarks_) {
 			markStale(lanes.evidence.state);
 			markStale(lanes.evidence.input);
 			markStale(lanes.evidence.metrics);
 		}
+	}
 	// stale отзывает свежесть переданного status, сохраняя известную полноту и значения.
 	auto stale = [](ReadStatus &status) {
 		markStale(status.availability);
@@ -472,6 +480,7 @@ void StateStore::markRuntimeStale()
 	emit serverStateChanged();
 }
 
+// Удаляет оперативное дерево и независимые подтверждения до уведомления потребителей.
 void StateStore::clearRuntime()
 {
 	runtime_ = {};
@@ -479,6 +488,7 @@ void StateStore::clearRuntime()
 	gpuInstanceId_.clear();
 	gpuRevision_.reset();
 	watermarks_.clear();
+	gpuAvailability_ = RuntimeAvailability::Unknown;
 	emit runtimeStateChanged();
 	emit serverStateChanged();
 }
@@ -498,6 +508,7 @@ void StateStore::clearServerState(bool preserveDock)
 	clearRuntime();
 }
 
+// Устанавливает целиком проверенный anchor; awaitSubscription откладывает подтверждение до SSE.
 bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription)
 {
 	// next/watermarks/instances остаются локальными до конца проверки: отказ последнего потомка
@@ -506,13 +517,16 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 	Q_ASSERT(QThread::currentThread() == thread());
 	if (!validIdentity(anchor.cursor))
 		return false;
+	// next содержит кандидат дерева, watermarks — его ревизии, instances обнаруживает повтор исполнения.
 	RuntimeState next;
 	QMap<QString, Watermarks> watermarks;
 	QSet<QString> instances;
+	// addObservation проверяет observation и регистрирует её state без выдуманной ревизии metrics.
 	auto addObservation = [&](const api::Observation &observation) {
 		if (!validIdentity(observation.instanceId) || instances.contains(observation.instanceId))
 			return false;
 		instances.insert(observation.instanceId);
+		// lanes хранит ревизии и подтверждения именно добавляемого исполнения.
 		auto &lanes = watermarks[observation.instanceId];
 		// У ревизии состояния из снимка нет обещания совпадать с ревизией последующего измерения.
 		lanes.state = observation.revision;
@@ -520,6 +534,7 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 			lanes.evidence.state = RuntimeAvailability::Fresh;
 		return true;
 	};
+	// session последовательно проверяется вместе со всеми своими потомками.
 	for (const auto &session : anchor.sessions) {
 		if (!validIdentity(session.sessionId) || next.sessions.contains(session.sessionId))
 			return false;
@@ -527,14 +542,17 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 			if (!addObservation(*session.observation))
 				return false;
 			if (session.input) {
+				// evidence получает независимые подтверждения входа и его измерения из anchor.
 				auto &evidence = watermarks[session.observation->instanceId].evidence;
 				evidence.input = RuntimeAvailability::Fresh;
 				if (session.input->metrics)
 					evidence.metrics = RuntimeAvailability::Fresh;
 			}
 		}
+		// groups проверяет родителя FFmpeg, outputIds исключает два исполнения одного Output в снимке.
 		QSet<QString> groups;
 		QSet<QString> outputIds;
+		// group добавляет проверенное исполнение группы и подтверждение его метрик.
 		for (const auto &group : session.groups) {
 			if (!validIdentity(group.groupId) || !validIdentity(group.profileId) || !addObservation(group))
 				return false;
@@ -542,6 +560,7 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 			if (group.metrics)
 				watermarks[group.instanceId].evidence.metrics = RuntimeAvailability::Fresh;
 		}
+		// output проверяется по конфигурационному ID и общей уникальности instanceId.
 		for (const auto &output : session.outputs) {
 			if (!validIdentity(output.outputId) || outputIds.contains(output.outputId) ||
 			    !addObservation(output))
@@ -550,6 +569,7 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 			if (output.metrics)
 				watermarks[output.instanceId].evidence.metrics = RuntimeAvailability::Fresh;
 		}
+		// ffmpeg должен ссылаться на уже проверенное исполнение группы этой Session.
 		for (const auto &ffmpeg : session.ffmpeg) {
 			if (!groups.contains(ffmpeg.groupInstanceId) || ffmpeg.role.size() > 4096 ||
 			    ffmpeg.role.contains(QChar::Null) || !addObservation(ffmpeg))
@@ -569,11 +589,13 @@ bool StateStore::installAnchor(const api::Anchor &anchor, bool awaitSubscription
 	gpuInstanceId_.clear();
 	gpuRevision_.reset();
 	watermarks_ = std::move(watermarks);
+	gpuAvailability_ = anchor.gpu.hasValue() ? RuntimeAvailability::Fresh : RuntimeAvailability::Unknown;
 	emit runtimeStateChanged();
 	emit serverStateChanged();
 	return true;
 }
 
+// Принимает проверенное event атомарно; dockTopologyChanged сообщает о необходимости REST-перечитывания.
 bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyChanged)
 {
 	// Для Session и её потомков сначала проверяем форму события и принадлежность исполнения.
@@ -597,12 +619,15 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 				runtime_.gpu = {};
 				gpuInstanceId_.clear();
 				gpuRevision_.reset();
+				gpuAvailability_ = RuntimeAvailability::Unknown;
 			}
 		} else if (gpuInstanceId_ != event.observation.instanceId || !gpuRevision_ ||
 			   event.observation.revision > *gpuRevision_) {
 			runtime_.gpu = event.gpu;
 			gpuInstanceId_ = event.observation.instanceId;
 			gpuRevision_ = event.observation.revision;
+			gpuAvailability_ = event.gpu.hasValue() ? RuntimeAvailability::Fresh
+								: RuntimeAvailability::Unknown;
 		}
 		runtime_.cursor = event.cursor;
 		runtime_.availability = RuntimeAvailability::Fresh;
@@ -610,6 +635,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		emit serverStateChanged();
 		return true;
 	}
+	// stateEvent/metricsEvent/inputEvent/attemptEvent/removedEvent выбирают независимый тип изменения.
 	const bool stateEvent = event.kind == QStringLiteral("state");
 	const bool metricsEvent = event.kind == QStringLiteral("metrics");
 	const bool inputEvent = event.kind == QStringLiteral("input");
@@ -618,6 +644,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 	if ((!stateEvent && !metricsEvent && !inputEvent && !attemptEvent && !removedEvent) ||
 	    !validIdentity(event.sessionId) || !validIdentity(event.observation.instanceId))
 		return false;
+	// sessionOwner/groupOwner/outputOwner/ffmpegOwner задают тип адресуемого узла runtime.
 	const bool sessionOwner = event.owner == QStringLiteral("session");
 	const bool groupOwner = event.owner == QStringLiteral("group");
 	const bool outputOwner = event.owner == QStringLiteral("output");
@@ -634,26 +661,31 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		return false;
 	if (stateEvent && event.observation.state.isEmpty())
 		return false;
+	// instance адресует исполнение, а не конфигурационный ID сущности.
 	const auto &instance = event.observation.instanceId;
 	if (ffmpegOwner && event.groupInstanceId == instance)
 		return false;
+	// existingSession проверяется на несовместимое повторное использование instanceId.
 	for (const auto &existingSession : runtime_.sessions) {
 		// Уже известное исполнение не может сменить тип/Session/родителя под тем же instanceId.
 		// Проверка выполняется до создания недостающих узлов, включая временного родителя FFmpeg.
 		if (existingSession.observation && existingSession.observation->instanceId == instance &&
 		    (!sessionOwner || existingSession.sessionId != event.sessionId))
 			return false;
+		// group проверяется на изменение типа, Session или конфигурационного родителя.
 		for (const auto &group : existingSession.groups)
 			if (group.instanceId == instance &&
 			    (!groupOwner || existingSession.sessionId != event.sessionId ||
 			     (!group.groupId.isEmpty() && group.groupId != event.groupId) ||
 			     (!group.profileId.isEmpty() && group.profileId != event.profileId)))
 				return false;
+		// output связывает известное исполнение с прежней Session и Output ID.
 		for (const auto &output : existingSession.outputs)
 			if (output.instanceId == instance &&
 			    (!outputOwner || existingSession.sessionId != event.sessionId ||
 			     output.outputId != event.outputId))
 				return false;
+		// ffmpeg сохраняет прежние Session, группу и роль для известного instanceId.
 		for (const auto &ffmpeg : existingSession.ffmpeg)
 			if (ffmpeg.instanceId == instance &&
 			    (!ffmpegOwner || existingSession.sessionId != event.sessionId ||
@@ -663,50 +695,63 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			if (existingSession.observation &&
 			    existingSession.observation->instanceId == event.groupInstanceId)
 				return false;
+			// existing здесь исключает использование Output как родителя FFmpeg.
 			for (const auto &existing : existingSession.outputs)
 				if (existing.instanceId == event.groupInstanceId)
 					return false;
+			// existing здесь исключает использование другого FFmpeg как родителя.
 			for (const auto &existing : existingSession.ffmpeg)
 				if (existing.instanceId == event.groupInstanceId)
 					return false;
+			// existing здесь проверяет, что группа-родитель относится к той же Session.
 			for (const auto &existing : existingSession.groups)
 				if (existing.instanceId == event.groupInstanceId &&
 				    existingSession.sessionId != event.sessionId)
 					return false;
 		}
 	}
-	// Изменения сессии и её ревизий устанавливаются только после полной проверки события.
+	// session — рабочая копия; её изменения устанавливаются только после полной проверки события.
 	auto session = runtime_.sessions.value(event.sessionId);
 	session.sessionId = event.sessionId;
 	if (groupOwner && !event.groupInstanceId.isEmpty() && session.observation &&
 	    event.groupInstanceId != session.observation->instanceId)
 		return false;
+	// lanes — копия ревизий исполнения, lanesChanged разрешает её публикацию после проверки.
 	auto lanes = watermarks_.value(instance);
 	bool lanesChanged = false;
+	// removed содержит точные исполнения, чьи узлы и границы ревизий удаляются вместе.
 	QSet<QString> removed;
+	// removeSession очищает копию Session и собирает её прежних потомков для удаления ревизий.
 	auto removeSession = [&] {
 		// Удаление или замена исполнения Session также удаляет записи ревизий всех его потомков.
 		if (session.observation)
 			removed.insert(session.observation->instanceId);
+		// group представляет удаляемое исполнение группы.
 		for (const auto &group : session.groups)
 			removed.insert(group.instanceId);
+		// output представляет удаляемое исполнение выхода.
 		for (const auto &output : session.outputs)
 			removed.insert(output.instanceId);
+		// ffmpeg представляет удаляемый дочерний процесс.
 		for (const auto &ffmpeg : session.ffmpeg)
 			removed.insert(ffmpeg.instanceId);
 		session = {};
 		session.sessionId = event.sessionId;
 	};
+	// removeGroup собирает groupInstance и только его дочерние FFmpeg для последующего удаления.
 	auto removeGroup = [&](const QString &groupInstance) {
 		// Удаляется точный экземпляр группы и его FFmpeg, а не все группы с тем же конфигурационным ID.
 		removed.insert(groupInstance);
+		// ffmpeg проверяется на принадлежность удаляемому исполнению группы.
 		for (const auto &ffmpeg : session.ffmpeg)
 			if (ffmpeg.groupInstanceId == groupInstance)
 				removed.insert(ffmpeg.instanceId);
 	};
+	// eraseSession удаляет контейнер, ignored пропускает запись узла, topologyChanged отзывает REST-состав.
 	bool eraseSession = false;
 	bool ignored = false;
 	bool topologyChanged = false;
+	// observation/group/output/ffmpeg заимствуют адреса только из рабочей копии session до её публикации.
 	api::Observation *observation = nullptr;
 	api::RuntimeGroup *group = nullptr;
 	api::RuntimeOutput *output = nullptr;
@@ -725,6 +770,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			if (session.observation && session.observation->instanceId != instance)
 				removeSession();
 			if (!session.observation) {
+				// unknown содержит лишь доказанную идентичность новой Session до применения события.
 				api::Observation unknown;
 				unknown.instanceId = instance;
 				session.observation = present(std::move(unknown));
@@ -733,6 +779,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			observation = &*session.observation;
 		}
 	} else if (groupOwner) {
+		// found указывает на прежнее исполнение группы либо конец её списка.
 		auto found = findInstance(session.groups, instance);
 		if (removedEvent) {
 			if (found != session.groups.end()) {
@@ -742,6 +789,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			ignored = true;
 		} else {
 			if (found == session.groups.end()) {
+				// unknown временно представляет новую группу до заполнения её состояния.
 				api::RuntimeGroup unknown;
 				unknown.instanceId = instance;
 				session.groups.push_back(std::move(unknown));
@@ -753,6 +801,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			observation = group;
 		}
 	} else if (outputOwner) {
+		// found ищет точное исполнение выхода, независимо от совпадения Output ID.
 		auto found = findInstance(session.outputs, instance);
 		if (removedEvent) {
 			if (found != session.outputs.end()) {
@@ -763,10 +812,12 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		} else {
 			if (found == session.outputs.end()) {
 				// Новое исполнение того же Output вытесняет старое вместе с его ревизиями и подтверждениями свежести.
+				// old выявляет вытесняемые исполнения того же Output ID.
 				for (const auto &old : session.outputs)
 					if (old.outputId == event.outputId)
 						removed.insert(old.instanceId);
 				eraseInstances(session.outputs, removed);
+				// unknown начинает новое исполнение без унаследованных метрик старого выхода.
 				api::RuntimeOutput unknown;
 				unknown.instanceId = instance;
 				unknown.outputId = event.outputId;
@@ -777,20 +828,24 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 			observation = output;
 		}
 	} else {
+		// found ищет точное исполнение FFmpeg внутри рабочей копии.
 		auto found = findInstance(session.ffmpeg, instance);
 		if (removedEvent) {
 			if (found != session.ffmpeg.end())
 				removed.insert(instance);
 			ignored = true;
 		} else {
+			// parent проверяет наличие группы-родителя перед созданием временного узла.
 			auto parent = findInstance(session.groups, event.groupInstanceId);
 			if (parent == session.groups.end()) {
 				// Событие дочернего FFmpeg может прийти раньше родителя; известен только ID экземпляра группы.
+				// unknown содержит только доказанный ID родителя, пока событие группы не принято.
 				api::RuntimeGroup unknown;
 				unknown.instanceId = event.groupInstanceId;
 				session.groups.push_back(std::move(unknown));
 			}
 			if (found == session.ffmpeg.end()) {
+				// unknown содержит идентичность, родителя и роль нового исполнения FFmpeg.
 				api::RuntimeFFmpeg unknown;
 				unknown.instanceId = instance;
 				unknown.groupInstanceId = event.groupInstanceId;
@@ -856,7 +911,9 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 	eraseInstances(session.groups, removed);
 	eraseInstances(session.outputs, removed);
 	eraseInstances(session.ffmpeg, removed);
+	// count проверяет общий бюджет узлов с учётом заменяемой копии session.
 	qsizetype count = eraseSession ? 0 : observationCount(session);
+	// existingSession добавляет узлы остальных, не затронутых событием сессий.
 	for (const auto &existingSession : runtime_.sessions)
 		if (existingSession.sessionId != event.sessionId)
 			count += observationCount(existingSession);
@@ -867,6 +924,7 @@ bool StateStore::applyEvent(const api::RuntimeEvent &event, bool *dockTopologyCh
 		runtime_.sessions.remove(event.sessionId);
 	else if (!ignored || runtime_.sessions.contains(event.sessionId))
 		runtime_.sessions.insert(event.sessionId, std::move(session));
+	// id адресует границу ревизий уже удалённого исполнения.
 	for (const auto &id : removed)
 		watermarks_.remove(id);
 	if (lanesChanged)

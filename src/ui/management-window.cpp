@@ -6,6 +6,7 @@
 #include "core/configuration-controller.hpp"
 #include "ui/configuration-editor.hpp"
 #include "ui/fallback-editor.hpp"
+#include "ui/diagnostics-page.hpp"
 #include "ui/status-label.hpp"
 
 #include <QApplication>
@@ -225,28 +226,16 @@ ManagementWindow::ManagementWindow(StateStore &stateStore, TextLookup text, QWid
 	}
 	addPage("Page.Fallback", fallbackPage, "sources/image.svg", QStyle::SP_FileIcon);
 
-	// diagnostics содержит локальные наблюдения OBS и сообщение о границах диагностики.
-	auto *diagnostics = new QWidget(pages);
-	// diagnosticsLayout размещает наблюдения и существующее пояснение диагностики.
-	auto *diagnosticsLayout = new QVBoxLayout(diagnostics);
-	// observations выравнивает профиль и состояние OBS с переносом длинных подписей.
-	auto *observations = new QFormLayout;
-	observations->setRowWrapPolicy(QFormLayout::WrapLongRows);
-	profile_ = new QLabel(diagnostics);
-	profile_->setObjectName(QStringLiteral("obsProfile"));
-	profile_->setTextFormat(Qt::PlainText);
-	profile_->setWordWrap(true);
-	observations->addRow(text_("OBS.Profile"), profile_);
-	streaming_ = new StatusLabel(diagnostics);
-	streaming_->setObjectName(QStringLiteral("obsStreaming"));
-	observations->addRow(text_("OBS.Streaming"), streaming_);
-	diagnosticsLayout->addLayout(observations);
-	// notice поясняет доступные сейчас сведения диагностики.
-	auto *notice = new QLabel(text_("Page.Diagnostics.NotAvailable"), diagnostics);
-	notice->setWordWrap(true);
-	diagnosticsLayout->addWidget(notice);
-	diagnosticsLayout->addStretch();
-	addPage("Page.Diagnostics", diagnostics, "sources/window.svg", QStyle::SP_FileDialogDetailedView);
+	// diagnostics показывает только текущий эфир из общего состояния без дополнительных запросов.
+	auto *diagnostics = new DiagnosticsPage(stateStore_, text_, pages);
+	// diagnosticsScroll сохраняет доступ ко всем источникам наблюдений при небольшом размере окна.
+	auto *diagnosticsScroll = new QScrollArea(pages);
+	diagnosticsScroll->setObjectName(QStringLiteral("diagnosticsScroll"));
+	diagnosticsScroll->setFrameShape(QFrame::NoFrame);
+	diagnosticsScroll->setWidgetResizable(true);
+	diagnosticsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	diagnosticsScroll->setWidget(diagnostics);
+	addPage("Page.Diagnostics", diagnosticsScroll, "sources/window.svg", QStyle::SP_FileDialogDetailedView);
 	// settingsPage содержит черновик адреса API и явные действия сохранения/отмены.
 	auto *settingsPage = new QWidget(pages);
 	// settingsLayout размещает форму адреса, кнопки и локальные сообщения о её сохранении.
@@ -544,14 +533,10 @@ void ManagementWindow::editAdvancedSettings()
 	refresh();
 }
 
-// Отражает диагностику и доступность форм без обратного сохранения через сигналы виджетов.
+// Отражает доступность форм без обратного сохранения через сигналы виджетов.
 // Черновики адреса и дополнительных предпочтений сохраняются при любых обновлениях состояния.
 void ManagementWindow::refresh()
 {
-	// profile содержит последнее доступное имя профиля OBS.
-	const auto &profile = stateStore_.profileName();
-	profile_->setText(profile && !profile->isEmpty() ? *profile : text_("Observation.NoData"));
-	streaming_->setStreamingStatus(text_, stateStore_.streamingActive());
 	if (!advancedSettingsDirty_) {
 		// blockSseRetries, blockTimeout и blockLog не превращают отражение рабочих значений в новый ввод.
 		const QSignalBlocker blockSseRetries(sseRejectionRetries_);

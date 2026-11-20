@@ -862,6 +862,12 @@ private slots:
 	void stopAllKeepsObsAndServerResultsSeparate_data();
 	// Сопоставляет подтверждение OBS, server stop и появление следующей Session.
 	void stopAllKeepsObsAndServerResultsSeparate();
+	// Задаёт синхронную смену контекста, shutdown и уничтожение из обработчика отказа OBS.
+	void stopAllObsFailureCallbackCannotContinueInvalidatedIntent_data();
+	// После отзыва намерения уведомлением не посылает старую серверную команду.
+	void stopAllObsFailureCallbackCannotContinueInvalidatedIntent();
+	// Локальный отказ OBS не подавляет самостоятельный HTTP-отказ остановки исходной Session.
+	void stopAllObsAndServerFailuresNotifyIndependently();
 	// Полная проверка использует current и все страницы вариантов; start передаёт фиксированный непустой список.
 	void fallbackPrecheckAndStart();
 	// Пустые назначения и различия полного профиля запрещают предварительный запуск.
@@ -1448,6 +1454,7 @@ void RestreamOperationsTest::sessionChangeFreezesBatch()
 	QCOMPARE(rig.state.operations().current->sessionId, QStringLiteral("session"));
 }
 
+// Задаёт подтверждение остановки OBS и независимое появление следующей Session.
 void RestreamOperationsTest::stopAllKeepsObsAndServerResultsSeparate_data()
 {
 	QTest::addColumn<bool>("obsConfirmed");
@@ -1455,27 +1462,34 @@ void RestreamOperationsTest::stopAllKeepsObsAndServerResultsSeparate_data()
 	QTest::newRow("both-confirmed") << true << false;
 	QTest::newRow("obs-refused") << false << false;
 	QTest::newRow("new-session") << true << true;
+	QTest::newRow("obs-refused-new-session") << false << true;
 }
 
+// Проверяет отдельные итоги OBS/Session и единственное уведомление о неподтверждённой локальной остановке.
 void RestreamOperationsTest::stopAllKeepsObsAndServerResultsSeparate()
 {
 	// obsConfirmed задаёт возможность отдельно подтвердить локальную остановку OBS.
 	QFETCH(bool, obsConfirmed);
 	// nextSession задаёт обнаружение следующего эфира во время завершения исходного.
 	QFETCH(bool, nextSession);
-	// Локальная и серверная части подтверждаются независимо; следующая Session не является целью старого stop.
+	// rig предоставляет независимые наблюдения OBS и Session; следующая Session не является целью прежней команды остановки.
 	OperationRig rig;
 	QVERIFY(rig.initialize());
+	// expected сохраняет адрес исходного пользовательского намерения для проверки получателя уведомления.
+	const auto expected = rig.context();
+	// failures принимает однократный отказ OBS; успешная остановка Session не должна скрывать его.
+	QSignalSpy failures(&rig.operations, &RestreamController::operationFailed);
+	QVERIFY(failures.isValid());
 	rig.frontend.streaming = true;
 	rig.obs.handleEvent(FrontendEvent::StreamingStarting);
 	rig.obs.handleEvent(FrontendEvent::StreamingStarted);
-	// Callback адаптера отдельно доставляет Stopped, когда остановка действительно разрешена сценарием.
+	// Обработчик остановки адаптера доставляет Stopped, только когда сценарий подтверждает остановку.
 	if (obsConfirmed)
 		rig.frontend.onStopRequest = [&] {
 			rig.frontend.streaming = false;
 			rig.obs.handleEvent(FrontendEvent::StreamingStopped);
 		};
-	// Наблюдатель может обнаружить следующий эфир во время чтения принятой старой квитанции.
+	// Перехватчик request обнаруживает следующий эфир при чтении квитанции старой команды.
 	if (nextSession)
 		rig.intercept = [&](const auto &request) {
 			if (request.target.startsWith("/api/v1/commands/")) {
@@ -1487,7 +1501,7 @@ void RestreamOperationsTest::stopAllKeepsObsAndServerResultsSeparate()
 			}
 			return false;
 		};
-	QVERIFY(rig.operations.stopAll(rig.context(), QStringLiteral("session")));
+	QVERIFY(rig.operations.stopAll(expected, QStringLiteral("session")));
 	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
 	QCOMPARE(rig.frontend.stopRequests, 1);
 	QCOMPARE(rig.posts().size(), 1);
@@ -1496,19 +1510,170 @@ void RestreamOperationsTest::stopAllKeepsObsAndServerResultsSeparate()
 	QCOMPARE(rig.state.operations().current->obsOutcome == OperationOutcome::Completed, obsConfirmed);
 	QCOMPARE(rig.state.operations().current->outcome == OperationOutcome::Completed, obsConfirmed && !nextSession);
 	QCOMPARE(rig.frontend.streaming, !obsConfirmed);
+	QCOMPARE(rig.state.operations().current->sessionId, QStringLiteral("session"));
+	QCOMPARE(failures.size(), obsConfirmed ? 0 : 1);
+	if (!obsConfirmed) {
+		QCOMPARE(rig.state.operations().current->obsOutcome, OperationOutcome::Unknown);
+		QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Unknown);
+		// failure описывает только локальное отсутствие подтверждения и сохраняет исходный контекст.
+		const auto failure = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+		QCOMPARE(failure.source, OperationFailureSource::Runtime);
+		QCOMPARE(failure.context, expected);
+		QCOMPARE(failure.generation, rig.state.operations().current->generation);
+		QVERIFY(failure.generation > 0);
+		QVERIFY(!failure.stepIdentity.isEmpty());
+		QVERIFY(!failure.reasonKey.isEmpty());
+		QVERIFY(!failure.actionKey.isEmpty());
+		QVERIFY(failure.reason.isEmpty());
+		QVERIFY(failure.action.isEmpty());
+		QVERIFY(failure.diagnosticBody.isEmpty());
+	}
+	// Перепубликация результата и наблюдений не является новым отказом пользовательского действия.
+	rig.state.setOperations(rig.state.operations());
+	rig.state.setDockServer(rig.state.dockServer());
+	QCoreApplication::processEvents();
+	QCOMPARE(failures.size(), obsConfirmed ? 0 : 1);
+	QCOMPARE(rig.posts().size(), 1);
 	if (nextSession)
 		QCOMPARE(rig.state.dockServer().session->id, QStringLiteral("next-session"));
 }
 
+// Выбирает способ отзыва исходного намерения прямо во время синхронной доставки отказа OBS.
+void RestreamOperationsTest::stopAllObsFailureCallbackCannotContinueInvalidatedIntent_data()
+{
+	QTest::addColumn<QString>("invalidation");
+	QTest::newRow("context-change") << QStringLiteral("context");
+	QTest::newRow("shutdown") << QStringLiteral("shutdown");
+	QTest::newRow("destroy-controller") << QStringLiteral("destroy");
+}
+
+// Проверяет время жизни продолжения после уведомления: смена выбора или завершение владельца запрещают POST.
+void RestreamOperationsTest::stopAllObsFailureCallbackCannotContinueInvalidatedIntent()
+{
+	// invalidation выбирает синхронное действие получателя уведомления.
+	QFETCH(QString, invalidation);
+	// rig сохраняет транспорт, OBS и модель живыми даже при удалении отдельного координатора.
+	OperationRig rig;
+	QVERIFY(rig.initialize());
+	rig.operations.shutdown();
+	// controller принадлежит тесту; обработчик destroy удаляет его до возврата из operationFailed.
+	auto controller = std::make_unique<RestreamController>(rig.state, rig.command, rig.connection, rig.obs,
+							       RestreamController::Limits{300, 5, 30});
+	// expected фиксирует контекст до того, как получатель может выбрать другой Stream.
+	const auto expected = rig.context();
+	// failures сохраняет содержимое уведомления раньше обработчика, который может уничтожить отправителя.
+	QSignalSpy failures(controller.get(), &RestreamController::operationFailed);
+	QVERIFY(failures.isValid());
+	rig.frontend.streaming = true;
+	rig.obs.handleEvent(FrontendEvent::StreamingStarting);
+	rig.obs.handleEvent(FrontendEvent::StreamingStarted);
+	// Получатель отзывает текущее намерение синхронно; продолжение не вправе обращаться к удалённым данным.
+	QObject::connect(controller.get(), &RestreamController::operationFailed, this, [&] {
+		if (invalidation == QStringLiteral("context"))
+			rig.state.setSelection(QStringLiteral("other-stream"), true, {}, {},
+					       QStringLiteral("profile-uuid"));
+		else if (invalidation == QStringLiteral("shutdown"))
+			controller->shutdown();
+		else
+			controller.reset();
+	});
+	QVERIFY(controller->stopAll(expected, QStringLiteral("session")));
+	QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, 1000);
+	// failure должен принадлежать исходному намерению, даже когда обработчик уже отозвал его контекст.
+	const auto failure = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	QCOMPARE(failure.source, OperationFailureSource::Runtime);
+	QCOMPARE(failure.context, expected);
+	QVERIFY(failure.generation > 0);
+	QVERIFY(!failure.reasonKey.isEmpty());
+	QVERIFY(!failure.actionKey.isEmpty());
+	QCOMPARE(rig.frontend.stopRequests, 1);
+	QVERIFY(rig.frontend.streaming);
+	if (invalidation == QStringLiteral("context"))
+		QCOMPARE(rig.context().streamId, QStringLiteral("other-stream"));
+	if (invalidation == QStringLiteral("destroy"))
+		QVERIFY(!controller);
+	else
+		QVERIFY(!controller->stopAll(expected, QStringLiteral("session")));
+	// probeFinished отмечает завершённый HTTP-запрос после уведомления; его результат не влияет на старое намерение.
+	bool probeFinished = false;
+	// Обработчик пробного GET только подтверждает прохождение сетевого цикла Qt после отзыва намерения.
+	rig.command.getLive(this, [&](auto, auto) { probeFinished = true; });
+	QTRY_VERIFY_WITH_TIMEOUT(probeFinished, 1000);
+	QCOMPARE(rig.posts().size(), 0);
+	QCOMPARE(failures.size(), 1);
+}
+
+// Проверяет две самостоятельные причины одного Stop All: неизвестную остановку OBS и отказ серверной остановки.
+void RestreamOperationsTest::stopAllObsAndServerFailuresNotifyIndependently()
+{
+	// rig оставляет OBS активной и позволяет серверу явно отклонить единственную stop-команду.
+	OperationRig rig;
+	QVERIFY(rig.initialize());
+	// expected сохраняет контекст, общий для локальной и серверной частей намерения.
+	const auto expected = rig.context();
+	// failures различает локальное уведомление и поздний HTTP-отказ по содержимому уведомлений и идентичности шага.
+	QSignalSpy failures(&rig.operations, &RestreamController::operationFailed);
+	QVERIFY(failures.isValid());
+	rig.frontend.streaming = true;
+	rig.obs.handleEvent(FrontendEvent::StreamingStarting);
+	rig.obs.handleEvent(FrontendEvent::StreamingStarted);
+	// Перехватчик request отклоняет только POST исходной Session, не подменяя локальный результат OBS.
+	rig.intercept = [&](const HttpServer::Request &request) {
+		if (request.method != "POST")
+			return false;
+		HttpServer::reply(
+			request,
+			R"({"status":503,"code":"service_unavailable","detail":"Stop rejected","action":"Check server","context":{"session_id":"session"}})",
+			503, "application/problem+json");
+		return true;
+	};
+	QVERIFY(rig.operations.stopAll(expected, QStringLiteral("session")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
+	QCOMPARE(rig.posts().size(), 1);
+	QCOMPARE(rig.posts().first().target, QByteArray("/api/v1/sessions/session/stop"));
+	QCOMPARE(rig.frontend.stopRequests, 1);
+	QVERIFY(rig.frontend.streaming);
+	QCOMPARE(rig.state.operations().current->obsOutcome, OperationOutcome::Unknown);
+	QCOMPARE(rig.state.operations().current->serverOutcome, OperationOutcome::Failed);
+	QVERIFY(rig.state.operations().current->outcome != OperationOutcome::Completed);
+	QCOMPARE(failures.size(), 2);
+	// localFailure описывает отсутствие подтверждения OBS; serverFailure содержит точный ответ отказа POST.
+	const auto localFailure = qvariant_cast<OperationFailure>(failures.at(0).at(0));
+	const auto serverFailure = qvariant_cast<OperationFailure>(failures.at(1).at(0));
+	QCOMPARE(localFailure.source, OperationFailureSource::Runtime);
+	QCOMPARE(serverFailure.source, OperationFailureSource::Runtime);
+	QCOMPARE(localFailure.context, expected);
+	QCOMPARE(serverFailure.context, expected);
+	QVERIFY(localFailure.generation > 0);
+	QCOMPARE(localFailure.generation, serverFailure.generation);
+	QVERIFY(!localFailure.stepIdentity.isEmpty());
+	QVERIFY(!serverFailure.stepIdentity.isEmpty());
+	QVERIFY(localFailure.stepIdentity != serverFailure.stepIdentity);
+	QVERIFY(!localFailure.reasonKey.isEmpty());
+	QVERIFY(!localFailure.actionKey.isEmpty());
+	QCOMPARE(serverFailure.code, QStringLiteral("service_unavailable"));
+	QCOMPARE(serverFailure.reason, QStringLiteral("Stop rejected"));
+	QCOMPARE(serverFailure.action, QStringLiteral("Check server"));
+	QCOMPARE(serverFailure.ids.value(QStringLiteral("session_id")), QStringLiteral("session"));
+	// Повторная публикация модели не создаёт третий отказ уже завершённых частей.
+	rig.state.setOperations(rig.state.operations());
+	QCoreApplication::processEvents();
+	QCOMPARE(failures.size(), 2);
+	QCOMPARE(rig.posts().size(), 1);
+}
+
+// Проверяет полный постраничный обход и запуск только одобренного текущего поколения.
 void RestreamOperationsTest::fallbackPrecheckAndStart()
 {
-	// Начальная Fresh+complete пустота позволяет только явный предварительный запуск; подходящий вариант находится на второй странице.
-	OperationRig rig;
+	// rig задаёт Fresh+complete отсутствие Session и секунду на восемь последовательных GET.
+	// Это проверка полного успешного обхода; короткие сроки отказов задаются отдельными сценариями.
+	OperationRig rig({1000, 5, 30});
 	QVERIFY(rig.initialize(false));
 	rig.paginateVariants = true;
 	QVERIFY(rig.operations.checkFallback(rig.context()));
 	QTRY_VERIFY_WITH_TIMEOUT(rig.state.operations().fallback.readiness != FallbackReadiness::Checking, 2000);
-	QCOMPARE(rig.state.operations().fallback.readiness, FallbackReadiness::Ready);
+	QVERIFY2(rig.state.operations().fallback.readiness == FallbackReadiness::Ready,
+		 qPrintable(rig.state.operations().fallback.messageKey));
 	QCOMPARE(rig.state.operations().fallback.generationId, QStringLiteral("current"));
 	QVERIFY(rig.state.operations().fallback.rebuildWarning);
 	QCOMPARE(rig.state.operations().fallback.destinations.size(), 1);
