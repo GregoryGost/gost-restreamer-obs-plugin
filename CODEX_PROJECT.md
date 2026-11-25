@@ -137,7 +137,7 @@ bootstrap-правила проверки зависимостей и коорд
 
 - Subagents enabled: yes, для разрешённых изменений исполняемого кода приложения и тестов.
 - Delegation scope: исполняемый код/тесты; задачи только по документации, комментариям, docstrings и инструкциям выполняет основной агент.
-- Primary agent model/effort: `gpt-6.1-sol` / `xhigh`, согласно существующему локальному `.codex/config.toml`.
+- Primary agent model/effort: `gpt-6.2-sol` / `xhigh`, согласно существующему локальному `.codex/config.toml`.
 - Ограничение локальной конфигурации: 4 одновременно открытых потока субагентов, без основного потока.
 - Формат: отдельные `.codex/agents/*.toml` с `name`, `description`, `developer_instructions`, моделью и effort. MCP и разрешения наследуются от родителя; инструкции read-only не создают отдельную техническую песочницу.
 - Доступность моделей и загрузку ролей проверять в конкретной сессии Codex; TOML-валидация не доказывает доступность аккаунта. Недоступные роли/модели не заменять молча.
@@ -149,15 +149,15 @@ Selected role files:
 
 | Роль | Файл | Модель | Effort |
 | --- | --- | --- | --- |
-| Архитектура: стабильность и совместимость | `.codex/agents/architect_stability.toml` | `gpt-6.1-sol` | `xhigh` |
-| Архитектура: целостность и развитие | `.codex/agents/architect_evolution.toml` | `gpt-6.1-sol` | `xhigh` |
+| Архитектура: стабильность и совместимость | `.codex/agents/architect_stability.toml` | `gpt-6.2-sol` | `xhigh` |
+| Архитектура: целостность и развитие | `.codex/agents/architect_evolution.toml` | `gpt-6.2-sol` | `xhigh` |
 | Исследование кода | `.codex/agents/code_explorer.toml` | `gpt-6-luna` | `high` |
 | Исследование документации/API | `.codex/agents/docs_researcher.toml` | `gpt-6-luna` | `high` |
-| Сложная реализация | `.codex/agents/complex_implementer.toml` | `gpt-6.1-sol` | `high` |
+| Сложная реализация | `.codex/agents/complex_implementer.toml` | `gpt-6.2-sol` | `high` |
 | Небольшие исправления | `.codex/agents/simple_implementer.toml` | `gpt-6-luna` | `high` |
-| Независимые тесты | `.codex/agents/test_engineer.toml` | `gpt-6.1-sol` | `high` |
-| Независимое ревью | `.codex/agents/code_reviewer.toml` | `gpt-6.1-sol` | `high` |
-| Сложная диагностика | `.codex/agents/deep_debugger.toml` | `gpt-6-astra` | `xhigh` |
+| Независимые тесты | `.codex/agents/test_engineer.toml` | `gpt-6.2-sol` | `high` |
+| Независимое ревью | `.codex/agents/code_reviewer.toml` | `gpt-6.2-sol` | `high` |
+| Сложная диагностика | `.codex/agents/deep_debugger.toml` | `gpt-6.2-astra` | `xhigh` |
 
 `database_architect` не выбран: серверная SQLite и миграции принадлежат backend,
 локальная база данных плагину не требуется. Их изменение не входит в область
@@ -512,6 +512,6 @@ OBS 33: DLL в корне каталога плагина, рядом `data/loca
 ## Imported Materials
 
 - Upstream: `https://github.com/GregoryGost/agent-projects-tools`.
-- Revision: `5d1f446c9baed6ff116fcd4f52042583ae594999` (`v1.21.0`).
+- Revision: `faa2d863d9d76d51f14c90ed5e433b5c2b921bef` (`v1.21.1`).
 - Переносимые rules/skills/roles подключены выборочно; `AGENTS.md` и общие правила адаптированы к целевому проекту.
 - Локальный `.codex/config.toml` остаётся вне Git; `.codex/config.example.toml` содержит воспроизводимый пример без секретов.

@@ -1,0 +1,2 @@
+# Контрактный тест сверяет SHA256 исходных байтов схемы OpenAPI.
+tests/fixtures/backend/openapi.json -text
