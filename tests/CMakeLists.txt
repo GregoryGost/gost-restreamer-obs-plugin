@@ -3,7 +3,10 @@ add_executable(gost-restreamer-lifecycle-test unit/plugin-lifecycle-test.cpp fix
 target_link_libraries(gost-restreamer-lifecycle-test PRIVATE gost-restreamer-core Qt6::Test)
 target_include_directories(gost-restreamer-lifecycle-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 set_target_properties(gost-restreamer-lifecycle-test PROPERTIES AUTOMOC ON CXX_EXTENSIONS OFF)
-add_test(NAME gost-restreamer.lifecycle COMMAND gost-restreamer-lifecycle-test)
+add_test(
+  NAME gost-restreamer.lifecycle
+  COMMAND gost-restreamer-lifecycle-test -v1 -o -,txt -o "../test-results/lifecycle-$<CONFIG>.txt,txt"
+)
 set_tests_properties(
   gost-restreamer.lifecycle
   PROPERTIES
@@ -29,8 +32,8 @@ file(MAKE_DIRECTORY "${GOST_TEST_WORKSPACE_DIR}" "${PROJECT_SOURCE_DIR}/build/tm
 # CI выгружает этот каталог даже при сбое тестов. Пути для Qt Test заданы относительно рабочего каталога CTest.
 file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/test-results")
 
-# Регистрирует отдельный процесс Qt Test для сценариев, которые выполняются без настоящего backend.
-# name задаёт имена исполняемого файла и теста CTest, source — файл сценария, ARGN — аргументы Qt Test.
+# Регистрирует отдельный процесс Qt Test с собственным журналом для сценариев без настоящего backend.
+# name задаёт имена исполняемого файла, теста CTest и журнала, source указывает файл сценария.
 function(gost_add_offline_test name source)
   # Каждый тест запускается отдельным процессом: глобальные прокси и палитра Qt не разделяются между ними.
   # Таймаут ограничивает зависание сценария, но не является порогом производительности продукта.
@@ -38,11 +41,14 @@ function(gost_add_offline_test name source)
   target_link_libraries(gost-restreamer-${name}-test PRIVATE gost-restreamer-core Qt6::Test)
   target_include_directories(gost-restreamer-${name}-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   set_target_properties(gost-restreamer-${name}-test PROPERTIES AUTOMOC ON CXX_EXTENSIONS OFF)
-  add_test(NAME gost-restreamer.${name} COMMAND gost-restreamer-${name}-test ${ARGN})
+  add_test(
+    NAME gost-restreamer.${name}
+    COMMAND gost-restreamer-${name}-test -v1 -o -,txt -o "../test-results/${name}-$<CONFIG>.txt,txt"
+  )
   set_tests_properties(gost-restreamer.${name} PROPERTIES LABELS "offline" TIMEOUT 120)
 endfunction()
 
-gost_add_offline_test(dto contract/dto-test.cpp -v1 -o -,txt -o "../test-results/dto-$<CONFIG>.txt,txt")
+gost_add_offline_test(dto contract/dto-test.cpp)
 gost_add_offline_test(sse unit/sse-parser-test.cpp)
 gost_add_offline_test(state unit/state-store-test.cpp)
 gost_add_offline_test(settings unit/settings-store-test.cpp)
@@ -50,13 +56,13 @@ gost_add_offline_test(network integration/api-network-test.cpp)
 gost_add_offline_test(connection integration/connection-controller-test.cpp)
 gost_add_offline_test(stats-baseline unit/stats-baseline-test.cpp)
 gost_add_offline_test(obs-stop unit/obs-stop-test.cpp)
-gost_add_offline_test(operations integration/restream-operations-test.cpp -v1 -o -,txt -o "../test-results/operations-$<CONFIG>.txt,txt")
+gost_add_offline_test(operations integration/restream-operations-test.cpp)
 gost_add_offline_test(configuration-api contract/configuration-api-test.cpp)
-gost_add_offline_test(configuration integration/configuration-controller-test.cpp -v1 -o -,txt -o "../test-results/configuration-$<CONFIG>.txt,txt")
+gost_add_offline_test(configuration integration/configuration-controller-test.cpp)
 gost_add_offline_test(configuration-ui unit/configuration-ui-test.cpp)
 gost_add_offline_test(settings-preferences unit/settings-preferences-test.cpp)
 gost_add_offline_test(fallback-api contract/fallback-api-test.cpp)
-gost_add_offline_test(fallback integration/fallback-controller-test.cpp -v1 -o -,txt -o "../test-results/fallback-$<CONFIG>.txt,txt")
+gost_add_offline_test(fallback integration/fallback-controller-test.cpp)
 gost_add_offline_test(fallback-ui unit/fallback-ui-test.cpp)
 gost_add_offline_test(diagnostics unit/diagnostics-page-test.cpp)
 

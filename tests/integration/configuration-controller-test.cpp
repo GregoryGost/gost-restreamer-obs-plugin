@@ -632,20 +632,24 @@ void ConfigurationControllerTest::unknownCreateRequiresCompleteCollectionReconci
 	QTest::newRow("lost-response") << true;
 	QTest::newRow("malformed-created-entity") << false;
 }
+// Проверяет, что неполный список сохраняет запрет записи после создания с неизвестным исходом.
 void ConfigurationControllerTest::unknownCreateRequiresCompleteCollectionReconciliation()
 {
 	// responseLost различает разрыв соединения после POST и некорректный ответ создания 201.
 	QFETCH(bool, responseLost);
-	// rig предоставляет независимые сервисы, а limitedApi ограничивает обход одним листом для проверки неполноты.
+	// rig предоставляет независимые сервисы и исходный пустой, но полный список потоков.
 	ConfigurationRig rig;
 	QVERIFY(rig.initialize(false));
+	// limits оставляет необработанный курсор после первой страницы.
 	Limits limits;
 	limits.maxPages = 1;
+	// limitedApi применяет ограничения пагинации, controller сверяет результат создания в общей модели.
 	APIClient limitedApi(limits);
 	ConfigurationController controller(rig.state, limitedApi, rig.connection, rig.operations);
-	// partial задаёт наличие ещё одной страницы; listReads доказывает завершение каждого запрошенного перечитывания.
-	bool partial = true;
+	// firstListRequest удерживает ответ первого GET. listReads считает запросы, полученные сервером.
+	std::optional<HttpServer::Request> firstListRequest;
 	int listReads = 0;
+	// Перехватчик request управляет исходом записи и порядком ответов со списками.
 	rig.intercept = [&](const HttpServer::Request &request) {
 		if (request.method == "POST" && rig.mutations().size() == 1) {
 			if (responseLost) {
@@ -656,9 +660,10 @@ void ConfigurationControllerTest::unknownCreateRequiresCompleteCollectionReconci
 			return true;
 		}
 		if (request.method == "GET" && request.target.startsWith("/api/v1/streams?")) {
-			++listReads;
-			HttpServer::reply(request, fixture::page({fixture::stream()},
-								 partial ? QStringLiteral("next-page") : QString{}));
+			if (++listReads == 1)
+				firstListRequest = request;
+			else
+				HttpServer::reply(request, fixture::page({fixture::stream()}));
 			return true;
 		}
 		return false;
@@ -676,13 +681,17 @@ void ConfigurationControllerTest::unknownCreateRequiresCompleteCollectionReconci
 	QVERIFY(!controller.save());
 	QCOMPARE(rig.mutations().size(), 1);
 	QVERIFY(controller.reload());
-	QTRY_VERIFY_WITH_TIMEOUT(listReads == 1 && rig.state.configuration().streamsStatus.availability ==
-							   RuntimeAvailability::Fresh,
+	QTRY_VERIFY_WITH_TIMEOUT(firstListRequest.has_value(), 1000);
+	QCOMPARE(rig.state.configuration().streamsStatus.availability, RuntimeAvailability::Fresh);
+	QVERIFY(rig.state.configuration().streamsStatus.complete);
+	HttpServer::reply(*firstListRequest, fixture::page({fixture::stream()}, QStringLiteral("next-page")));
+	QTRY_VERIFY_WITH_TIMEOUT(rig.state.configuration().streamsStatus.availability == RuntimeAvailability::Fresh &&
+					 !rig.state.configuration().streamsStatus.complete,
 				 1000);
-	QVERIFY(!rig.state.configuration().streamsStatus.complete);
+	QCOMPARE(listReads, 1);
+	QVERIFY(rig.state.configuration().streams.contains(QStringLiteral("stream")));
 	QVERIFY(rig.state.configurationEditor().reconciliationRequired);
 	QVERIFY(!controller.save());
-	partial = false;
 	QVERIFY(controller.reload());
 	QTRY_VERIFY_WITH_TIMEOUT(listReads == 2 && !rig.state.configurationEditor().reconciliationRequired, 1000);
 	QVERIFY(rig.state.configuration().streamsStatus.complete);
