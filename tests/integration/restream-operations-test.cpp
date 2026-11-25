@@ -2599,7 +2599,7 @@ void RestreamOperationsTest::selectedDestinationRechecksBeforeFirstPost()
 void RestreamOperationsTest::selectedDestinationRetryKeepsSingletonIntent()
 {
 	// rig и scenario принимают первый start и теряют его HTTP-ответ.
-	OperationRig rig({500, 5, 20});
+	OperationRig rig;
 	QVERIFY(rig.initialize(false));
 	StartDestinationScenario scenario(rig);
 	scenario.loseFirstResponse = true;
@@ -2635,7 +2635,7 @@ void RestreamOperationsTest::selectedDestinationRetryKeepsSingletonIntent()
 void RestreamOperationsTest::selectedDestinationConflictDoesNotChangeBranch()
 {
 	// rig и scenario моделируют атомарный конфликт с чужой публикацией.
-	OperationRig rig({500, 5, 20});
+	OperationRig rig;
 	QVERIFY(rig.initialize(false));
 	StartDestinationScenario scenario(rig);
 	scenario.conflict = true;
