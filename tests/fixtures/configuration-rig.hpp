@@ -18,7 +18,7 @@
 // Все HTTP-запросы замыкаются на петлевую фикстуру; нужен QApplication для FakeFrontend.
 class ConfigurationRig final {
 public:
-	// Создаёт независимые каналы с коротким сроком; configLimits ограничивает только конфигурационный API.
+	// Создаёт независимые каналы. configLimits задаёт ограничения конфигурационного API.
 	explicit ConfigurationRig(gost::api::Limits configLimits = {})
 		: settings(temp.filePath(QStringLiteral("settings.json"))),
 		  configApi(configLimits),
@@ -27,7 +27,8 @@ public:
 		  operations(state, command, connection, obs, {250, 5, 30}),
 		  configuration(state, configApi, connection, operations)
 	{
-		configApi.setHttpTimeoutMs(120);
+		// Срок конфигурационного запроса включает ожидание очереди и обработку событий локального сервера.
+		configApi.setHttpTimeoutMs(500);
 		// Обработчик сначала даёт intercept возможность удержать запрос или внедрить отказ.
 		server.handler = [this](const HttpServer::Request &request) {
 			if (!intercept || !intercept(request))
