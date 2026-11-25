@@ -56,7 +56,7 @@ gost_add_offline_test(configuration integration/configuration-controller-test.cp
 gost_add_offline_test(configuration-ui unit/configuration-ui-test.cpp)
 gost_add_offline_test(settings-preferences unit/settings-preferences-test.cpp)
 gost_add_offline_test(fallback-api contract/fallback-api-test.cpp)
-gost_add_offline_test(fallback integration/fallback-controller-test.cpp)
+gost_add_offline_test(fallback integration/fallback-controller-test.cpp -v1 -o -,txt -o "../test-results/fallback-$<CONFIG>.txt,txt")
 gost_add_offline_test(fallback-ui unit/fallback-ui-test.cpp)
 gost_add_offline_test(diagnostics unit/diagnostics-page-test.cpp)
 

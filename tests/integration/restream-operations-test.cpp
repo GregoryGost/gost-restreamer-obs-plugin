@@ -13,6 +13,7 @@
 #include "ui/management-window.hpp"
 #include <QApplication>
 #include <QComboBox>
+#include <QDebug>
 #include <QMessageBox>
 #include <QPushButton>
 
@@ -34,8 +35,8 @@ namespace {
 // Начальный StateStore задаётся как подтверждённый результат наблюдателя; сам наблюдатель не подключается.
 class OperationRig final {
 public:
-	// limits задают короткий ограниченный срок выполнения последовательности; все файлы и сокеты принадлежат этой фикстуре.
-	explicit OperationRig(RestreamController::Limits limits = {300, 5, 30})
+	// limits оставляют время на цепочку HTTP-запросов. Сценарии с намеренным таймаутом задают собственный срок.
+	explicit OperationRig(RestreamController::Limits limits = {1500, 5, 30})
 		: settings(temp.filePath(QStringLiteral("settings.json"))),
 		  connection(state, settings, observer, events),
 		  obs(frontend, state),
@@ -46,6 +47,22 @@ public:
 			if (!intercept || !intercept(request))
 				respond(request);
 		};
+		// Обработчик добавляет причину завершения и маршрут последнего запроса в журнал Qt Test.
+		QObject::connect(&state, &StateStore::operationsChanged, &state, [this] {
+			// current содержит опубликованный итог, включая причину отказа или истечения срока.
+			const auto &current = state.operations().current;
+			if (!current || current->phase != OperationPhase::Finished || current->messageKey.isEmpty())
+				return;
+			// lastRequest содержит метод и маршрут последнего полного запроса без заголовков и тела.
+			QString lastRequest;
+			if (!server.requests.isEmpty()) {
+				// request уже прочитан целиком синтетическим HTTP-сервером.
+				const auto &request = server.requests.constLast();
+				lastRequest = QString::fromLatin1(request.method + ' ' + request.target);
+			}
+			qInfo().noquote()
+				<< QStringLiteral("messageKey=%1 lastRequest=%2").arg(current->messageKey, lastRequest);
+		});
 	}
 	// Закрывает сервисы до уничтожения их зависимостей и локальных сокетов.
 	~OperationRig()
@@ -959,12 +976,12 @@ void RestreamOperationsTest::addOutputRequiresExactReceiptAndDurableSnapshot()
 	// violation задаёт независимое нарушение ID или долговечного attached/desired состояния нового Output.
 	QFETCH(QString, violation);
 	// rig/scenario принимают команду, но не предоставляют доказательство нужного публичного результата.
-	OperationRig rig({180, 5, 20});
+	OperationRig rig;
 	QVERIFY(rig.initialize());
 	AddOutputScenario scenario(rig);
 	scenario.violation = violation;
 	QVERIFY(rig.operations.addOutput(rig.context(), QStringLiteral("session"), QStringLiteral("destination")));
-	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 1500);
+	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
 	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Unknown);
 	QVERIFY(!rig.state.operations().current->stateConfirmed);
 	QCOMPARE(rig.posts().size(), 1);
@@ -1965,6 +1982,7 @@ void RestreamOperationsTest::manualRetryHasFreshBoundedBudget()
 	QTRY_COMPARE_WITH_TIMEOUT(rig.posts().size(), 1, 2000);
 	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
 	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Unknown);
+	QCOMPARE(rig.state.operations().current->messageKey, QStringLiteral("Operation.Timeout"));
 	// firstRequest фиксирует исходный request_id; secondPolls подтверждает реальную работу новой попытки.
 	const auto firstRequest = rig.posts().first().body;
 	int secondPolls = 0;
@@ -1981,6 +1999,7 @@ void RestreamOperationsTest::manualRetryHasFreshBoundedBudget()
 	QTRY_VERIFY_WITH_TIMEOUT(rig.finished(), 2000);
 	QVERIFY(secondPolls > 0);
 	QCOMPARE(rig.state.operations().current->outcome, OperationOutcome::Unknown);
+	QCOMPARE(rig.state.operations().current->messageKey, QStringLiteral("Operation.Timeout"));
 	QCOMPARE(rig.posts().size(), 2);
 	QCOMPARE(rig.posts()[1].body, firstRequest);
 }
@@ -2236,7 +2255,7 @@ void RestreamOperationsTest::interruptedPrecheckDoesNotRemainChecking()
 void RestreamOperationsTest::selectedDestinationStartsAloneAndPreservesLegacyPrecheck()
 {
 	// rig и scenario создают один готовый disabled Destination и enabled-соседа без подготовленной группы.
-	OperationRig rig({1000, 5, 20});
+	OperationRig rig;
 	QVERIFY(rig.initialize(false));
 	StartDestinationScenario scenario(rig);
 	QVERIFY(rig.operations.checkFallback(rig.context()));
@@ -2386,7 +2405,7 @@ void RestreamOperationsTest::selectedDestinationRequiresOwnReceiptAndUniqueDurab
 void RestreamOperationsTest::selectedDestinationKeepsPinnedOutputAfterReplacement()
 {
 	// rig и scenario дают прежнему Output и замене одинаковые Destination/Session, различая только их долговечные ID.
-	OperationRig rig({1000, 5, 20});
+	OperationRig rig;
 	QVERIFY(rig.initialize(false));
 	StartDestinationScenario scenario(rig);
 	// replacementAvailable означает, что detach/re-add уже произошёл после закрепления исходного ID.
@@ -2523,7 +2542,7 @@ void RestreamOperationsTest::selectedDestinationRechecksBeforeFirstPost()
 	// change выбирает событие, которое отзывает допуск ещё не отправленного запроса.
 	QFETCH(QString, change);
 	// rig и scenario начали выбранную проверку в безопасном контексте.
-	OperationRig rig({500, 5, 20});
+	OperationRig rig;
 	QVERIFY(rig.initialize(false));
 	StartDestinationScenario scenario(rig);
 	// held удерживает последнее фильтрованное чтение отсутствия активной Session.

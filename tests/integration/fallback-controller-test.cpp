@@ -230,8 +230,8 @@ void FallbackControllerTest::failedPendingPreservesCurrentAndDeduplicatesOwnFail
 
 void FallbackControllerTest::observationTimeoutKeepsAcceptance()
 {
-	// test использует короткий цикл наблюдения; серверное queued остаётся неокончательным.
-	FallbackRig test({70, 5});
+	// test даёт циклу время прочитать queued и позднее пройти всю цепочку GET при явном обновлении.
+	FallbackRig test({1000, 5});
 	test.generations.insert(QStringLiteral("new"),
 				fallbackFixture::generation(QStringLiteral("new"), QStringLiteral("queued")));
 	QVERIFY(test.initialize());
@@ -263,10 +263,10 @@ void FallbackControllerTest::observationBudgetIncludesTerminalReads()
 {
 	// holdFinalAsset выбирает шаг после достоверного ready, который не ответит до истечения общего срока.
 	QFETCH(bool, holdFinalAsset);
-	// limits сериализует чтения; test ограничивает весь цикл 500 мс, а отдельный REST допускает 5 секунд.
+	// limits сериализует чтения. Общий срок test даёт дойти до удержанного GET и истекает раньше срока отдельного REST.
 	Limits limits;
 	limits.maxActiveRequests = 1;
-	FallbackRig test({500, 5}, limits);
+	FallbackRig test({1500, 5}, limits);
 	QVERIFY(test.initialize());
 	// Независимый precheck командного контроллера читает тот же Asset и мог бы занять перехват
 	// вместо проверяемой цепочки FallbackController; в этом сценарии управление эфиром не используется.
